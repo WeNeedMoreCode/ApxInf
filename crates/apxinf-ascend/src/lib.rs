@@ -15,11 +15,14 @@
 pub mod context;
 pub mod ffi;
 pub mod graph;
+pub mod ops;
 pub mod stream;
+pub mod tensor;
 
 pub use context::{AscendContext, DeviceBuffer};
 pub use graph::AscendGraph;
 pub use stream::AscendStream;
+pub use tensor::AclTensor;
 
 /// ACL error code (aclError, i32). 0 = ACL_SUCCESS.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]

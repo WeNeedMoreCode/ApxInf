@@ -15,5 +15,9 @@ fn main() {
         .unwrap_or_else(|| PathBuf::from("/usr/local/Ascend/ascend-toolkit/latest"));
     println!("cargo:rustc-link-search=native={}", home.join("lib64").display());
     println!("cargo:rustc-link-lib=dylib=ascendcl");
+    // aclnn op entry points (aclCreateTensor, aclnn*) live in libopapi,
+    // whose symbols additionally pull libnnopbase at link time.
+    println!("cargo:rustc-link-lib=dylib=opapi");
+    println!("cargo:rustc-link-lib=dylib=nnopbase");
     println!("cargo:rerun-if-env-changed=ASCEND_TOOLKIT_HOME");
 }

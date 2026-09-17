@@ -62,6 +62,50 @@ pub const ACL_MEMCPY_DEVICE_TO_DEVICE: u32 = 3;
 /// aclrtMemMallocPolicy.
 pub const ACL_MEM_MALLOC_HUGE_FIRST: u32 = 0;
 
+// aclDataType (acl_base_rt.h).
+pub const ACL_FLOAT: u32 = 0;
+pub const ACL_FLOAT16: u32 = 1;
+
+// aclFormat (acl_base_rt.h).
+pub const ACL_FORMAT_ND: u32 = 2;
+pub const ACL_FORMAT_FRACTAL_NZ: u32 = 29;
+
+// aclnnStatus (aclnn/acl_meta.h): int32, OK = 0.
+
+// aclnn tensors (aclnn/acl_meta.h): opaque descriptor handles that bind a
+// device pointer to shape/stride/format for the aclnn op entry points.
+extern "C" {
+    pub fn aclCreateTensor(
+        viewDims: *const i64,
+        viewDimsNum: u64,
+        dataType: u32,
+        stride: *const i64,
+        offset: i64,
+        format: u32,
+        storageDims: *const i64,
+        storageDimsNum: u64,
+        tensorData: *mut c_void,
+    ) -> *mut c_void;
+    pub fn aclDestroyTensor(tensor: *mut c_void) -> i32;
+
+    // aclnnMatmul (aclnnop/aclnn_matmul.h), two-stage API: plan then run.
+    // cubeMathType: 1 = KEEP_DTYPE (compute in the tensors' dtype).
+    pub fn aclnnMatmulGetWorkspaceSize(
+        selfT: *mut c_void,
+        mat2: *mut c_void,
+        out: *mut c_void,
+        cubeMathType: i8,
+        workspaceSize: *mut u64,
+        executor: *mut *mut c_void,
+    ) -> i32;
+    pub fn aclnnMatmul(
+        workspace: *mut c_void,
+        workspaceSize: u64,
+        executor: *mut c_void,
+        stream: *mut c_void,
+    ) -> i32;
+}
+
 // aclmdlRICaptureMode (acl_rt.h): capture scoping, mirrors CUDA's
 // cudaStreamCaptureMode.
 pub const ACL_MODEL_RI_CAPTURE_MODE_GLOBAL: i32 = 0;
