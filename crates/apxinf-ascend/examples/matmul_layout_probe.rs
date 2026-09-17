@@ -89,5 +89,28 @@ fn main() {
         }
         Err(e) => println!("t-b ERR {e:?}"),
     }
+    // Variant 3: K ladder on the transposed path -- the layer's down proj
+    // (K=inter=8192) crashed while K=2048 matmuls passed. Find the cliff.
+    println!("-- K ladder (transposed b) --");
+    for kk in [4096i64, 8192i64, 16384i64] {
+        let n2 = 2048i64;
+        let hb2: Vec<f16> = (0..(kk * n2) as usize).map(|_| f16::from_f32(rnd())).collect();
+        let db2 = ctx.malloc(hb2.len() * 2).unwrap();
+        ctx.copy_h2d(&db2, bytemuck::cast_slice(&hb2)).unwrap();
+        let ht = ops::host_transpose(bytemuck::cast_slice(&hb2), kk, n2);
+        let dbt2 = ctx.malloc(ht.len()).unwrap();
+        ctx.copy_h2d(&dbt2, &ht).unwrap();
+        // a: [m, kk]
+        let ha2: Vec<f16> = (0..(m * kk) as usize).map(|_| f16::from_f32(rnd())).collect();
+        let da2 = ctx.malloc(ha2.len() * 2).unwrap();
+        ctx.copy_h2d(&da2, bytemuck::cast_slice(&ha2)).unwrap();
+        match ops::matmul_b_t_fp16(&ctx, &stream, &da2, [m, kk], &dbt2, kk, n2) {
+            Ok(_) => {
+                let _ = stream.synchronize();
+                println!("K={kk} OK");
+            }
+            Err(e) => println!("K={kk} ERR {e:?}"),
+        }
+    }
     println!("PROBE_DONE");
 }
