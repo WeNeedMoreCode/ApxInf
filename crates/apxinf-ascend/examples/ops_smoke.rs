@@ -4,7 +4,7 @@
 //!   source /data/apxinf/rust_env.sh
 //!   ASCEND_RT_VISIBLE_DEVICES=5 cargo run --example ops_smoke --release
 
-use apxinf_ascend::ops::{add_fp16, add_rms_norm_fp16, bias_add_fp16, cat_fp16, euler_update_fp16, muls_fp16, silu_fp16};
+use apxinf_ascend::ops::{add_fp16, add_rms_norm_fp16, bias_add_fp16, cat_fp16, euler_update_fp16, gather_rows_fp16, gelu_fp16, muls_fp16, silu_fp16};
 use apxinf_ascend::{AscendContext, AscendStream};
 use half::f16;
 
@@ -137,6 +137,46 @@ fn main() {
     }
     println!("cat exact: {ok}");
     assert!(ok, "cat out of order");
+
+    // ---- gelu (tanh approximation, full cubic form) ----
+    let dg = gelu_fp16(&ctx, &stream, &da, &[rows as i64, cols as i64], true).expect("gelu");
+    stream.synchronize().unwrap();
+    ctx.copy_d2h(&dg, &mut back).unwrap();
+    let got: Vec<f16> = bytemuck::cast_slice(&back).to_vec();
+    let mut max_rel = 0f32;
+    for i in 0..n {
+        let x = ha[i].to_f32();
+        let u = 0.7978845608 * (x + 0.044715 * x * x * x);
+        let want = 0.5 * x * (1.0 + u.tanh());
+        let rel = (got[i].to_f32() - want).abs() / want.abs().max(0.1);
+        max_rel = max_rel.max(rel);
+    }
+    println!("gelu  max rel err {max_rel:.5}");
+    assert!(max_rel < 0.01, "gelu out of tolerance");
+
+    // ---- gather (embedding lookup) ----
+    let vocab = 8i64;
+    let dim = 4i64;
+    let table: Vec<f16> = (0..(vocab * dim) as usize).map(|i| f16::from_f32(i as f32 * 0.5)).collect();
+    let dtable = ctx.malloc((vocab * dim * 2) as usize).unwrap();
+    ctx.copy_h2d(&dtable, bytemuck::cast_slice(&table)).unwrap();
+    let idx: Vec<i32> = vec![3, 0, 7];
+    let didx = ctx.malloc(12).unwrap();
+    ctx.copy_h2d(&didx, unsafe { std::slice::from_raw_parts(idx.as_ptr() as *const u8, 12) }).unwrap();
+    let dgot = gather_rows_fp16(&ctx, &stream, &dtable, vocab, dim, &didx, 3).expect("gather");
+    stream.synchronize().unwrap();
+    let mut gback = vec![0u8; 24];
+    ctx.copy_d2h(&dgot, &mut gback).unwrap();
+    let rows_out: Vec<f16> = bytemuck::cast_slice(&gback).to_vec();
+    let mut ok = true;
+    for (r, &ix) in idx.iter().enumerate() {
+        for c in 0..dim as usize {
+            let want = table[ix as usize * dim as usize + c].to_f32();
+            ok = ok && rows_out[r * dim as usize + c].to_f32() == want;
+        }
+    }
+    println!("gather(embedding) exact: {ok}");
+    assert!(ok, "gather wrong rows");
 
     println!("OPS_SMOKE_OK");
 }

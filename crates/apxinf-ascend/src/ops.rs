@@ -129,6 +129,11 @@ pub fn cat_fp16(
         |ws, ex| unsafe { ffi::aclnnCatGetWorkspaceSize(list, dim, t_out.handle(), ws, ex) },
         |ws, size, ex| unsafe { ffi::aclnnCat(ws, size, ex, stream.handle()) },
     )?;
+    // Ownership: aclDestroyTensorList releases the child descriptors too;
+    // dropping our AclTensor wrappers as well would double-destroy and
+    // corrupt the process's acl tensor registry (later ops segfault in
+    // their plan phase -- bisected 2026-09-17).
+    std::mem::forget(descs);
     unsafe { ffi::aclDestroyTensorList(list) };
     Ok(out)
 }
@@ -240,6 +245,55 @@ pub fn euler_update_fp16(
     let scaled = muls_fp16(ctx, stream, &dx, sigma, shape)?;
     add_fp16(ctx, stream, x0, &scaled, shape)
 }
+
+/// out = gelu(a), elementwise fp16 via aclnnGeluV2. `tanh_approx` selects
+/// the tanh approximation (PaliGemma/gelu_tanh semantics) vs exact erf.
+pub fn gelu_fp16(
+    ctx: &AscendContext,
+    stream: &AscendStream,
+    a: &crate::DeviceBuffer,
+    shape: &[i64],
+    tanh_approx: bool,
+) -> Result<crate::DeviceBuffer> {
+    let out = ctx.malloc(a.len())?;
+    let ta = AclTensor::fp16_nd(a, shape)?;
+    let tout = AclTensor::fp16_nd(&out, shape)?;
+    let approximate: i64 = if tanh_approx { 1 } else { 0 };
+    two_stage(
+        ctx,
+        stream,
+        "aclnnGeluV2",
+        |ws, ex| unsafe { ffi::aclnnGeluV2GetWorkspaceSize(ta.handle(), approximate, tout.handle(), ws, ex) },
+        |ws, size, ex| unsafe { ffi::aclnnGeluV2(ws, size, ex, stream.handle()) },
+    )?;
+    Ok(out)
+}
+
+/// Embedding lookup: rows of `table` (fp16 [vocab, dim]) selected by
+/// device-resident i32 `indices` ([n]) -> out fp16 [n, dim].
+pub fn gather_rows_fp16(
+    ctx: &AscendContext,
+    stream: &AscendStream,
+    table: &crate::DeviceBuffer,
+    vocab: i64,
+    dim: i64,
+    indices: &crate::DeviceBuffer,
+    n: i64,
+) -> Result<crate::DeviceBuffer> {
+    let out = ctx.malloc((n * dim * 2) as usize)?;
+    let tt = AclTensor::fp16_nd(table, &[vocab, dim])?;
+    let ti = AclTensor::i32_nd(indices, &[n])?;
+    let tout = AclTensor::fp16_nd(&out, &[n, dim])?;
+    two_stage(
+        ctx,
+        stream,
+        "aclnnGatherV2",
+        |ws, ex| unsafe { ffi::aclnnGatherV2GetWorkspaceSize(tt.handle(), 0, ti.handle(), tout.handle(), ws, ex) },
+        |ws, size, ex| unsafe { ffi::aclnnGatherV2(ws, size, ex, stream.handle()) },
+    )?;
+    Ok(out)
+}
+
 pub fn add_fp16(
     ctx: &AscendContext,
     stream: &AscendStream,

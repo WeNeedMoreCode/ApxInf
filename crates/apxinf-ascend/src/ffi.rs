@@ -65,6 +65,7 @@ pub const ACL_MEM_MALLOC_HUGE_FIRST: u32 = 0;
 // aclDataType (acl_base_rt.h).
 pub const ACL_FLOAT: u32 = 0;
 pub const ACL_FLOAT16: u32 = 1;
+pub const ACL_INT32: u32 = 3;
 
 // aclFormat (acl_base_rt.h).
 pub const ACL_FORMAT_ND: u32 = 2;
@@ -170,6 +171,43 @@ extern "C" {
         executor: *mut *mut c_void,
     ) -> i32;
     pub fn aclnnCat(
+        workspace: *mut c_void,
+        workspaceSize: u64,
+        executor: *mut c_void,
+        stream: *mut c_void,
+    ) -> i32;
+
+    // aclnnop/aclnn_gelu_v2.h: gelu with an `approximate` selector
+    // (0 = erf, 1 = tanh), the PyTorch-compatible semantics torch_npu
+    // dispatches to. This is the ONLY working gelu entry on 310P3:
+    // aclnnGelu core-dumps and aclnnFastGelu returns 161002
+    // ("not implemented, dtype support list []") on every dtype and both
+    // CANN 8.5.1/9.0.1 -- those op binaries simply do not ship for this
+    // SoC (proven via CANN debug logs, 2026-09-17).
+    pub fn aclnnGeluV2GetWorkspaceSize(
+        x: *mut c_void,
+        approximate: i64,
+        y: *mut c_void,
+        workspaceSize: *mut u64,
+        executor: *mut *mut c_void,
+    ) -> i32;
+    pub fn aclnnGeluV2(
+        workspace: *mut c_void,
+        workspaceSize: u64,
+        executor: *mut c_void,
+        stream: *mut c_void,
+    ) -> i32;
+
+    // aclnnop/aclnn_gather_v2.h: out[i..] = self[index[i]..] along `dim`.
+    pub fn aclnnGatherV2GetWorkspaceSize(
+        selfT: *mut c_void,
+        dim: i64,
+        index: *mut c_void,
+        out: *mut c_void,
+        workspaceSize: *mut u64,
+        executor: *mut *mut c_void,
+    ) -> i32;
+    pub fn aclnnGatherV2(
         workspace: *mut c_void,
         workspaceSize: u64,
         executor: *mut c_void,
