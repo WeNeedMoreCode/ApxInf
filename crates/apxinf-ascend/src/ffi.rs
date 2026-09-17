@@ -158,6 +158,41 @@ extern "C" {
     // aclnn/acl_meta.h scalars.
     pub fn aclCreateScalar(value: *mut c_void, dataType: u32) -> *mut c_void;
     pub fn aclDestroyScalar(scalar: *mut c_void) -> i32;
+
+    // aclnnop/level2/aclnn_prompt_flash_attention_v3.h -- PFA, the fused
+    // attention for 310P-class inference cards (fp16 only). The legacy
+    // aclnnPromptFlashAttention deprecates 2026-12; V3 is the long-term API.
+    pub fn aclnnPromptFlashAttentionV3GetWorkspaceSize(
+        query: *mut c_void,
+        key: *mut c_void,
+        value: *mut c_void,
+        pseShift: *mut c_void,
+        attenMask: *mut c_void,
+        actualSeqLengths: *mut c_void,
+        actualSeqLengthsKv: *mut c_void,
+        deqScale1: *mut c_void,
+        quantScale1: *mut c_void,
+        deqScale2: *mut c_void,
+        quantScale2: *mut c_void,
+        quantOffset2: *mut c_void,
+        numHeads: i64,
+        scaleValue: f64,
+        preTokens: i64,
+        nextTokens: i64,
+        inputLayout: *mut u8,
+        numKeyValueHeads: i64,
+        sparseMode: i64,
+        innerPrecise: i64,
+        attentionOut: *mut c_void,
+        workspaceSize: *mut u64,
+        executor: *mut *mut c_void,
+    ) -> i32;
+    pub fn aclnnPromptFlashAttentionV3(
+        workspace: *mut c_void,
+        workspaceSize: u64,
+        executor: *mut c_void,
+        stream: *mut c_void,
+    ) -> i32;
 }
 
 // aclmdlRICaptureMode (acl_rt.h): capture scoping, mirrors CUDA's

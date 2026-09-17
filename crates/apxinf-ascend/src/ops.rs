@@ -92,6 +92,71 @@ fn two_stage(
     Ok(())
 }
 
+/// Fused attention (PFA V3) for full (non-causal, unmasked) attention in
+/// BNSD layout: q/k/v/out all [b, n, s, d] fp16, contiguous.
+///
+/// scale = 1/sqrt(d) unless overridden. 310P: fp16 only; the legacy
+/// non-V3 PFA entry deprecates 2026-12 so we bind V3 from day one.
+#[allow(clippy::too_many_arguments)]
+pub fn prompt_flash_attention_fp16(
+    ctx: &AscendContext,
+    stream: &AscendStream,
+    q: &crate::DeviceBuffer,
+    k: &crate::DeviceBuffer,
+    v: &crate::DeviceBuffer,
+    shape: [i64; 4], // [b, n, s, d]
+    scale: Option<f64>,
+) -> Result<crate::DeviceBuffer> {
+    let [b, n, s, d] = shape;
+    let elems = b * n * s * d;
+    let out = ctx.malloc((elems * 2) as usize)?;
+
+    let dims = [b, n, s, d];
+    let tq = AclTensor::fp16_nd(q, &dims)?;
+    let tk = AclTensor::fp16_nd(k, &dims)?;
+    let tv = AclTensor::fp16_nd(v, &dims)?;
+    let tout = AclTensor::fp16_nd(&out, &dims)?;
+
+    let mut layout: [u8; 5] = *b"BNSD\0";
+    let scale_value = scale.unwrap_or(1.0 / (d as f64).sqrt());
+    let null = std::ptr::null_mut::<std::ffi::c_void>();
+
+    two_stage(
+        ctx,
+        stream,
+        "aclnnPromptFlashAttentionV3",
+        |ws, ex| unsafe {
+            ffi::aclnnPromptFlashAttentionV3GetWorkspaceSize(
+                tq.handle(),
+                tk.handle(),
+                tv.handle(),
+                null, // pseShift
+                null, // attenMask (full attention)
+                null, // actualSeqLengths
+                null, // actualSeqLengthsKv
+                null, // deqScale1
+                null, // quantScale1
+                null, // deqScale2
+                null, // quantScale2
+                null, // quantOffset2
+                n,
+                scale_value,
+                i64::MAX, // preTokens: unrestricted
+                0,        // nextTokens
+                layout.as_mut_ptr(),
+                n,        // numKeyValueHeads: no GQA
+                0,        // sparseMode
+                0,        // innerPrecise
+                tout.handle(),
+                ws,
+                ex,
+            )
+        },
+        |ws, size, ex| unsafe { ffi::aclnnPromptFlashAttentionV3(ws, size, ex, stream.handle()) },
+    )?;
+    Ok(out)
+}
+
 /// out = a + b (fp16, same shape).
 pub fn add_fp16(
     ctx: &AscendContext,
