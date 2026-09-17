@@ -146,7 +146,10 @@ fn two_stage(
     if code != 0 {
         return Err(AclError { code, op });
     }
-    let ws = if ws_size > 0 { Some(ctx.malloc(ws_size as usize)?) } else { None };
+    // pooled workspace: same-size reuse across ops (single-stream
+    // ordering makes reuse safe) and the buffer outlives its async
+    // consumers -- dropping a workspace mid-queue is a use-after-free
+    let ws = if ws_size > 0 { Some(ctx.scratch_buf(ws_size as usize)?) } else { None };
     let code = run(
         ws.as_ref().map(|w| w.as_ptr()).unwrap_or(std::ptr::null_mut()),
         ws_size,
