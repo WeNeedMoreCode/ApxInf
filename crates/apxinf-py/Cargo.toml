@@ -29,3 +29,6 @@ extension-module = ["pyo3/extension-module"]
 # which is only registered on CUDA devices. Without it the extension still
 # imports and reports shapes, but `load` errors for pi05.
 cuda = ["apxinf-model/cuda"]
+# Ascend NPU (310P3) via apxinf-ascend. Kernel ops live; the PI0.5
+# executor registration on Ascend devices is stage-2 work in progress.
+ascend = ["apxinf-model/ascend"]

@@ -22,6 +22,9 @@ default = []
 # CUDA uses libnvToolsExt. Both are handled transparently — see
 # crates/apxinf-cuda/build.rs.
 cuda = ["dep:apxinf-cuda", "apxinf-cuda/nvtx", "apxinf-model/cuda"]
+# Ascend NPU (310P3) inference via aclrt/aclnn. Build in the CANN 9.0.1+
+# container (ACLGraph capture needs it); library targets build anywhere.
+ascend = ["dep:apxinf-ascend", "apxinf-model/ascend"]
 # Same as `cuda` but with NVTX compiled out entirely (no-op stubs). Use
 # when the target has no NVTX library installed at all.
 cuda-no-nvtx = ["dep:apxinf-cuda", "apxinf-model/cuda"]
@@ -33,6 +36,7 @@ openblas = ["apxinf-core/openblas"]
 [dependencies]
 apxinf-core = { path = "crates/apxinf-core" }
 apxinf-cuda = { path = "crates/apxinf-cuda", optional = true, default-features = false }
+apxinf-ascend = { path = "crates/apxinf-ascend", optional = true }
 apxinf-loader = { path = "crates/apxinf-loader" }
 apxinf-model = { path = "crates/apxinf-model" }
 apxinf-tokenizer = { path = "crates/apxinf-tokenizer" }

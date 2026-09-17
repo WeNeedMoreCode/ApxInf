@@ -13,12 +13,21 @@ pub(crate) fn create_backend(device: Device) -> Result<Arc<dyn Backend>> {
         Device::Cuda(id) => cuda::create(id),
         #[cfg(not(feature = "cuda"))]
         Device::Cuda(_) => Err(Error::Other("CUDA support not compiled in".into())),
-        // The apxinf-ascend crate is scaffolded (aclrt FFI + context RAII);
-        // the Backend trait impl lands with the first kernels on the
-        // stage-2 roadmap. Until then this arm keeps the enum exhaustive.
-        Device::Ascend(_) => Err(Error::Other(
-            "Ascend backend not yet implemented (apxinf-ascend stage-2 in progress)".into(),
-        )),
+        #[cfg(feature = "ascend")]
+        Device::Ascend(id) => ascend::create(id),
+        #[cfg(not(feature = "ascend"))]
+        Device::Ascend(_) => Err(Error::Other("Ascend support not compiled in".into())),
+    }
+}
+
+#[cfg(feature = "ascend")]
+pub(crate) mod ascend {
+    use std::sync::Arc;
+
+    use apxinf_core::{Backend, Result};
+
+    pub(crate) fn create(device_id: usize) -> Result<Arc<dyn Backend>> {
+        Ok(Arc::new(apxinf_ascend::AscendBackend::new(device_id)?))
     }
 }
 
