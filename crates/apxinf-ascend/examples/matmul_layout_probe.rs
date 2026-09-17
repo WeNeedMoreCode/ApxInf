@@ -112,5 +112,51 @@ fn main() {
             Err(e) => println!("K={kk} ERR {e:?}"),
         }
     }
+    // Variant 4: replicate the smoke sequence's prime suspect --
+    // rms -> PFA (BSH, smoke's exact head geometry, tokens=8) ->
+    // down-matmul (K=8192). PFA "succeeds" in smoke but may poison
+    // later matmuls.
+    println!("-- rms -> PFA(BSH) -> down matmul --");
+    {
+        let heads = 8i64;
+        let kv_heads = 1i64;
+        let hd = 256i64;
+        let qd = heads * hd;
+        let kvd = kv_heads * hd;
+        let hq2: Vec<f16> = (0..(m * qd) as usize).map(|_| f16::from_f32(rnd())).collect();
+        let hk2: Vec<f16> = (0..(m * kvd) as usize).map(|_| f16::from_f32(rnd())).collect();
+        let hv2: Vec<f16> = (0..(m * kvd) as usize).map(|_| f16::from_f32(rnd())).collect();
+        let dq2 = ctx.malloc(hq2.len() * 2).unwrap();
+        let dk2 = ctx.malloc(hk2.len() * 2).unwrap();
+        let dv2 = ctx.malloc(hv2.len() * 2).unwrap();
+        ctx.copy_h2d(&dq2, bytemuck::cast_slice(&hq2)).unwrap();
+        ctx.copy_h2d(&dk2, bytemuck::cast_slice(&hk2)).unwrap();
+        ctx.copy_h2d(&dv2, bytemuck::cast_slice(&hv2)).unwrap();
+        let attn = ops::prompt_flash_attention_bsh_fp16(&ctx, &stream, &dq2, &dk2, &dv2, m, heads, kv_heads, hd, None);
+        match attn {
+            Ok(a) => {
+                let _ = stream.synchronize();
+                println!("PFA ok (len {})", a.len());
+                // now the down matmul on its output
+                let hb3: Vec<f16> = (0..(8192 * 2048) as usize).map(|_| f16::from_f32(rnd())).collect();
+                let db3 = ctx.malloc(hb3.len() * 2).unwrap();
+                ctx.copy_h2d(&db3, bytemuck::cast_slice(&hb3)).unwrap();
+                let ht3 = ops::host_transpose(bytemuck::cast_slice(&hb3), 8192, 2048);
+                let dbt3 = ctx.malloc(ht3.len()).unwrap();
+                ctx.copy_h2d(&dbt3, &ht3).unwrap();
+                let ha3: Vec<f16> = (0..(m * 8192) as usize).map(|_| f16::from_f32(rnd())).collect();
+                let da3 = ctx.malloc(ha3.len() * 2).unwrap();
+                ctx.copy_h2d(&da3, bytemuck::cast_slice(&ha3)).unwrap();
+                match ops::matmul_b_t_fp16(&ctx, &stream, &da3, [m, 8192], &dbt3, 8192, 2048) {
+                    Ok(_) => {
+                        let _ = stream.synchronize();
+                        println!("post-PFA down matmul OK");
+                    }
+                    Err(e) => println!("post-PFA down matmul ERR {e:?}"),
+                }
+            }
+            Err(e) => println!("PFA ERR {e:?}"),
+        }
+    }
     println!("PROBE_DONE");
 }
