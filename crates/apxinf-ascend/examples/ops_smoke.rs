@@ -4,7 +4,7 @@
 //!   source /data/apxinf/rust_env.sh
 //!   ASCEND_RT_VISIBLE_DEVICES=5 cargo run --example ops_smoke --release
 
-use apxinf_ascend::ops::{add_fp16, add_rms_norm_fp16, silu_fp16};
+use apxinf_ascend::ops::{add_fp16, add_rms_norm_fp16, bias_add_fp16, cat_fp16, euler_update_fp16, muls_fp16, silu_fp16};
 use apxinf_ascend::{AscendContext, AscendStream};
 use half::f16;
 
@@ -84,6 +84,59 @@ fn main() {
     }
     println!("add_rms_norm max rel err {max_rel:.5}");
     assert!(max_rel < 0.02, "add_rms_norm out of tolerance");
+
+    // ---- bias_add (row broadcast) ----
+    let hbias: Vec<f16> = (0..cols).map(|i| f16::from_f32(0.25 * (i as f32 % 4.0))).collect();
+    let dbias = ctx.malloc(cols * 2).unwrap();
+    ctx.copy_h2d(&dbias, bytemuck::cast_slice(&hbias)).unwrap();
+    let dbiased = bias_add_fp16(&ctx, &stream, &da, &dbias, rows as i64, cols as i64).expect("bias");
+    stream.synchronize().unwrap();
+    ctx.copy_d2h(&dbiased, &mut back).unwrap();
+    let got: Vec<f16> = bytemuck::cast_slice(&back).to_vec();
+    let mut max_err = 0f32;
+    for r in 0..rows {
+        for c in 0..cols {
+            let want = ha[r * cols + c].to_f32() + hbias[c].to_f32();
+            max_err = max_err.max((got[r * cols + c].to_f32() - want).abs());
+        }
+    }
+    println!("bias  max abs err {max_err:.5}");
+    assert!(max_err < 0.01, "bias out of tolerance");
+
+    // ---- muls + euler_update: x0 + 0.5*(x1-x0) = midpoint ----
+    let deuler = euler_update_fp16(&ctx, &stream, &da, &db, 0.5, &[rows as i64, cols as i64]).expect("euler");
+    stream.synchronize().unwrap();
+    ctx.copy_d2h(&deuler, &mut back).unwrap();
+    let got: Vec<f16> = bytemuck::cast_slice(&back).to_vec();
+    let mut max_err = 0f32;
+    for i in 0..n {
+        let a = ha[i].to_f32();
+        let b = hb[i].to_f32();
+        max_err = max_err.max((got[i].to_f32() - (a + b) / 2.0).abs());
+    }
+    println!("euler(midpoint) max abs err {max_err:.5}");
+    assert!(max_err < 0.01, "euler out of tolerance");
+
+    // ---- cat along dim 0 ----
+    let dcat = cat_fp16(
+        &ctx,
+        &stream,
+        &[&da, &db],
+        &[vec![rows as i64, cols as i64], vec![rows as i64, cols as i64]],
+        0,
+        &[(2 * rows) as i64, cols as i64],
+    )
+    .expect("cat");
+    stream.synchronize().unwrap();
+    let mut back2 = vec![0u8; 2 * n * 2];
+    ctx.copy_d2h(&dcat, &mut back2).unwrap();
+    let got: Vec<f16> = bytemuck::cast_slice(&back2).to_vec();
+    let mut ok = true;
+    for i in 0..n {
+        ok = ok && got[i].to_f32() == ha[i].to_f32() && got[n + i].to_f32() == hb[i].to_f32();
+    }
+    println!("cat exact: {ok}");
+    assert!(ok, "cat out of order");
 
     println!("OPS_SMOKE_OK");
 }

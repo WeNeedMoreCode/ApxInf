@@ -92,6 +92,47 @@ fn two_stage(
     Ok(())
 }
 
+/// Concatenate fp16 tensors along `dim` (0-based, ND descriptors).
+/// All inputs share the shape except along `dim`.
+pub fn cat_fp16(
+    ctx: &AscendContext,
+    stream: &AscendStream,
+    parts: &[&crate::DeviceBuffer],
+    shapes: &[Vec<i64>],
+    dim: i64,
+    out_shape: &[i64],
+) -> Result<crate::DeviceBuffer> {
+    assert_eq!(parts.len(), shapes.len());
+    let out_elems: i64 = out_shape.iter().product();
+    let out = ctx.malloc((out_elems * 2) as usize)?;
+
+    let descs: Vec<AclTensor> = parts
+        .iter()
+        .zip(shapes)
+        .map(|(b, s)| AclTensor::fp16_nd(b, s))
+        .collect::<Result<Vec<_>>>()?;
+    let t_out = AclTensor::fp16_nd(&out, out_shape)?;
+
+    let handles: Vec<*mut std::ffi::c_void> = descs.iter().map(|d| d.handle()).collect();
+    let list = unsafe {
+        let l = ffi::aclCreateTensorList(handles.as_ptr(), handles.len() as u64);
+        if l.is_null() {
+            return Err(AclError { code: -1, op: "aclCreateTensorList" });
+        }
+        l
+    };
+
+    two_stage(
+        ctx,
+        stream,
+        "aclnnCat",
+        |ws, ex| unsafe { ffi::aclnnCatGetWorkspaceSize(list, dim, t_out.handle(), ws, ex) },
+        |ws, size, ex| unsafe { ffi::aclnnCat(ws, size, ex, stream.handle()) },
+    )?;
+    unsafe { ffi::aclDestroyTensorList(list) };
+    Ok(out)
+}
+
 /// Fused attention (PFA V3) for full (non-causal, unmasked) attention in
 /// BNSD layout: q/k/v/out all [b, n, s, d] fp16, contiguous.
 ///
@@ -157,7 +198,48 @@ pub fn prompt_flash_attention_fp16(
     Ok(out)
 }
 
-/// out = a + b (fp16, same shape).
+/// out = x + bias (fp16): x is [rows, cols], bias is [cols] -- broadcast
+/// via a zero-stride descriptor, no materialized expansion.
+pub fn bias_add_fp16(
+    ctx: &AscendContext,
+    stream: &AscendStream,
+    x: &crate::DeviceBuffer,
+    bias: &crate::DeviceBuffer,
+    rows: i64,
+    cols: i64,
+) -> Result<crate::DeviceBuffer> {
+    let out = ctx.malloc((rows * cols * 2) as usize)?;
+    let tx = AclTensor::fp16_nd(x, &[rows, cols])?;
+    let tb = AclTensor::fp16_row_broadcast(bias, rows, cols)?;
+    let tout = AclTensor::fp16_nd(&out, &[rows, cols])?;
+    let mut one: f32 = 1.0;
+    let alpha = ScalarFp32::new(&mut one);
+    two_stage(
+        ctx,
+        stream,
+        "aclnnAdd(bias)",
+        |ws, ex| unsafe { ffi::aclnnAddGetWorkspaceSize(tx.handle(), tb.handle(), alpha.handle(), tout.handle(), ws, ex) },
+        |ws, size, ex| unsafe { ffi::aclnnAdd(ws, size, ex, stream.handle()) },
+    )?;
+    Ok(out)
+}
+
+/// Flow-matching Euler step: x = x0 + sigma * (x1 - x0), elementwise fp16.
+/// Two composed aclnn calls (sub via mul(-1)+add avoided; muls+add used):
+/// dx = (x1 - x0) needs a sub op -- express as add(x1, muls(x0, -1)).
+pub fn euler_update_fp16(
+    ctx: &AscendContext,
+    stream: &AscendStream,
+    x0: &crate::DeviceBuffer,
+    x1: &crate::DeviceBuffer,
+    sigma: f32,
+    shape: &[i64],
+) -> Result<crate::DeviceBuffer> {
+    let neg = muls_fp16(ctx, stream, x0, -1.0, shape)?;
+    let dx = add_fp16(ctx, stream, x1, &neg, shape)?;
+    let scaled = muls_fp16(ctx, stream, &dx, sigma, shape)?;
+    add_fp16(ctx, stream, x0, &scaled, shape)
+}
 pub fn add_fp16(
     ctx: &AscendContext,
     stream: &AscendStream,

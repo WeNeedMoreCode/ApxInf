@@ -15,6 +15,32 @@ pub struct AclTensor {
 }
 
 impl AclTensor {
+    /// fp16 [rows, cols] descriptor whose row stride is 0 -- broadcasts a
+    /// [cols] bias across rows in aclnnAdd without materializing.
+    pub fn fp16_row_broadcast(buf: &crate::DeviceBuffer, rows: i64, cols: i64) -> Result<Self> {
+        assert_eq!(buf.len(), (cols * 2) as usize, "bias buffer must hold one fp16 row");
+        let dims = [rows, cols];
+        let stride = [0i64, 1];
+        let storage = [cols]; // backing buffer physically holds one row
+        let raw = unsafe {
+            ffi::aclCreateTensor(
+                dims.as_ptr(),
+                dims.len() as u64,
+                ffi::ACL_FLOAT16,
+                stride.as_ptr(),
+                0,
+                ffi::ACL_FORMAT_ND,
+                storage.as_ptr(),
+                storage.len() as u64,
+                buf.as_ptr(),
+            )
+        };
+        if raw.is_null() {
+            return Err(AclError { code: -1, op: "aclCreateTensor(row_broadcast)" });
+        }
+        Ok(Self { raw })
+    }
+
     /// Build an ND fp32 descriptor (elementwise output stats, rstd etc.).
     pub fn fp32_nd(buf: &crate::DeviceBuffer, shape: &[i64]) -> Result<Self> {
         let elems: i64 = shape.iter().product();

@@ -155,9 +155,26 @@ extern "C" {
         stream: *mut c_void,
     ) -> i32;
 
-    // aclnn/acl_meta.h scalars.
+    // aclnn/acl_meta.h scalars and lists.
     pub fn aclCreateScalar(value: *mut c_void, dataType: u32) -> *mut c_void;
     pub fn aclDestroyScalar(scalar: *mut c_void) -> i32;
+    pub fn aclCreateTensorList(value: *const *mut c_void, size: u64) -> *mut c_void;
+    pub fn aclDestroyTensorList(list: *mut c_void) -> i32;
+
+    // aclnnop/aclnn_cat.h: concatenate tensors along `dim`.
+    pub fn aclnnCatGetWorkspaceSize(
+        tensors: *mut c_void,
+        dim: i64,
+        out: *mut c_void,
+        workspaceSize: *mut u64,
+        executor: *mut *mut c_void,
+    ) -> i32;
+    pub fn aclnnCat(
+        workspace: *mut c_void,
+        workspaceSize: u64,
+        executor: *mut c_void,
+        stream: *mut c_void,
+    ) -> i32;
 
     // aclnnop/aclnn_mul.h: out = self * other / out = self * scalar.
     pub fn aclnnMulGetWorkspaceSize(
