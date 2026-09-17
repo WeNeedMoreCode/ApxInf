@@ -5,6 +5,26 @@ use apxinf_ascend::ops;
 use apxinf_ascend::{AscendContext, AscendStream};
 use half::f16;
 
+fn half_f16(x: f32) -> u16 {
+    let bits = x.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exp = ((bits >> 23) & 0xff) as i32 - 127 + 15;
+    let mant = bits & 0x007f_ffff;
+    if ((bits >> 23) & 0xff) == 0 || exp <= 0 {
+        return sign;
+    }
+    if exp >= 0x1f {
+        return sign | 0x7c00;
+    }
+    let mm = (mant >> 13) as u16;
+    let rem = mant & 0x1fff;
+    let mut out = ((exp as u16) << 10) | mm;
+    if rem > 0x1000 || (rem == 0x1000 && (mm & 1) == 1) {
+        out += 1;
+    }
+    sign | out
+}
+
 fn main() {
     let ctx = AscendContext::new(0).expect("ctx");
     let stream = AscendStream::new().expect("stream");
@@ -156,6 +176,136 @@ fn main() {
                 }
             }
             Err(e) => println!("PFA ERR {e:?}"),
+        }
+    }
+    // Variant 5: full layer-sequence replication, segment by segment,
+    // in the smoke's exact op order. The last println printed before
+    // the fault names the poisoning segment.
+    println!("-- full layer sequence replication --");
+    {
+        use apxinf_ascend::ops as o;
+        let (heads, kv_heads, hd) = (8i64, 1i64, 256i64);
+        let qd = heads * hd;
+        let kvd = kv_heads * hd;
+        let inter = 8192i64;
+        let mkbuf = |len: usize| ctx.malloc(len).unwrap();
+        let rndbuf = |len: usize| -> apxinf_ascend::DeviceBuffer {
+            let h: Vec<f16> = (0..len / 2).map(|_| f16::from_f32(rnd())).collect();
+            let d = ctx.malloc(len).unwrap();
+            ctx.copy_h2d(&d, bytemuck::cast_slice(&h)).unwrap();
+            d
+        };
+        // seg 0: zeros cache
+        let zeros = mkbuf((m * k * 2) as usize);
+        ctx.copy_h2d(&zeros, &vec![0u8; (m * k * 2) as usize]).unwrap();
+        println!("seg0 zeros");
+        // seg 1: rms
+        let gamma = rndbuf((k * 2) as usize);
+        let (normed, _) = o::add_rms_norm_fp16(&ctx, &stream, &da, &zeros, &gamma, &[m, k], 1e-6).unwrap();
+        stream.synchronize().unwrap();
+        println!("seg1 rms");
+        // seg 2: transposed weight cache for qkv (d2h -> transpose -> h2d)
+        let qkv_w = rndbuf((k * (qd + 2 * kvd)) as usize * 2);
+        let mut host = vec![0u8; qkv_w.len()];
+        ctx.copy_d2h(&qkv_w, &mut host).unwrap();
+        let t = o::host_transpose(&host, k, qd + 2 * kvd);
+        let qkv_wt = mkbuf(t.len());
+        ctx.copy_h2d(&qkv_wt, &t).unwrap();
+        stream.synchronize().unwrap();
+        println!("seg2 nzcache-style transpose");
+        // seg 3: qkv matmul (transposed)
+        let qkv = o::matmul_b_t_fp16(&ctx, &stream, &normed, [m, k], &qkv_wt, k, qd + 2 * kvd).unwrap();
+        stream.synchronize().unwrap();
+        println!("seg3 qkv matmul");
+        // seg 4: take_rows split
+        let q = o::take_rows_fp16(&ctx, &stream, &qkv, 0, m, qd).unwrap();
+        let kk = o::take_rows_fp16(&ctx, &stream, &qkv, m, m, kvd).unwrap();
+        let vv = o::take_rows_fp16(&ctx, &stream, &qkv, m * 2, m, kvd).unwrap();
+        stream.synchronize().unwrap();
+        println!("seg4 take_rows");
+        // seg 5: kv_bias round trips
+        let bias_full = rndbuf(((qd + 2 * kvd) * 2) as usize);
+        let mut bh = vec![0u8; bias_full.len()];
+        ctx.copy_d2h(&bias_full, &mut bh).unwrap();
+        let kb = mkbuf((kvd * 2) as usize);
+        ctx.copy_h2d(&kb, &bh[(qd * 2) as usize..((qd + kvd) * 2) as usize]).unwrap();
+        let vb = mkbuf((kvd * 2) as usize);
+        ctx.copy_h2d(&vb, &bh[((qd + kvd) * 2) as usize..]).unwrap();
+        stream.synchronize().unwrap();
+        println!("seg5 kv_bias roundtrip");
+        // seg 6: rope for q (pos-gather + channel gather + mul + mul + add)
+        let rot_idx: Vec<i32> = (0..hd as usize).map(|i| if i < 128 { i + 128 } else { i - 128 } as i32).collect();
+        let dridx = mkbuf(hd as usize * 4);
+        ctx.copy_h2d(&dridx, unsafe { std::slice::from_raw_parts(rot_idx.as_ptr() as *const u8, hd as usize * 4) }).unwrap();
+        let mut cos_t = vec![0u16; (m * qd) as usize];
+        let mut sin_t = vec![0u16; (m * qd) as usize];
+        for pos in 0..m as usize {
+            for h in 0..heads as usize {
+                for i in 0..hd as usize / 2 {
+                    let f = pos as f32 / 10000f32.powf(i as f32 * 2.0 / hd as f32);
+                    let (c, s) = (f.cos(), f.sin());
+                    let base = (pos * heads as usize + h) * hd as usize;
+                    cos_t[base + i] = half_f16(c);
+                    cos_t[base + i + 128] = half_f16(c);
+                    sin_t[base + i] = half_f16(-s);
+                    sin_t[base + i + 128] = half_f16(s);
+                }
+            }
+        }
+        let dc = mkbuf(cos_t.len() * 2);
+        let ds = mkbuf(sin_t.len() * 2);
+        ctx.copy_h2d(&dc, unsafe { std::slice::from_raw_parts(cos_t.as_ptr() as *const u8, cos_t.len() * 2) }).unwrap();
+        ctx.copy_h2d(&ds, unsafe { std::slice::from_raw_parts(sin_t.as_ptr() as *const u8, sin_t.len() * 2) }).unwrap();
+        let qb = o::bias_add_fp16(&ctx, &stream, &q, &bias_full, m, qd).unwrap(); // (full-width bias would be wrong numerically; irrelevant for the fault)
+        let _ = qb;
+        let qr = o::rope_rotate_half_fp16(&ctx, &stream, &q, m * heads, hd, &dc, &ds, &dridx).unwrap();
+        let kr = o::rope_rotate_half_fp16(&ctx, &stream, &kk, m * kv_heads, hd, &dc, &ds, &dridx).unwrap();
+        stream.synchronize().unwrap();
+        println!("seg6 rope");
+        // seg 7: PFA
+        let attn = o::prompt_flash_attention_bsh_fp16(&ctx, &stream, &qr, &kr, &vv, m, heads, kv_heads, hd, None).unwrap();
+        stream.synchronize().unwrap();
+        println!("seg7 pfa (len {})", attn.len());
+        // seg 8: output proj + residual + rms
+        let ow = rndbuf((qd * k) as usize * 2);
+        let mut oh = vec![0u8; ow.len()];
+        ctx.copy_d2h(&ow, &mut oh).unwrap();
+        let ot = o::host_transpose(&oh, qd, k);
+        let owt = mkbuf(ot.len());
+        ctx.copy_h2d(&owt, &ot).unwrap();
+        let proj = o::matmul_b_t_fp16(&ctx, &stream, &attn, [m, qd], &owt, qd, k).unwrap();
+        let res = o::add_fp16(&ctx, &stream, &proj, &normed, &[m, k]).unwrap();
+        let (norm2, _) = o::add_rms_norm_fp16(&ctx, &stream, &res, &zeros, &gamma, &[m, k], 1e-6).unwrap();
+        stream.synchronize().unwrap();
+        println!("seg8 output proj + rms");
+        // seg 9: gate_up matmul + split + gelu + mul
+        let gw = rndbuf((k * (inter * 2)) as usize * 2);
+        let mut gh = vec![0u8; gw.len()];
+        ctx.copy_d2h(&gw, &mut gh).unwrap();
+        let gt = o::host_transpose(&gh, k, inter * 2);
+        let gwt = mkbuf(gt.len());
+        ctx.copy_h2d(&gwt, &gt).unwrap();
+        let gate_up = o::matmul_b_t_fp16(&ctx, &stream, &norm2, [m, k], &gwt, k, inter * 2).unwrap();
+        let up = o::take_rows_fp16(&ctx, &stream, &gate_up, 0, m, inter).unwrap();
+        let gate = o::take_rows_fp16(&ctx, &stream, &gate_up, m, m, inter).unwrap();
+        let gg = o::gelu_fp16(&ctx, &stream, &gate, &[m, inter], true).unwrap();
+        let act = o::mul_fp16(&ctx, &stream, &up, &gg, &[m, inter]).unwrap();
+        stream.synchronize().unwrap();
+        println!("seg9 gate_up + geglu");
+        // seg 10: DOWN MATMUL (the smoke's op #25)
+        let dw = rndbuf((inter * k) as usize * 2);
+        let mut dh2 = vec![0u8; dw.len()];
+        ctx.copy_d2h(&dw, &mut dh2).unwrap();
+        let dtt = o::host_transpose(&dh2, inter, k);
+        let dwt = mkbuf(dtt.len());
+        ctx.copy_h2d(&dwt, &dtt).unwrap();
+        match o::matmul_b_t_fp16(&ctx, &stream, &act, [m, inter], &dwt, inter, k) {
+            Ok(out) => {
+                let _ = out;
+                let _ = stream.synchronize();
+                println!("seg10 DOWN MATMUL OK -- sequence replication passes fully");
+            }
+            Err(e) => println!("seg10 DOWN MATMUL ERR {e:?}"),
         }
     }
     println!("PROBE_DONE");
