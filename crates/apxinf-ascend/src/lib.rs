@@ -12,6 +12,7 @@
 //! (`acl_base.h`, `acl_rt.h`) — no bindgen/clang dependency. Keep them in
 //! sync manually when the toolkit moves.
 
+pub mod backend;
 pub mod context;
 pub mod ffi;
 pub mod graph;
@@ -19,6 +20,7 @@ pub mod ops;
 pub mod stream;
 pub mod tensor;
 
+pub use backend::AscendBackend;
 pub use context::{AscendContext, DeviceBuffer};
 pub use graph::AscendGraph;
 pub use stream::AscendStream;

@@ -159,6 +159,34 @@ extern "C" {
     pub fn aclCreateScalar(value: *mut c_void, dataType: u32) -> *mut c_void;
     pub fn aclDestroyScalar(scalar: *mut c_void) -> i32;
 
+    // aclnnop/aclnn_mul.h: out = self * other / out = self * scalar.
+    pub fn aclnnMulGetWorkspaceSize(
+        selfT: *mut c_void,
+        other: *mut c_void,
+        out: *mut c_void,
+        workspaceSize: *mut u64,
+        executor: *mut *mut c_void,
+    ) -> i32;
+    pub fn aclnnMul(
+        workspace: *mut c_void,
+        workspaceSize: u64,
+        executor: *mut c_void,
+        stream: *mut c_void,
+    ) -> i32;
+    pub fn aclnnMulsGetWorkspaceSize(
+        selfT: *mut c_void,
+        other: *mut c_void,
+        out: *mut c_void,
+        workspaceSize: *mut u64,
+        executor: *mut *mut c_void,
+    ) -> i32;
+    pub fn aclnnMuls(
+        workspace: *mut c_void,
+        workspaceSize: u64,
+        executor: *mut c_void,
+        stream: *mut c_void,
+    ) -> i32;
+
     // aclnnop/level2/aclnn_prompt_flash_attention_v3.h -- PFA, the fused
     // attention for 310P-class inference cards (fp16 only). The legacy
     // aclnnPromptFlashAttention deprecates 2026-12; V3 is the long-term API.

@@ -150,6 +150,9 @@ pub struct DeviceBuffer {
 }
 
 unsafe impl Send for DeviceBuffer {}
+// Shared read-only access to a raw pointer is sound: ops take &self and ACL
+// memory APIs accept const device pointers for reads.
+unsafe impl Sync for DeviceBuffer {}
 
 impl DeviceBuffer {
     pub fn as_ptr(&self) -> *mut c_void {

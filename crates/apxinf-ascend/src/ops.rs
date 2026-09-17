@@ -183,6 +183,51 @@ pub fn add_fp16(
     Ok(out)
 }
 
+/// out = a * b (fp16, same shape).
+pub fn mul_fp16(
+    ctx: &AscendContext,
+    stream: &AscendStream,
+    a: &crate::DeviceBuffer,
+    b: &crate::DeviceBuffer,
+    shape: &[i64],
+) -> Result<crate::DeviceBuffer> {
+    let out = ctx.malloc(a.len())?;
+    let ta = AclTensor::fp16_nd(a, shape)?;
+    let tb = AclTensor::fp16_nd(b, shape)?;
+    let tout = AclTensor::fp16_nd(&out, shape)?;
+    two_stage(
+        ctx,
+        stream,
+        "aclnnMul",
+        |ws, ex| unsafe { ffi::aclnnMulGetWorkspaceSize(ta.handle(), tb.handle(), tout.handle(), ws, ex) },
+        |ws, size, ex| unsafe { ffi::aclnnMul(ws, size, ex, stream.handle()) },
+    )?;
+    Ok(out)
+}
+
+/// out = a * scalar (fp16 elementwise; scalar passed as fp32).
+pub fn muls_fp16(
+    ctx: &AscendContext,
+    stream: &AscendStream,
+    a: &crate::DeviceBuffer,
+    scalar: f32,
+    shape: &[i64],
+) -> Result<crate::DeviceBuffer> {
+    let out = ctx.malloc(a.len())?;
+    let ta = AclTensor::fp16_nd(a, shape)?;
+    let tout = AclTensor::fp16_nd(&out, shape)?;
+    let mut s = scalar;
+    let sc = ScalarFp32::new(&mut s);
+    two_stage(
+        ctx,
+        stream,
+        "aclnnMuls",
+        |ws, ex| unsafe { ffi::aclnnMulsGetWorkspaceSize(ta.handle(), sc.handle(), tout.handle(), ws, ex) },
+        |ws, size, ex| unsafe { ffi::aclnnMuls(ws, size, ex, stream.handle()) },
+    )?;
+    Ok(out)
+}
+
 /// out = silu(a) = a * sigmoid(a) (fp16 elementwise).
 pub fn silu_fp16(
     ctx: &AscendContext,

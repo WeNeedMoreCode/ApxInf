@@ -11,6 +11,7 @@ pub struct AscendStream {
 }
 
 unsafe impl Send for AscendStream {}
+unsafe impl Sync for AscendStream {}
 
 impl AscendStream {
     pub fn new() -> Result<Self> {
