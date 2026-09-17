@@ -31,7 +31,10 @@ fn with_m_padded(
     target_m: i64,
     f: impl FnOnce(&crate::DeviceBuffer, i64) -> Result<crate::DeviceBuffer>,
 ) -> Result<crate::DeviceBuffer> {
-    let padded = ctx.malloc((target_m * k * 2) as usize)?;
+    // pooled scratch: padded feeds async memset/copy/matmul and must
+    // outlive the stream queue (aclrtFree is not stream-ordered)
+    let padded = ctx.scratch_buf((target_m * k * 2) as usize)?;
+    let padded: &crate::DeviceBuffer = &padded;
     ctx.memset_async(&padded, 0, stream)?;
     let bytes = (m * k * 2) as usize;
     let code = unsafe {

@@ -21,7 +21,7 @@ pub mod stream;
 pub mod tensor;
 
 pub use backend::AscendBackend;
-pub use context::{AscendContext, DeviceBuffer};
+pub use context::{flush_pending_frees, AscendContext, DeviceBuffer};
 pub use graph::AscendGraph;
 pub use stream::AscendStream;
 pub use tensor::AclTensor;

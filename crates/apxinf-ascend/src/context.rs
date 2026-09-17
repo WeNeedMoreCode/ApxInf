@@ -28,6 +28,28 @@ fn ensure_init() -> Result<()> {
 pub struct AscendContext {
     device_id: i32,
     raw: *mut c_void,
+    /// Reuse pool for short-lived scratch buffers that feed async ops.
+    /// aclrtFree does not wait for the stream, so dropping a buffer whose
+    /// async consumers are still queued is a use-after-free (sdma copy
+    /// error 0x217 under deep queues, 2026-09-18 bench). Pooling by size
+    /// keeps every buffer alive forever; single-stream execution makes
+    /// same-size reuse sequentially ordered (a kernel's reads finish
+    /// before the next same-size writer's writes begin).
+    scratch: std::sync::Mutex<std::collections::HashMap<usize, Vec<std::sync::Arc<DeviceBuffer>>>>,
+}
+
+impl AscendContext {
+    /// Get a pooled scratch buffer of exactly `len` bytes (zeroed by the
+    /// caller before use as an accumulator input; contents are undefined).
+    pub fn scratch_buf(&self, len: usize) -> Result<std::sync::Arc<DeviceBuffer>> {
+        let mut pool = self.scratch.lock().unwrap();
+        if let Some(buf) = pool.get_mut(&len).and_then(|v| v.pop()) {
+            return Ok(buf);
+        }
+        let buf = std::sync::Arc::new(self.malloc(len)?);
+        pool.entry(len).or_default().reserve(1);
+        Ok(buf)
+    }
 }
 
 // The raw context handle is opaque; ACL APIs are thread-safe for concurrent
@@ -50,7 +72,7 @@ impl AscendContext {
             unsafe { ffi::aclrtResetDevice(id) };
             return Err(AclError { code, op: "aclrtCreateContext" });
         }
-        Ok(Self { device_id: id, raw })
+        Ok(Self { device_id: id, raw, scratch: Default::default() })
     }
 
     pub fn device_id(&self) -> usize {
@@ -168,10 +190,33 @@ impl DeviceBuffer {
     }
 }
 
+/// Buffers whose async consumers may still sit in the stream queue.
+/// aclrtFree is NOT stream-ordered: freeing immediately lets a later
+/// malloc reuse the address while a kernel/memcpy still touches it
+/// (sdma copy error 0x217 under deep queues, bench 2026-09-18). Drops
+/// park here; the next successful stream synchronize flushes for real.
+/// Raw device pointer + length, parked until the stream drains. The
+/// wrapper makes the static's Send requirement honest (ACL device
+/// pointers are plain addresses; freeing on any thread after the
+/// stream drained is safe).
+struct PendingPtr(*mut std::ffi::c_void, usize);
+unsafe impl Send for PendingPtr {}
+
+static PENDING_FREES: std::sync::Mutex<Vec<PendingPtr>> = std::sync::Mutex::new(Vec::new());
+
+/// Really free everything parked by DeviceBuffer drops. Only safe after
+/// the stream has drained (callers: stream/context synchronize).
+pub fn flush_pending_frees() {
+    let mut pending = PENDING_FREES.lock().unwrap();
+    for entry in pending.drain(..) {
+        unsafe { ffi::aclrtFree(entry.0) };
+    }
+}
+
 impl Drop for DeviceBuffer {
     fn drop(&mut self) {
         if !self.ptr.is_null() {
-            unsafe { ffi::aclrtFree(self.ptr) };
+            PENDING_FREES.lock().unwrap().push(PendingPtr(self.ptr, self.len));
         }
     }
 }

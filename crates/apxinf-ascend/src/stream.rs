@@ -32,6 +32,8 @@ impl AscendStream {
         if code != 0 {
             return Err(AclError { code, op: "aclrtSynchronizeStream" });
         }
+        // queue drained: safe to release buffers parked by DeviceBuffer drops
+        crate::flush_pending_frees();
         Ok(())
     }
 }

@@ -95,7 +95,10 @@ pub(crate) mod aq {
         acl(aops::matmul_b_t_fp16(be.ctx(), be.stream(), a, ash, &bt, bsh[0], bsh[1]))
     }
     pub fn bias(be: &AscendBackend, x: &DeviceBuffer, bias: Option<&DeviceBuffer>, rows: i64, cols: i64) -> Result<DeviceBuffer> {
-        acl(aops::bias_add_fp16(be.ctx(), be.stream(), x, bias.ok_or_else(|| Error::Other("bias required in aq::bias".into()))?, rows, cols))
+        match bias {
+            Some(b) => acl(aops::bias_add_fp16(be.ctx(), be.stream(), x, b, rows, cols)),
+            None => acl(aops::take_rows_fp16(be.ctx(), be.stream(), x, 0, (x.len() / 2) as i64, 1)),
+        }
     }
     pub fn add(be: &AscendBackend, a: &DeviceBuffer, b: &DeviceBuffer, sh: &[i64]) -> Result<DeviceBuffer> {
         acl(aops::add_fp16(be.ctx(), be.stream(), a, b, sh))
@@ -286,7 +289,7 @@ fn apply_rope_rows(
             pos_idx.push((pos_offset as i64 + t) as i32);
         }
     }
-    let pos_buf = acl(ctx.malloc(pos_idx.len() * 4))?;
+    let pos_buf = acl(ctx.scratch_buf(pos_idx.len() * 4))?;
     let pb = unsafe { std::slice::from_raw_parts(pos_idx.as_ptr() as *const u8, pos_idx.len() * 4) };
     acl(ctx.copy_h2d(&pos_buf, pb))?;
 
@@ -299,8 +302,8 @@ fn apply_rope_rows(
     let t_cos_tab = acl(apxinf_ascend::AclTensor::fp16_nd(&tables.cos, &[max_pos, d]))?;
     let t_sin_tab = acl(apxinf_ascend::AclTensor::fp16_nd(&tables.sin_signed, &[max_pos, d]))?;
     let t_pos = acl(apxinf_ascend::AclTensor::i32_nd(&pos_buf, &[rows]))?;
-    let cos_pos = acl(ctx.malloc((rows * d * 2) as usize))?;
-    let sin_pos = acl(ctx.malloc((rows * d * 2) as usize))?;
+    let cos_pos = acl(ctx.scratch_buf((rows * d * 2) as usize))?;
+    let sin_pos = acl(ctx.scratch_buf((rows * d * 2) as usize))?;
     let t_cp = acl(apxinf_ascend::AclTensor::fp16_nd(&cos_pos, &[rows, d]))?;
     let t_sp = acl(apxinf_ascend::AclTensor::fp16_nd(&sin_pos, &[rows, d]))?;
     for (tab, out) in [(t_cos_tab.handle(), t_cp.handle()), (t_sin_tab.handle(), t_sp.handle())] {
@@ -377,9 +380,9 @@ pub fn language_layer_ascend(
     let q_bias = kv_bias(be, &weights.qkv.bias, 0, qd)?;
     let k_bias = kv_bias(be, &weights.qkv.bias, qd, kv_d)?;
     let v_bias = kv_bias(be, &weights.qkv.bias, qd + kv_d, kv_d)?;
-    let q = aq::bias(be,&q_raw, q_bias.as_ref(), tokens, qd)?;
-    let k = aq::bias(be,&k_raw, k_bias.as_ref(), tokens, kv_d)?;
-    let v = aq::bias(be,&v_raw, v_bias.as_ref(), tokens, kv_d)?;
+    let q = aq::bias(be,&q_raw, q_bias.as_deref(), tokens, qd)?;
+    let k = aq::bias(be,&k_raw, k_bias.as_deref(), tokens, kv_d)?;
+    let v = aq::bias(be,&v_raw, v_bias.as_deref(), tokens, kv_d)?;
 
     let q_rope = apply_rope_rows(be, cache, &q, tokens, config.num_heads as i64, rope_theta, position_offset)?;
     let k_rope = apply_rope_rows(be, cache, &k, tokens, config.num_kv_heads as i64, rope_theta, position_offset)?;
@@ -432,7 +435,7 @@ fn tensor_opt(t: &Option<Tensor>) -> Result<Option<&DeviceBuffer>> {
 }
 
 /// Slice a fused qkv bias into a kv-slice device row (host pass-through).
-fn kv_bias(be: &AscendBackend, bias: &Option<Tensor>, start: i64, len: i64) -> Result<Option<DeviceBuffer>> {
+fn kv_bias(be: &AscendBackend, bias: &Option<Tensor>, start: i64, len: i64) -> Result<Option<Arc<DeviceBuffer>>> {
     let Some(bias) = bias else { return Ok(None) };
     let b = tensor_buf(bias)?;
     let bytes = (len * 2) as usize;
@@ -440,7 +443,7 @@ fn kv_bias(be: &AscendBackend, bias: &Option<Tensor>, start: i64, len: i64) -> R
     // full d2h then host-side slice (bias is tiny and static)
     let mut full = vec![0u8; b.len()];
     acl(be.ctx().copy_d2h(b, &mut full))?;
-    let out = acl(be.ctx().malloc(bytes))?;
+    let out = acl(be.ctx().scratch_buf(bytes))?;
     acl(be.ctx().copy_h2d(&out, &full[off..off + bytes]))?;
     acl(be.stream().synchronize())?;
     Ok(Some(out))
@@ -500,9 +503,9 @@ pub fn vision_layer_ascend(
     let q_bias = vision_kv_bias(be, &weights.qkv.bias, 0, qd)?;
     let k_bias = vision_kv_bias(be, &weights.qkv.bias, qd, qd)?;
     let v_bias = vision_kv_bias(be, &weights.qkv.bias, qd * 2, qd)?;
-    let q = aq::bias(be,&q_raw, q_bias.as_ref(), tokens, qd)?;
-    let k = aq::bias(be,&k_raw, k_bias.as_ref(), tokens, qd)?;
-    let v = aq::bias(be,&v_raw, v_bias.as_ref(), tokens, qd)?;
+    let q = aq::bias(be,&q_raw, q_bias.as_deref(), tokens, qd)?;
+    let k = aq::bias(be,&k_raw, k_bias.as_deref(), tokens, qd)?;
+    let v = aq::bias(be,&v_raw, v_bias.as_deref(), tokens, qd)?;
 
     // SigLIP attends WITHIN each view's window: [views, tpv] batched PFA
     // over the same contiguous [tokens, qd] buffers.
@@ -552,41 +555,48 @@ pub fn vision_patch_embed_ascend(
     // cyclic per-view repeat of the [p, width] table
     let idx: Vec<i32> = (0..tokens as usize).map(|r| (r % p as usize) as i32).collect();
     let idx_bytes: Vec<u8> = idx.iter().flat_map(|v| v.to_le_bytes()).collect();
-    let di = acl(be.ctx().malloc(idx_bytes.len()))?;
+    let di = acl(be.ctx().scratch_buf(idx_bytes.len()))?;
     acl(be.ctx().copy_h2d(&di, &idx_bytes))?;
     let pos_rep = aq::gather_rows(be, tensor_buf(position_embedding)?, p, out_w, &di, tokens)?;
     let out = acl(aops::add_fp16(be.ctx(), be.stream(), &proj, &pos_rep, &[tokens, out_w]))?;
     Ok(be.wrap_fp16(out, vec![tokens as usize, out_w as usize]))
 }
 
-/// ada-norm: y = rms_norm(x) * (1 + style), style is a [width] row.
+/// ada-norm, cuda kernel semantics (normalization.cuh ada_rms_norm_bf16):
+/// y = rms(x) * (1 + style[0:cols]) + style[cols:2*cols]. The style
+/// projection outputs [3*cols]; the third segment is unused here.
 fn adaptive_rms(be: &AscendBackend, x: &DeviceBuffer, style: &Tensor, rows: i64, cols: i64, eps: f32) -> Result<DeviceBuffer> {
-    // rms with gamma = ones (ada-norm has no gamma), then scale by
-    // row-replicated (1 + style).
+    // rms with gamma = ones (ada-norm has no gamma)
     let zeros = be.zeros(rows as usize * cols as usize * 2)?;
-    let ones = zeros_scale_buf(be, style)?;
+    let c = cols as usize;
+    let ones = zeros_scale_buf(be, c)?;
     let normed = acl(aops::add_rms_norm_fp16(be.ctx(), be.stream(), x, &zeros, &ones, &[rows, cols], eps as f64))?.0;
-    let mut one_plus = vec![0u16; cols as usize];
-    let style_h = host_f16_row(be, style, cols as usize)?;
-    for i in 0..cols as usize {
-        let v = f16_bits_to_f32(style_h[i]);
-        one_plus[i] = f32_to_f16_bits(v + 1.0);
+    let style_h = host_f16_row(be, style, 3 * c)?;
+    let mut scale_row = vec![0u16; c];
+    let mut shift_row = vec![0u16; c];
+    for i in 0..c {
+        scale_row[i] = f32_to_f16_bits(f16_bits_to_f32(style_h[i]) + 1.0);
+        shift_row[i] = style_h[c + i];
     }
-    let row = acl(be.ctx().malloc(cols as usize * 2))?;
-    let bytes: &[u8] = unsafe { std::slice::from_raw_parts(one_plus.as_ptr() as *const u8, one_plus.len() * 2) };
-    acl(be.ctx().copy_h2d(&row, bytes))?;
-    let scale_mat = acl(aops::row_replicate_fp16(be.ctx(), be.stream(), &row, rows, cols))?;
-    acl(aops::mul_fp16(be.ctx(), be.stream(), &normed, &scale_mat, &[rows, cols]))
+    let mut upload = |vals: &[u16]| -> Result<Arc<DeviceBuffer>> {
+        let buf = acl(be.ctx().scratch_buf(vals.len() * 2))?;
+        let bytes: &[u8] = unsafe { std::slice::from_raw_parts(vals.as_ptr() as *const u8, vals.len() * 2) };
+        acl(be.ctx().copy_h2d(&buf, bytes))?;
+        Ok(buf)
+    };
+    let scale_b = upload(&scale_row)?;
+    let shift_b = upload(&shift_row)?;
+    let scale_mat = acl(aops::row_replicate_fp16(be.ctx(), be.stream(), &scale_b, rows, cols))?;
+    let shift_mat = acl(aops::row_replicate_fp16(be.ctx(), be.stream(), &shift_b, rows, cols))?;
+    let scaled = acl(aops::mul_fp16(be.ctx(), be.stream(), &normed, &scale_mat, &[rows, cols]))?;
+    acl(aops::add_fp16(be.ctx(), be.stream(), &scaled, &shift_mat, &[rows, cols]))
 }
 
-fn zeros_scale_buf(be: &AscendBackend, style: &Tensor) -> Result<DeviceBuffer> {
-    // gamma for rms = style itself in pi0.5's ada-norm? The cuda path uses
-    // adaptive_rms(x, style): norm scale comes from the style projection.
-    // Gemma3 ada-norm: normalized = rms(x) * (1 + style); rms has NO gamma.
-    // So gamma = ones.
-    let width = style.shape().dims()[0];
-    let ones = vec![0x3c00u16; width]; // 1.0 fp16
-    let buf = acl(be.ctx().malloc(width * 2))?;
+fn zeros_scale_buf(be: &AscendBackend, cols: usize) -> Result<Arc<DeviceBuffer>> {
+    // ada-norm's rms carries no gamma (the scale lives in the style
+    // projection) -- gamma = ones of exactly `cols`.
+    let ones = vec![0x3c00u16; cols]; // 1.0 fp16
+    let buf = acl(be.ctx().scratch_buf(cols * 2))?;
     let bytes: &[u8] = unsafe { std::slice::from_raw_parts(ones.as_ptr() as *const u8, ones.len() * 2) };
     acl(be.ctx().copy_h2d(&buf, bytes))?;
     Ok(buf)
@@ -632,7 +642,7 @@ fn f32_to_f16_bits(x: f32) -> u16 {
 }
 
 /// Host-side kv bias slice (same pass-through as language path).
-fn vision_kv_bias(be: &AscendBackend, bias: &Option<Tensor>, start: i64, len: i64) -> Result<Option<DeviceBuffer>> {
+fn vision_kv_bias(be: &AscendBackend, bias: &Option<Tensor>, start: i64, len: i64) -> Result<Option<Arc<DeviceBuffer>>> {
     kv_bias(be, bias, start, len)
 }
 
@@ -691,9 +701,9 @@ pub fn action_layer_ascend(
     let q_bias = kv_bias(be, &weights.qkv.bias, 0, qd)?;
     let k_bias = kv_bias(be, &weights.qkv.bias, qd, kv_d)?;
     let v_bias = kv_bias(be, &weights.qkv.bias, qd + kv_d, kv_d)?;
-    let q = acl(aops::bias_add_fp16(ctx, stream, &q_raw, q_bias.as_ref().ok_or_else(|| Error::Other("q bias".into()))?, tokens, qd))?;
-    let k = acl(aops::bias_add_fp16(ctx, stream, &k_raw, k_bias.as_ref().ok_or_else(|| Error::Other("k bias".into()))?, tokens, kv_d))?;
-    let v = acl(aops::bias_add_fp16(ctx, stream, &v_raw, v_bias.as_ref().ok_or_else(|| Error::Other("v bias".into()))?, tokens, kv_d))?;
+    let q = aq::bias(be, &q_raw, q_bias.as_deref(), tokens, qd)?;
+    let k = aq::bias(be, &k_raw, k_bias.as_deref(), tokens, kv_d)?;
+    let v = aq::bias(be, &v_raw, v_bias.as_deref(), tokens, kv_d)?;
 
     let q_rope = apply_rope_rows(be, cache, &q, tokens, config.num_heads as i64, rope_theta, position_offset)?;
     let k_rope = apply_rope_rows(be, cache, &k, tokens, config.num_kv_heads as i64, rope_theta, position_offset)?;
