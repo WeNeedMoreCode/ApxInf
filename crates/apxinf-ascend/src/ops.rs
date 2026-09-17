@@ -487,6 +487,92 @@ pub fn prompt_flash_attention_bsh_fp16(
     Ok(out)
 }
 
+/// Host-side FRACTAL_NZ reordering: pull the weight back, rearrange into
+/// 16x16 blocks on the CPU, upload once. Replaces aclnnNpuFormatCast,
+/// whose descriptor expectations (undocumented ori-shape semantics) we
+/// could not satisfy from the public aclCreateTensor -- weights load once
+/// per process, so a host pass is free. Returns (nz_bytes, dims, strides).
+pub fn host_nz_reorder(host: &[u8], rows: i64, cols: i64) -> (Vec<u8>, Vec<i64>, Vec<i64>) {
+    let h1 = (rows as usize + 15) / 16;
+    let w1 = (cols as usize + 15) / 16;
+    let mut out = vec![0u16; h1 * w1 * 256];
+    let src: Vec<u16> = host.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+    for hb in 0..h1 {
+        for wb in 0..w1 {
+            for i in 0..16 {
+                for j in 0..16 {
+                    let r = hb * 16 + i;
+                    let c = wb * 16 + j;
+                    let v = if r < rows as usize && c < cols as usize { src[r * cols as usize + c] } else { 0 };
+                    // block order W-major: [wb][hb][i][j]
+                    out[(wb * h1 + hb) * 256 + i * 16 + j] = v;
+                }
+            }
+        }
+    }
+    let bytes: Vec<u8> = out.iter().flat_map(|&v| v.to_le_bytes()).collect();
+    let dims = vec![w1 as i64, h1 as i64, 16, 16];
+    let strides = vec![h1 as i64 * 256, 256, 16, 1];
+    (bytes, dims, strides)
+}
+
+/// Build an FRACTAL_NZ descriptor over an already-NZ buffer (see
+/// host_nz_reorder for the layout contract).
+pub fn nz_tensor(buf: &crate::DeviceBuffer, dims: &[i64], strides: &[i64]) -> Result<AclTensor> {
+    let raw = unsafe {
+        ffi::aclCreateTensor(
+            dims.as_ptr(), dims.len() as u64, ffi::ACL_FLOAT16,
+            strides.as_ptr(), 0,
+            ffi::ACL_FORMAT_FRACTAL_NZ,
+            dims.as_ptr(), dims.len() as u64,
+            buf.as_ptr(),
+        )
+    };
+    if raw.is_null() {
+        return Err(AclError { code: -1, op: "aclCreateTensor(NZ)" });
+    }
+    Ok(AclTensor::from_raw(raw))
+}
+
+/// out = a @ b_nz with the weight held in FRACTAL_NZ (host_nz_reorder
+/// layout). Strides describe the NZ block order on the b buffer.
+pub fn matmul_weight_nz_fp16(
+    ctx: &AscendContext,
+    stream: &AscendStream,
+    a: &crate::DeviceBuffer,
+    ash: [i64; 2],
+    b_nz: &crate::DeviceBuffer,
+    b_dims: &[i64],
+    b_strides: &[i64],
+    out_cols: i64,
+) -> Result<crate::DeviceBuffer> {
+    let out = ctx.malloc((ash[0] * out_cols * 2) as usize)?;
+    let ta = AclTensor::fp16_nd(a, &ash)?;
+    let tb = nz_tensor(b_nz, b_dims, b_strides)?;
+    let tout = AclTensor::fp16_nd(&out, &[ash[0], out_cols])?;
+    let mut ws_size: u64 = 0;
+    let mut executor: *mut std::ffi::c_void = std::ptr::null_mut();
+    let code = unsafe {
+        ffi::aclnnMatmulWeightNzGetWorkspaceSize(ta.handle(), tb.handle(), tout.handle(), 1, &mut ws_size, &mut executor)
+    };
+    if code != 0 {
+        return Err(AclError { code, op: "aclnnMatmulWeightNzGetWorkspaceSize" });
+    }
+    let ws = if ws_size > 0 { Some(ctx.malloc(ws_size as usize)?) } else { None };
+    let code = unsafe {
+        ffi::aclnnMatmulWeightNz(
+            ws.as_ref().map(|w| w.as_ptr()).unwrap_or(std::ptr::null_mut()),
+            ws_size,
+            executor,
+            stream.handle(),
+        )
+    };
+    if code != 0 {
+        return Err(AclError { code, op: "aclnnMatmulWeightNz" });
+    }
+    Ok(out)
+}
+
 pub fn add_fp16(
     ctx: &AscendContext,
     stream: &AscendStream,

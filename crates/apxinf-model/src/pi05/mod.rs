@@ -48,6 +48,11 @@ pub use bf16_runtime::{
     upload_time_embeddings_bf16, Bf16PrefixKvCache, Pi05Bf16CapturedGraph, Pi05Bf16CudaRuntime,
 };
 pub use bf16_weights::{bf16_to_device, Bf16LinearWeights};
+#[cfg(feature = "ascend")]
+pub use ascend_executor::{
+    action_layer_ascend, language_layer_ascend, vision_layer_ascend, vision_patch_embed_ascend,
+    AscendCaches, AscendRopeCache,
+};
 #[cfg(feature = "cuda")]
 pub use calibration::Pi05CalibrationObserver;
 pub use config::{GemmaVariantConfig, Pi05Config, Pi05PerformanceProfile};

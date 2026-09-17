@@ -221,6 +221,45 @@ extern "C" {
         stream: *mut c_void,
     ) -> i32;
 
+    // aclnnop/aclnn_npu_format_cast.h: ND -> FRACTAL_NZ weight conversion
+    // (torch_npu's npu_format_cast(w, 29) at the aclnn layer).
+    pub fn aclnnNpuFormatCastCalculateSizeAndFormat(
+        srcTensor: *mut c_void,
+        dstFormat: i32,
+        additionalDtype: i32,
+        dstShape: *mut *mut i64,
+        dstShapeSize: *mut u64,
+        actualFormat: *mut i32,
+    ) -> i32;
+    pub fn aclnnNpuFormatCastGetWorkspaceSize(
+        srcTensor: *mut c_void,
+        dstTensor: *mut c_void,
+        workspaceSize: *mut u64,
+        executor: *mut *mut c_void,
+    ) -> i32;
+    pub fn aclnnNpuFormatCast(
+        workspace: *mut c_void,
+        workspaceSize: u64,
+        executor: *mut c_void,
+        stream: *mut c_void,
+    ) -> i32;
+
+    // aclnnop/aclnn_matmul.h (WeightNz variant): mat2 held in FRACTAL_NZ.
+    pub fn aclnnMatmulWeightNzGetWorkspaceSize(
+        selfT: *mut c_void,
+        mat2: *mut c_void,
+        out: *mut c_void,
+        cubeMathType: i8,
+        workspaceSize: *mut u64,
+        executor: *mut *mut c_void,
+    ) -> i32;
+    pub fn aclnnMatmulWeightNz(
+        workspace: *mut c_void,
+        workspaceSize: u64,
+        executor: *mut c_void,
+        stream: *mut c_void,
+    ) -> i32;
+
     // aclnnop/aclnn_gelu_v2.h: gelu with an `approximate` selector
     // (0 = erf, 1 = tanh), the PyTorch-compatible semantics torch_npu
     // dispatches to. This is the ONLY working gelu entry on 310P3:

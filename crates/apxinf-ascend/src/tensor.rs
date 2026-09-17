@@ -108,6 +108,12 @@ impl AclTensor {
 
     /// Build an ND fp16 descriptor for `buf` with the given shape.
     /// `buf.len` must equal `shape.iter().product() * 2`.
+    /// Wrap a raw aclTensor handle (crate-internal constructor for
+    /// custom-descriptor builders like the NZ path).
+    pub(crate) fn from_raw(raw: *mut std::ffi::c_void) -> Self {
+        Self { raw }
+    }
+
     pub fn fp16_nd(buf: &crate::DeviceBuffer, shape: &[i64]) -> Result<Self> {
         let elems: i64 = shape.iter().product();
         let expect = (elems * 2) as usize;
