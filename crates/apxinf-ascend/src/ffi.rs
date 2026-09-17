@@ -177,6 +177,25 @@ extern "C" {
         stream: *mut c_void,
     ) -> i32;
 
+    // aclnnop/aclnn_apply_rotary_pos_emb.h: fused in-place RoPE for q/k,
+    // rotate-half formula (== Gemma semantics), layout=1 means BSND.
+    // Supported on Atlas inference cards per cann-ops-adv docs.
+    pub fn aclnnApplyRotaryPosEmbGetWorkspaceSize(
+        queryRef: *mut c_void,
+        keyRef: *mut c_void,
+        cos: *mut c_void,
+        sin: *mut c_void,
+        layout: i64,
+        workspaceSize: *mut u64,
+        executor: *mut *mut c_void,
+    ) -> i32;
+    pub fn aclnnApplyRotaryPosEmb(
+        workspace: *mut c_void,
+        workspaceSize: u64,
+        executor: *mut c_void,
+        stream: *mut c_void,
+    ) -> i32;
+
     // aclnnop/aclnn_gelu_v2.h: gelu with an `approximate` selector
     // (0 = erf, 1 = tanh), the PyTorch-compatible semantics torch_npu
     // dispatches to. This is the ONLY working gelu entry on 310P3:

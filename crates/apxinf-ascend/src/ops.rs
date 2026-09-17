@@ -246,6 +246,49 @@ pub fn euler_update_fp16(
     add_fp16(ctx, stream, x0, &scaled, shape)
 }
 
+/// Rotate-half RoPE for one [rows, d] tensor, composed from verified ops
+/// (gather + mul + add). The fused aclnn rope entries hard-reject pi0.5's
+/// head_dims on 310P3 (ApplyRotaryPosEmb: d must be 64/128;
+/// RotaryPositionEmbedding: d must be 32/64/96/128 -- pi0.5 uses 256/72),
+/// so the composition is the primary path, not a fallback.
+///
+/// Caller-managed constants (upload once at load):
+/// - cos_pos/sin_pos: fp16 [rows, d] rows selected per position;
+///   sin_pos must ALREADY carry the rotate-half sign (sin'[r,i] =
+///   sin(r,i) * (-1 if i<d/2 else +1)) -- aclnnMul rejects zero-stride
+///   broadcasts, so the sign is folded into the table host-side.
+/// - rot_idx: i32 [d], rotate-half gather index (i<d/2 -> i+d/2, else i-d/2)
+pub fn rope_rotate_half_fp16(
+    ctx: &AscendContext,
+    stream: &AscendStream,
+    x: &crate::DeviceBuffer,
+    rows: i64,
+    d: i64,
+    cos_pos: &crate::DeviceBuffer,
+    sin_signed: &crate::DeviceBuffer,
+    rot_idx: &crate::DeviceBuffer,
+) -> Result<crate::DeviceBuffer> {
+    // q_rot = gather(x, rot_idx) along the channel dim
+    let t_x = AclTensor::fp16_nd(x, &[rows, d])?;
+    let t_idx = AclTensor::i32_nd(rot_idx, &[d])?;
+    let q_rot = ctx.malloc((rows * d * 2) as usize)?;
+    let t_qrot = AclTensor::fp16_nd(&q_rot, &[rows, d])?;
+    two_stage(
+        ctx,
+        stream,
+        "aclnnGatherV2(rope)",
+        |ws, ex| unsafe {
+            ffi::aclnnGatherV2GetWorkspaceSize(t_x.handle(), 1, t_idx.handle(), t_qrot.handle(), ws, ex)
+        },
+        |ws, size, ex| unsafe { ffi::aclnnGatherV2(ws, size, ex, stream.handle()) },
+    )?;
+
+    // out = x * cos + q_rot * sin_signed
+    let t1 = mul_fp16(ctx, stream, x, cos_pos, &[rows, d])?;
+    let t2 = mul_fp16(ctx, stream, &q_rot, sin_signed, &[rows, d])?;
+    add_fp16(ctx, stream, &t1, &t2, &[rows, d])
+}
+
 /// out = gelu(a), elementwise fp16 via aclnnGeluV2. `tanh_approx` selects
 /// the tanh approximation (PaliGemma/gelu_tanh semantics) vs exact erf.
 pub fn gelu_fp16(
