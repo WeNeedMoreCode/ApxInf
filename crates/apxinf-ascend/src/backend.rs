@@ -260,7 +260,52 @@ impl apxinf_core::SamplingBackend for AscendBackend {
         Err(Error::Other("ascend token sampler pending (flow sampling lands with the PI0.5 executor)".into()))
     }
 
-    fn create_normal_generator(&self, _output: Tensor) -> Result<Box<dyn apxinf_core::NormalGenerator>> {
-        Err(Error::Other("ascend normal generator pending (host RNG path planned first)".into()))
+    fn create_normal_generator(&self, output: Tensor) -> Result<Box<dyn apxinf_core::NormalGenerator>> {
+        // Validate ownership + fp16, matching the CPU/CUDA contracts.
+        if output.device() != self.dev() {
+            return Err(Error::UnsupportedDevice(output.device()));
+        }
+        if output.dtype() != apxinf_core::DType::F16 {
+            return Err(Error::Other(format!(
+                "ascend normal generator expects F16 output, got {:?}",
+                output.dtype()
+            )));
+        }
+        let _ = Self::buf(&output)?; // ensure ascend storage is present
+        Ok(Box::new(AscendNormalGenerator {
+            output,
+            ctx: self.ctx.clone(),
+        }))
+    }
+}
+
+/// Flow-matching noise via the deterministic core RNG, uploaded host-side.
+/// Same semantics as the CPU backend's generator; generation cost is one
+/// h2d copy of numel*2 bytes, hidden behind the model's async dispatch.
+struct AscendNormalGenerator {
+    output: Tensor,
+    ctx: Arc<AscendContext>,
+}
+
+impl apxinf_core::NormalGenerator for AscendNormalGenerator {
+    fn output(&self) -> &Tensor {
+        &self.output
+    }
+
+    fn generate(&mut self, rng: apxinf_core::RngKey) -> Result<&Tensor> {
+        let n = self.output.numel();
+        let f32s = apxinf_core::standard_normal_f32(n, rng);
+        let f16s: Vec<half::f16> = f32s.iter().map(|&x| half::f16::from_f32(x)).collect();
+        let bytes: &[u8] = bytemuck::cast_slice(&f16s);
+        let buf = match self.output.storage() {
+            Storage::Gpu { handle, .. } => handle
+                ._prevent_leak
+                .as_ref()
+                .and_then(|any| any.downcast_ref::<DeviceBuffer>())
+                .ok_or_else(|| Error::Other("ascend tensor storage missing DeviceBuffer".into()))?,
+            _ => return Err(Error::UnsupportedDevice(self.output.device())),
+        };
+        self.ctx.copy_h2d(buf, bytes).map_err(acl_err)?;
+        Ok(&self.output)
     }
 }
