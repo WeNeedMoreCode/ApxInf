@@ -57,6 +57,11 @@ fn main() {
         }
     }
 
+    // `v5only` argv skips variants 0-4: the probe prefix (25+ ops, incl.
+    // the numerically-wrong plain-b read) may itself advance whatever
+    // cumulative state kills later matmuls -- isolate it.
+    let v5only = std::env::args().nth(1).as_deref() == Some("v5only");
+    if !v5only {
     // Variant 0: AddRmsNorm BEFORE the plain matmul -- does the norm
     // corrupt the process state for the following big matmul?
     println!("-- add_rms_norm then plain b --");
@@ -178,6 +183,8 @@ fn main() {
             Err(e) => println!("PFA ERR {e:?}"),
         }
     }
+    } // end !v5only
+
     // Variant 5: full layer-sequence replication, segment by segment,
     // in the smoke's exact op order. The last println printed before
     // the fault names the poisoning segment.
@@ -189,7 +196,7 @@ fn main() {
         let kvd = kv_heads * hd;
         let inter = 8192i64;
         let mkbuf = |len: usize| ctx.malloc(len).unwrap();
-        let rndbuf = |len: usize| -> apxinf_ascend::DeviceBuffer {
+        let mut rndbuf = |len: usize| -> apxinf_ascend::DeviceBuffer {
             let h: Vec<f16> = (0..len / 2).map(|_| f16::from_f32(rnd())).collect();
             let d = ctx.malloc(len).unwrap();
             ctx.copy_h2d(&d, bytemuck::cast_slice(&h)).unwrap();
@@ -237,29 +244,43 @@ fn main() {
         let rot_idx: Vec<i32> = (0..hd as usize).map(|i| if i < 128 { i + 128 } else { i - 128 } as i32).collect();
         let dridx = mkbuf(hd as usize * 4);
         ctx.copy_h2d(&dridx, unsafe { std::slice::from_raw_parts(rot_idx.as_ptr() as *const u8, hd as usize * 4) }).unwrap();
-        let mut cos_t = vec![0u16; (m * qd) as usize];
-        let mut sin_t = vec![0u16; (m * qd) as usize];
+        // rope cache tables: [max_pos, d] (executor's AscendRopeCache shape)
+        let mut cos_tab = vec![0u16; (m * hd) as usize];
+        let mut sin_tab = vec![0u16; (m * hd) as usize];
         for pos in 0..m as usize {
-            for h in 0..heads as usize {
-                for i in 0..hd as usize / 2 {
-                    let f = pos as f32 / 10000f32.powf(i as f32 * 2.0 / hd as f32);
-                    let (c, s) = (f.cos(), f.sin());
-                    let base = (pos * heads as usize + h) * hd as usize;
-                    cos_t[base + i] = half_f16(c);
-                    cos_t[base + i + 128] = half_f16(c);
-                    sin_t[base + i] = half_f16(-s);
-                    sin_t[base + i + 128] = half_f16(s);
-                }
+            for i in 0..hd as usize / 2 {
+                let f = pos as f32 / 10000f32.powf(i as f32 * 2.0 / hd as f32);
+                let (c, s) = (f.cos(), f.sin());
+                let base = pos * hd as usize;
+                cos_tab[base + i] = half_f16(c);
+                cos_tab[base + i + 128] = half_f16(c);
+                sin_tab[base + i] = half_f16(-s);
+                sin_tab[base + i + 128] = half_f16(s);
             }
         }
-        let dc = mkbuf(cos_t.len() * 2);
-        let ds = mkbuf(sin_t.len() * 2);
-        ctx.copy_h2d(&dc, unsafe { std::slice::from_raw_parts(cos_t.as_ptr() as *const u8, cos_t.len() * 2) }).unwrap();
-        ctx.copy_h2d(&ds, unsafe { std::slice::from_raw_parts(sin_t.as_ptr() as *const u8, sin_t.len() * 2) }).unwrap();
-        let qb = o::bias_add_fp16(&ctx, &stream, &q, &bias_full, m, qd).unwrap(); // (full-width bias would be wrong numerically; irrelevant for the fault)
+        let dctab = mkbuf(cos_tab.len() * 2);
+        let dstab = mkbuf(sin_tab.len() * 2);
+        ctx.copy_h2d(&dctab, unsafe { std::slice::from_raw_parts(cos_tab.as_ptr() as *const u8, cos_tab.len() * 2) }).unwrap();
+        ctx.copy_h2d(&dstab, unsafe { std::slice::from_raw_parts(sin_tab.as_ptr() as *const u8, sin_tab.len() * 2) }).unwrap();
+        let qbb = mkbuf((qd * 2) as usize);
+        ctx.copy_h2d(&qbb, &bh[..(qd * 2) as usize]).unwrap();
+        let qb = o::bias_add_fp16(&ctx, &stream, &q, &qbb, m, qd).unwrap();
         let _ = qb;
-        let qr = o::rope_rotate_half_fp16(&ctx, &stream, &q, m * heads, hd, &dc, &ds, &dridx).unwrap();
-        let kr = o::rope_rotate_half_fp16(&ctx, &stream, &kk, m * kv_heads, hd, &dc, &ds, &dridx).unwrap();
+        // per-row materialization via pos-gather (executor's apply_rope_rows)
+        let idx_q: Vec<i32> = (0..m as u32).flat_map(|p| std::iter::repeat(p as i32).take(heads as usize)).collect();
+        let idx_k: Vec<i32> = (0..m as u32).flat_map(|p| std::iter::repeat(p as i32).take(kv_heads as usize)).collect();
+        let diq = mkbuf(idx_q.len() * 4);
+        let dik = mkbuf(idx_k.len() * 4);
+        ctx.copy_h2d(&diq, unsafe { std::slice::from_raw_parts(idx_q.as_ptr() as *const u8, idx_q.len() * 4) }).unwrap();
+        ctx.copy_h2d(&dik, unsafe { std::slice::from_raw_parts(idx_k.as_ptr() as *const u8, idx_k.len() * 4) }).unwrap();
+        let nq = (idx_q.len()) as i64;
+        let nk = (idx_k.len()) as i64;
+        let cos_q = o::gather_rows_fp16(&ctx, &stream, &dctab, m, hd, &diq, nq).unwrap();
+        let sin_q = o::gather_rows_fp16(&ctx, &stream, &dstab, m, hd, &diq, nq).unwrap();
+        let cos_k = o::gather_rows_fp16(&ctx, &stream, &dctab, m, hd, &dik, nk).unwrap();
+        let sin_k = o::gather_rows_fp16(&ctx, &stream, &dstab, m, hd, &dik, nk).unwrap();
+        let qr = o::rope_rotate_half_fp16(&ctx, &stream, &q, m * heads, hd, &cos_q, &sin_q, &dridx).unwrap();
+        let kr = o::rope_rotate_half_fp16(&ctx, &stream, &kk, m * kv_heads, hd, &cos_k, &sin_k, &dridx).unwrap();
         stream.synchronize().unwrap();
         println!("seg6 rope");
         // seg 7: PFA
@@ -286,12 +307,18 @@ fn main() {
         let gwt = mkbuf(gt.len());
         ctx.copy_h2d(&gwt, &gt).unwrap();
         let gate_up = o::matmul_b_t_fp16(&ctx, &stream, &norm2, [m, k], &gwt, k, inter * 2).unwrap();
+        stream.synchronize().unwrap();
+        println!("seg9a gate_up matmul");
         let up = o::take_rows_fp16(&ctx, &stream, &gate_up, 0, m, inter).unwrap();
         let gate = o::take_rows_fp16(&ctx, &stream, &gate_up, m, m, inter).unwrap();
+        stream.synchronize().unwrap();
+        println!("seg9b take_rows x2");
         let gg = o::gelu_fp16(&ctx, &stream, &gate, &[m, inter], true).unwrap();
+        stream.synchronize().unwrap();
+        println!("seg9c gelu");
         let act = o::mul_fp16(&ctx, &stream, &up, &gg, &[m, inter]).unwrap();
         stream.synchronize().unwrap();
-        println!("seg9 gate_up + geglu");
+        println!("seg9d mul");
         // seg 10: DOWN MATMUL (the smoke's op #25)
         let dw = rndbuf((inter * k) as usize * 2);
         let mut dh2 = vec![0u8; dw.len()];

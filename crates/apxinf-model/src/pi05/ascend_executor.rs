@@ -561,6 +561,9 @@ fn zeros_scale_buf(be: &AscendBackend, style: &Tensor) -> Result<DeviceBuffer> {
 
 fn host_f16_row(be: &AscendBackend, t: &Tensor, len: usize) -> Result<Vec<u16>> {
     let b = tensor_buf(t)?;
+    // `t` may be the async product of a matmul on our stream (e.g. the
+    // style projections); synchronous aclrtMemcpy does NOT wait for it.
+    acl(be.stream().synchronize())?;
     let mut host = vec![0u8; len * 2];
     acl(be.ctx().copy_d2h(b, &mut host))?;
     Ok(host.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect())

@@ -106,6 +106,44 @@ extern "C" {
         stream: *mut c_void,
     ) -> i32;
 
+    // aclnnop/aclnn_mm.h: aten::mm mirror, 2x2 pattern only.
+    pub fn aclnnMmGetWorkspaceSize(
+        selfT: *mut c_void,
+        mat2: *mut c_void,
+        out: *mut c_void,
+        cubeMathType: i8,
+        workspaceSize: *mut u64,
+        executor: *mut *mut c_void,
+    ) -> i32;
+    pub fn aclnnMm(
+        workspace: *mut c_void,
+        workspaceSize: u64,
+        executor: *mut c_void,
+        stream: *mut c_void,
+    ) -> i32;
+
+    // aclnnop/level2/aclnn_gemm.h: BLAS gemm with explicit transA/transB.
+    // out = alpha * op(A) * op(B) + beta * C.
+    pub fn aclnnGemmGetWorkspaceSize(
+        a: *mut c_void,
+        b: *mut c_void,
+        c: *mut c_void,
+        alpha: f32,
+        beta: f32,
+        transA: i64,
+        transB: i64,
+        out: *mut c_void,
+        cubeMathType: i8,
+        workspaceSize: *mut u64,
+        executor: *mut *mut c_void,
+    ) -> i32;
+    pub fn aclnnGemm(
+        workspace: *mut c_void,
+        workspaceSize: u64,
+        executor: *mut c_void,
+        stream: *mut c_void,
+    ) -> i32;
+
     // aclnnop/aclnn_add.h: out = self + alpha * other.
     pub fn aclnnAddGetWorkspaceSize(
         selfT: *mut c_void,

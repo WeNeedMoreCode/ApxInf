@@ -10,6 +10,46 @@ use crate::{AclError, Result};
 /// fp16 out on 310P3, which has no bf16 unit).
 const CUBE_MATH_KEEP_DTYPE: i8 = 1;
 
+/// Minimum M for the aclnn matmul kernels on 310P3: m=8 x wide N (>=12288)
+/// trips an aicore tiling fault (507015 at sync) on both the plain and
+/// transposed-b descriptors, while m>=16 is verified correct through
+/// N=16384 (m-ladder probe, 2026-09-18). Smaller M is zero-padded to this
+/// floor; the extra output rows are sliced off.
+const MATMUL_MIN_M: i64 = 16;
+
+/// Run `f` on a zero-padded [MATMUL_MIN_M, k] copy of `a`, slice the real
+/// `m` rows back out. Padding appends whole rows so the real data is one
+/// contiguous leading block -- a single D2D copy after a stream-ordered
+/// memset.
+fn with_m_padded(
+    ctx: &AscendContext,
+    stream: &AscendStream,
+    a: &crate::DeviceBuffer,
+    m: i64,
+    k: i64,
+    n: i64,
+    f: impl FnOnce(&crate::DeviceBuffer, i64) -> Result<crate::DeviceBuffer>,
+) -> Result<crate::DeviceBuffer> {
+    let padded = ctx.malloc((MATMUL_MIN_M * k * 2) as usize)?;
+    ctx.memset_async(&padded, 0, stream)?;
+    let bytes = (m * k * 2) as usize;
+    let code = unsafe {
+        ffi::aclrtMemcpyAsync(
+            padded.as_ptr(),
+            bytes,
+            a.as_ptr() as *const std::ffi::c_void,
+            bytes,
+            ffi::ACL_MEMCPY_DEVICE_TO_DEVICE,
+            stream.handle(),
+        )
+    };
+    if code != 0 {
+        return Err(AclError { code, op: "aclrtMemcpyAsync(m-pad)" });
+    }
+    let full = f(&padded, MATMUL_MIN_M)?;
+    take_rows_fp16(ctx, stream, &full, 0, m, n)
+}
+
 /// out = a @ b for fp16 ND matrices, executed on `stream`.
 ///
 /// Shapes: a = [m, k], b = [k, n], out = [m, n] (all fp16, row-major).
@@ -25,6 +65,11 @@ pub fn matmul_fp16(
     let [m, k] = a_shape;
     let [k2, n] = b_shape;
     assert_eq!(k, k2, "inner dims must match: {a_shape:?} x {b_shape:?}");
+    if m < MATMUL_MIN_M {
+        return with_m_padded(ctx, stream, a, m, k, n, |a2, m2| {
+            matmul_fp16(ctx, stream, a2, [m2, k], b, b_shape)
+        });
+    }
 
     let ta = AclTensor::fp16_nd(a, &a_shape)?;
     let tb = AclTensor::fp16_nd(b, &b_shape)?;
@@ -587,6 +632,11 @@ pub fn matmul_b_t_fp16(
     k: i64,
     n: i64,
 ) -> Result<crate::DeviceBuffer> {
+    if ash[0] < MATMUL_MIN_M {
+        return with_m_padded(ctx, stream, a, ash[0], ash[1], n, |a2, m2| {
+            matmul_b_t_fp16(ctx, stream, a2, [m2, ash[1]], b_t, k, n)
+        });
+    }
     let out = ctx.malloc((ash[0] * n * 2) as usize)?;
     let ta = AclTensor::fp16_nd(a, &ash)?;
     // view [k, n] over physical [n, k]: element (i,j) at j*k + i
@@ -625,6 +675,94 @@ pub fn matmul_b_t_fp16(
     if code != 0 {
         return Err(AclError { code, op: "aclnnMatmul(t-b) run" });
     }
+    Ok(out)
+}
+
+/// aten::mm mirror via aclnnMm: plain [k, n] row-major b. torch_npu's mm
+/// computes the wide-N shapes that crash aclnnMatmul on 310P3 -- test
+/// whether this entry avoids the cliff. cubeMathType 2 = KEEP_DTYPE.
+pub fn mm_fp16(
+    ctx: &AscendContext,
+    stream: &AscendStream,
+    a: &crate::DeviceBuffer,
+    ash: [i64; 2],
+    b: &crate::DeviceBuffer,
+    bsh: [i64; 2],
+) -> Result<crate::DeviceBuffer> {
+    let out = ctx.malloc((ash[0] * bsh[1] * 2) as usize)?;
+    let ta = AclTensor::fp16_nd(a, &ash)?;
+    let tb = AclTensor::fp16_nd(b, &bsh)?;
+    let tout = AclTensor::fp16_nd(&out, &[ash[0], bsh[1]])?;
+    two_stage(
+        ctx,
+        stream,
+        "aclnnMm",
+        |ws, ex| unsafe { ffi::aclnnMmGetWorkspaceSize(ta.handle(), tb.handle(), tout.handle(), 2, ws, ex) },
+        |ws, size, ex| unsafe { ffi::aclnnMm(ws, size, ex, stream.handle()) },)?;
+    Ok(out)
+}
+
+/// aclnnMm over the transposed-b view ([k, n] shape, stride [1, k] over
+/// physical [n, k]).
+pub fn mm_b_t_fp16(
+    ctx: &AscendContext,
+    stream: &AscendStream,
+    a: &crate::DeviceBuffer,
+    ash: [i64; 2],
+    b_t: &crate::DeviceBuffer, // physical [n, k] row-major
+    k: i64,
+    n: i64,
+) -> Result<crate::DeviceBuffer> {
+    let out = ctx.malloc((ash[0] * n * 2) as usize)?;
+    let ta = AclTensor::fp16_nd(a, &ash)?;
+    let dims = [k, n];
+    let stride = [1, k];
+    let raw = unsafe {
+        ffi::aclCreateTensor(
+            dims.as_ptr(), 2, ffi::ACL_FLOAT16,
+            stride.as_ptr(), 0, ffi::ACL_FORMAT_ND,
+            std::ptr::null(), 0,
+            b_t.as_ptr(),
+        )
+    };
+    if raw.is_null() {
+        return Err(AclError { code: -1, op: "aclCreateTensor(mm t-b)" });
+    }
+    let tb = AclTensor::from_raw(raw);
+    let tout = AclTensor::fp16_nd(&out, &[ash[0], n])?;
+    two_stage(
+        ctx,
+        stream,
+        "aclnnMm(t-b)",
+        |ws, ex| unsafe { ffi::aclnnMmGetWorkspaceSize(ta.handle(), tb.handle(), tout.handle(), 2, ws, ex) },
+        |ws, size, ex| unsafe { ffi::aclnnMm(ws, size, ex, stream.handle()) },)?;
+    Ok(out)
+}
+
+/// BLAS gemm with native transB: A [m, k] (transA=0) x B physical [n, k]
+/// row-major with transB=1. out = 1 * A * B^T + 0 * C.
+pub fn gemm_b_t_fp16(
+    ctx: &AscendContext,
+    stream: &AscendStream,
+    a: &crate::DeviceBuffer,
+    ash: [i64; 2],
+    b_t: &crate::DeviceBuffer, // physical [n, k] row-major
+    k: i64,
+    n: i64,
+) -> Result<crate::DeviceBuffer> {
+    let out = ctx.malloc((ash[0] * n * 2) as usize)?;
+    let ta = AclTensor::fp16_nd(a, &ash)?;
+    let tb = AclTensor::fp16_nd(b_t, &[n, k])?;
+    let tc = AclTensor::fp16_nd(&out, &[ash[0], n])?;
+    let tout = AclTensor::fp16_nd(&out, &[ash[0], n])?;
+    two_stage(
+        ctx,
+        stream,
+        "aclnnGemm(tB)",
+        |ws, ex| unsafe {
+            ffi::aclnnGemmGetWorkspaceSize(ta.handle(), tb.handle(), tc.handle(), 1.0, 0.0, 0, 1, tout.handle(), 2, ws, ex)
+        },
+        |ws, size, ex| unsafe { ffi::aclnnGemm(ws, size, ex, stream.handle()) },)?;
     Ok(out)
 }
 
