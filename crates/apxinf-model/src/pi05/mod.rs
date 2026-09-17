@@ -118,3 +118,8 @@ pub use weights::{
 pub(crate) fn register_builtin() {
     crate::registry::register("pi05-cuda", vla_runtime::load_registered);
 }
+
+#[cfg(feature = "ascend")]
+pub(crate) fn register_builtin_ascend() {
+    crate::registry::register("pi05-ascend", ascend_vla::load_registered);
+}

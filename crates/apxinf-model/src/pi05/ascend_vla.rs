@@ -148,3 +148,51 @@ impl PreparedInference for AscendEagerPrepared {
         Ok(action)
     }
 }
+
+/// Registry loader ("pi05-ascend"): eager FP16 path over the aclnn
+/// compositions. Synthetic and SafeTensors loads share the device-agnostic
+/// host-weight pipeline; dual-GeGLU layouts stay off (plain [gate; up]).
+pub(crate) fn load_registered(
+    path: &std::path::Path,
+    _device: apxinf_core::Device,
+    backend: Arc<dyn apxinf_core::Backend>,
+    options: &crate::auto::LoadOptions,
+) -> Result<crate::auto::LoadedModel> {
+    use apxinf_core::Backend as _;
+
+    let backend = downcast_ascend_arc(backend)
+        .ok_or_else(|| Error::Other("pi05-ascend requires the Ascend backend".into()))?;
+    let config_path = path.join("config.json");
+    let config = Arc::new(if let Some(cfg) = options.config.clone() {
+        cfg
+    } else if config_path.is_file() {
+        super::Pi05Config::from_json_file(&config_path)?
+    } else {
+        super::Pi05Config::default()
+    });
+    let host_weights = match &options.synthetic {
+        Some(synthetic) => super::Pi05Weights::synthetic(&config, synthetic.seed)?,
+        None => super::Pi05Weights::from_safetensors(&config, path)?,
+    };
+    let weights = Arc::new(super::StaticBf16Pi05Weights::from_host(
+        &host_weights,
+        &*backend,
+        false,
+    )?);
+    let runtime = super::Pi05AscendRuntime::new(Arc::clone(&backend), Arc::clone(&config), weights)?;
+    let vla = Pi05AscendVlaRuntime::new(backend, config, runtime)?;
+    Ok(crate::auto::LoadedModel::Vla(Box::new(vla)))
+}
+
+/// Recover the concrete `AscendBackend` from an `Arc<dyn Backend>` --
+/// same rationale as the cuda seam (the registry hands out `dyn`, the
+/// ascend executor needs the concrete type for its aclnn compositions).
+fn downcast_ascend_arc(
+    backend: Arc<dyn apxinf_core::Backend>,
+) -> Option<Arc<apxinf_ascend::AscendBackend>> {
+    backend.as_any().downcast_ref::<apxinf_ascend::AscendBackend>()?;
+    let raw = Arc::into_raw(backend);
+    // SAFETY: the exact AscendBackend type was checked above; the Arc
+    // allocation and strong count are preserved.
+    Some(unsafe { Arc::from_raw(raw as *const apxinf_ascend::AscendBackend) })
+}
