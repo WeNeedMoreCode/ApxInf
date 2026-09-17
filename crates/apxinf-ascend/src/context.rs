@@ -113,6 +113,22 @@ impl AscendContext {
         )
     }
 
+    /// Stream-ordered memset (capturable: used as ACLGraph payload).
+    pub fn memset_async(&self, buf: &DeviceBuffer, value: u8, stream: &crate::AscendStream) -> Result<()> {
+        self.check(
+            unsafe {
+                ffi::aclrtMemsetAsync(
+                    buf.ptr,
+                    buf.len,
+                    value as i32,
+                    buf.len,
+                    stream.handle(),
+                )
+            },
+            "aclrtMemsetAsync",
+        )
+    }
+
     pub fn synchronize(&self) -> Result<()> {
         self.check(unsafe { ffi::aclrtSynchronizeDevice() }, "aclrtSynchronizeDevice")
     }

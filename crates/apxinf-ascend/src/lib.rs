@@ -14,8 +14,12 @@
 
 pub mod context;
 pub mod ffi;
+pub mod graph;
+pub mod stream;
 
 pub use context::{AscendContext, DeviceBuffer};
+pub use graph::AscendGraph;
+pub use stream::AscendStream;
 
 /// ACL error code (aclError, i32). 0 = ACL_SUCCESS.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]

@@ -36,6 +36,21 @@ extern "C" {
         count: usize,
         kind: u32,
     ) -> i32;
+    pub fn aclrtMemcpyAsync(
+        dst: *mut c_void,
+        destMax: usize,
+        src: *const c_void,
+        count: usize,
+        kind: u32,
+        stream: *mut c_void,
+    ) -> i32;
+    pub fn aclrtMemsetAsync(
+        dst: *mut c_void,
+        destMax: usize,
+        value: i32,
+        count: usize,
+        stream: *mut c_void,
+    ) -> i32;
 }
 
 /// aclrtMemcpyKind.
@@ -46,3 +61,28 @@ pub const ACL_MEMCPY_DEVICE_TO_DEVICE: u32 = 3;
 
 /// aclrtMemMallocPolicy.
 pub const ACL_MEM_MALLOC_HUGE_FIRST: u32 = 0;
+
+// aclmdlRICaptureMode (acl_rt.h): capture scoping, mirrors CUDA's
+// cudaStreamCaptureMode.
+pub const ACL_MODEL_RI_CAPTURE_MODE_GLOBAL: i32 = 0;
+pub const ACL_MODEL_RI_CAPTURE_MODE_THREAD_LOCAL: i32 = 1;
+pub const ACL_MODEL_RI_CAPTURE_MODE_RELAXED: i32 = 2;
+
+extern "C" {
+    // acl_rt.h -- ACLGraph (model Runtime Instance): capture/replay, the
+    // Ascend counterpart of CUDA Graphs. Runtime-gated by CANN version:
+    // symbols exist in 8.5.1 but capture is rejected (aclError 207000);
+    // verified working on 310P3 under CANN 9.0.1 (probe
+    // dev_logs/aclgraph_probe/, 2026-09-17).
+    pub fn aclmdlRICaptureBegin(stream: *mut c_void, mode: i32) -> i32;
+    pub fn aclmdlRICaptureEnd(stream: *mut c_void, modelRI: *mut *mut c_void) -> i32;
+    pub fn aclmdlRICaptureGetInfo(
+        stream: *mut c_void,
+        status: *mut i32,
+        modelRI: *mut *mut c_void,
+    ) -> i32;
+    pub fn aclmdlRIExecuteAsync(modelRI: *mut c_void, stream: *mut c_void) -> i32;
+    pub fn aclmdlRIExecute(modelRI: *mut c_void, timeout_ms: i32) -> i32;
+    pub fn aclmdlRIDestroy(modelRI: *mut c_void) -> i32;
+    pub fn aclmdlRIAbort(stream: *mut c_void) -> i32;
+}
