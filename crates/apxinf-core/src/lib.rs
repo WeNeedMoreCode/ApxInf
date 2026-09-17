@@ -29,11 +29,13 @@ pub use tensor::Tensor;
 pub enum Device {
     Cpu,
     Cuda(usize),
+    /// Huawei Ascend NPU (aclrt device id).
+    Ascend(usize),
 }
 
 impl Device {
     pub fn is_gpu(&self) -> bool {
-        matches!(self, Device::Cuda(_))
+        matches!(self, Device::Cuda(_) | Device::Ascend(_))
     }
 }
 
@@ -42,6 +44,7 @@ impl std::fmt::Display for Device {
         match self {
             Device::Cpu => write!(f, "cpu"),
             Device::Cuda(id) => write!(f, "cuda:{id}"),
+            Device::Ascend(id) => write!(f, "ascend:{id}"),
         }
     }
 }

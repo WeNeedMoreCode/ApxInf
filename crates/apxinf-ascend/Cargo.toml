@@ -1,0 +1,18 @@
+[package]
+name = "apxinf-ascend"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+build = "build.rs"
+
+# Stage-2 (Ascend 310P3) native backend. Currently scaffolding: aclrt FFI,
+# context/buffer RAII. The apxinf_core::Backend impl lands with the first
+# aclnn kernels (see roadmap stage 2).
+#
+# Library targets do not final-link libascendcl, so this crate builds on
+# machines without CANN; only the `smoke` example needs a real toolkit+chip
+# (run it in the apxinf_npu container on the server).
+
+[dependencies]
+apxinf-core = { path = "../apxinf-core" }
+thiserror = "1"

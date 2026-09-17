@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/apxinf-core",
+    "crates/apxinf-ascend",
     "crates/apxinf-cuda",
     "crates/apxinf-loader",
     "crates/apxinf-model",

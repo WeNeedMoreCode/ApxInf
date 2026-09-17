@@ -122,9 +122,10 @@ fn parse_device(spec: &str) -> PyResult<Device> {
     };
     match kind {
         "cuda" => Ok(Device::Cuda(index)),
+        "ascend" => Ok(Device::Ascend(index)),
         "cpu" => Ok(Device::Cpu),
         other => Err(PyValueError::new_err(format!(
-            "apxinf_py.load: unknown device `{other}` (expected cuda|cpu)"
+            "apxinf_py.load: unknown device `{other}` (expected cuda|ascend|cpu)"
         ))),
     }
 }
@@ -809,6 +810,7 @@ impl Model {
     fn device(&self) -> String {
         match self.device {
             Device::Cuda(index) => format!("cuda:{index}"),
+            Device::Ascend(index) => format!("ascend:{index}"),
             Device::Cpu => "cpu".to_string(),
         }
     }

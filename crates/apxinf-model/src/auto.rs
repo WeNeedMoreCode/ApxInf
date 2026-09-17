@@ -247,6 +247,7 @@ impl AutoModel {
         }
         let device_name = match device {
             Device::Cuda(_) => Some("cuda"),
+            Device::Ascend(_) => Some("ascend"),
             Device::Cpu => None,
         };
 

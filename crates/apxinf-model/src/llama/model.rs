@@ -75,6 +75,7 @@ impl LlamaModel {
     pub fn to_device(&mut self, device: Device) -> Result<()> {
         match device {
             Device::Cpu => Ok(()),
+            Device::Ascend(_) => Err(Error::Other("Ascend not wired for llama yet".into())),
             Device::Cuda(device_id) => {
                 let ctx = CudaContext::new(device_id)
                     .map_err(|e| Error::Cuda(format!("CUDA init: {e}")))?;
@@ -109,6 +110,7 @@ impl LlamaModel {
         match device {
             Device::Cpu => Ok(()),
             Device::Cuda(_) => Err(Error::Other("CUDA not compiled in".into())),
+            Device::Ascend(_) => Err(Error::Other("Ascend not wired for llama yet".into())),
         }
     }
 
@@ -495,6 +497,7 @@ impl LlamaModel {
             }
             #[cfg(not(feature = "cuda"))]
             Device::Cuda(_) => Err(Error::Other("CUDA not compiled in".into())),
+            Device::Ascend(_) => Err(Error::Other("Ascend not wired for llama yet".into())),
         }
     }
 
@@ -717,6 +720,7 @@ impl LlamaModel {
             }
             #[cfg(not(feature = "cuda"))]
             Device::Cuda(_) => Tensor::from_f32(vec![seq_len, n_heads * head_dim], &attn_out)?,
+            Device::Ascend(_) => Tensor::from_f32(vec![seq_len, n_heads * head_dim], &attn_out)?,
         };
 
         // Output projection
@@ -817,6 +821,9 @@ impl LlamaModel {
             Device::Cuda(_) => {
                 Err(Error::Other("CUDA not compiled in".into()))
             }
+            Device::Ascend(_) => {
+                Err(Error::Other("Ascend not wired for llama yet".into()))
+            }
         }
     }
 
@@ -883,6 +890,9 @@ impl LlamaModel {
             Device::Cuda(_) => {
                 Err(Error::Other("CUDA not compiled in".into()))
             }
+            Device::Ascend(_) => {
+                Err(Error::Other("Ascend not wired for llama yet".into()))
+            }
         }
     }
 
@@ -905,6 +915,9 @@ impl LlamaModel {
             #[cfg(not(feature = "cuda"))]
             Device::Cuda(_) => {
                 Err(Error::Other("CUDA not compiled in".into()))
+            }
+            Device::Ascend(_) => {
+                Err(Error::Other("Ascend not wired for llama yet".into()))
             }
         }
     }
@@ -929,6 +942,9 @@ impl LlamaModel {
             Device::Cuda(_) => {
                 Err(Error::Other("CUDA not compiled in".into()))
             }
+            Device::Ascend(_) => {
+                Err(Error::Other("Ascend not wired for llama yet".into()))
+            }
         }
     }
 
@@ -944,6 +960,9 @@ impl LlamaModel {
             #[cfg(not(feature = "cuda"))]
             Device::Cuda(_) => {
                 Err(Error::Other("CUDA not compiled in".into()))
+            }
+            Device::Ascend(_) => {
+                Err(Error::Other("Ascend not wired for llama yet".into()))
             }
         }
     }
