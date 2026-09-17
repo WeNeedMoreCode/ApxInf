@@ -443,7 +443,181 @@ pub fn vision_layer_ascend(
     Ok(buf_tensor(be, res2, tokens as usize, width as usize))
 }
 
+/// Patch embedding: projection + bias + position table (the position
+/// rows repeat per view: cat(position, position) covers both views).
+pub fn vision_patch_embed_ascend(
+    be: &AscendBackend,
+    weights: &Bf16LinearWeights,
+    position_embedding: &Tensor,
+    patches: &Tensor,
+    patches_per_view: usize,
+) -> Result<Tensor> {
+    let tokens = patches.shape().dims()[0] as i64;
+    let width = patches.shape().dims()[1] as i64;
+    let proj = aq::matmul(be, tensor_buf(patches)?, [tokens, width],
+        tensor_buf(&weights.weight)?, [width, weights.weight.shape().dims()[1] as i64])?;
+    let proj = bias_add(be, &proj, weights.bias.as_ref(), tokens, width)?;
+    let pos = tensor_buf(position_embedding)?;
+    let p = patches_per_view as i64;
+    let pos2 = acl(aops::cat_fp16(be.ctx(), be.stream(), &[pos, pos],
+        &[vec![p, width], vec![p, width]], 0, &[2 * p, width]))?;
+    let out = acl(aops::add_fp16(be.ctx(), be.stream(), &proj, &pos2, &[tokens, width]))?;
+    Ok(be.wrap_fp16(out, vec![tokens as usize, width as usize]))
+}
+
+/// ada-norm: y = rms_norm(x) * (1 + style), style is a [width] row.
+fn adaptive_rms(be: &AscendBackend, x: &DeviceBuffer, style: &Tensor, rows: i64, cols: i64, eps: f32) -> Result<DeviceBuffer> {
+    // rms with gamma = ones (ada-norm has no gamma), then scale by
+    // row-replicated (1 + style).
+    let zeros = be.zeros(rows as usize * cols as usize * 2)?;
+    let ones = zeros_scale_buf(be, style)?;
+    let normed = acl(aops::add_rms_norm_fp16(be.ctx(), be.stream(), x, &zeros, &ones, &[rows, cols], eps as f64))?.0;
+    let mut one_plus = vec![0u16; cols as usize];
+    let style_h = host_f16_row(be, style, cols as usize)?;
+    for i in 0..cols as usize {
+        let v = f16_bits_to_f32(style_h[i]);
+        one_plus[i] = f32_to_f16_bits(v + 1.0);
+    }
+    let row = acl(be.ctx().malloc(cols as usize * 2))?;
+    let bytes: &[u8] = unsafe { std::slice::from_raw_parts(one_plus.as_ptr() as *const u8, one_plus.len() * 2) };
+    acl(be.ctx().copy_h2d(&row, bytes))?;
+    let scale_mat = acl(aops::row_replicate_fp16(be.ctx(), be.stream(), &row, rows, cols))?;
+    acl(aops::mul_fp16(be.ctx(), be.stream(), &normed, &scale_mat, &[rows, cols]))
+}
+
+fn zeros_scale_buf(be: &AscendBackend, style: &Tensor) -> Result<DeviceBuffer> {
+    // gamma for rms = style itself in pi0.5's ada-norm? The cuda path uses
+    // adaptive_rms(x, style): norm scale comes from the style projection.
+    // Gemma3 ada-norm: normalized = rms(x) * (1 + style); rms has NO gamma.
+    // So gamma = ones.
+    let width = style.shape().dims()[0];
+    let ones = vec![0x3c00u16; width]; // 1.0 fp16
+    let buf = acl(be.ctx().malloc(width * 2))?;
+    let bytes: &[u8] = unsafe { std::slice::from_raw_parts(ones.as_ptr() as *const u8, ones.len() * 2) };
+    acl(be.ctx().copy_h2d(&buf, bytes))?;
+    Ok(buf)
+}
+
+fn host_f16_row(be: &AscendBackend, t: &Tensor, len: usize) -> Result<Vec<u16>> {
+    let b = tensor_buf(t)?;
+    let mut host = vec![0u8; len * 2];
+    acl(be.ctx().copy_d2h(b, &mut host))?;
+    Ok(host.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect())
+}
+
+fn f16_bits_to_f32(h: u16) -> f32 {
+    let sign = ((h & 0x8000) as u32) << 16;
+    let exp = ((h >> 10) & 0x1f) as i32;
+    let mant = (h & 0x03ff) as u32;
+    if exp == 0 {
+        if mant == 0 { return f32::from_bits(sign); }
+        let e = (mant.leading_zeros() - 22) as i32;
+        let norm = (mant << (e + 1)) & 0x03ff;
+        let reb = (127 - 15 + 1 - e - 1) as u32;
+        return f32::from_bits(sign | (reb << 23) | (norm << 13));
+    }
+    if exp == 0x1f { return f32::from_bits(sign | 0x7f80_0000 | (mant << 13)); }
+    f32::from_bits(sign | (((exp - 15 + 127) as u32) << 23) | (mant << 13))
+}
+
+fn f32_to_f16_bits(x: f32) -> u16 {
+    let bits = x.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exp = ((bits >> 23) & 0xff) as i32 - 127 + 15;
+    let mant = bits & 0x007f_ffff;
+    if ((bits >> 23) & 0xff) == 0 || exp <= 0 { return sign; }
+    if exp >= 0x1f { return sign | 0x7c00; }
+    let m = (mant >> 13) as u16;
+    let rem = mant & 0x1fff;
+    let mut out = ((exp as u16) << 10) | m;
+    if rem > 0x1000 || (rem == 0x1000 && (m & 1) == 1) { out += 1; }
+    sign | out
+}
+
 /// Host-side kv bias slice (same pass-through as language path).
 fn vision_kv_bias(be: &AscendBackend, bias: &Option<Tensor>, start: i64, len: i64) -> Result<Option<DeviceBuffer>> {
     kv_bias(be, bias, start, len)
 }
+
+/// Action expert layer with ada-norm styles and prefix KV — mirror of
+/// action_layer_bf16. prefix_k/v hold the language prefix keys/values
+/// [prefix_tokens, kv_heads*d]; attention runs over prefix + this chunk.
+#[allow(clippy::too_many_arguments)]
+pub fn action_layer_ascend(
+    be: &AscendBackend,
+    cache: &mut AscendRopeCache,
+    config: GemmaVariantConfig,
+    weights: &Bf16DeviceActionLayer,
+    input: &Tensor,
+    attention_normalized: Option<&Tensor>,
+    attention_style: &Tensor,
+    mlp_style: &Tensor,
+    next_norm_style: &Tensor,
+    prefix_k: &Tensor,
+    prefix_v: &Tensor,
+    position_offset: usize,
+    rms_eps: f32,
+    rope_theta: f32,
+) -> Result<ActionLayerOutput> {
+    let ctx = be.ctx();
+    let stream = be.stream();
+    let tokens = input.shape().dims()[0] as i64;
+    let width = input.shape().dims()[1] as i64;
+    let input_b = tensor_buf(input)?;
+
+    let _ = (ctx, stream);
+    let normalized = match attention_normalized {
+        Some(v) => aq::take_rows(be, tensor_buf(v)?, 0, tokens, width)?,
+        None => adaptive_rms(be, input_b, attention_style, tokens, width, rms_eps)?,
+    };
+
+    let qd = config.num_heads as i64 * config.head_dim as i64;
+    let kv_d = config.num_kv_heads as i64 * config.head_dim as i64;
+    let fused_w = tensor_buf(&weights.qkv.weight)?;
+    let out_w = qd + 2 * kv_d;
+    let in_w = (fused_w.len() / 2) as i64 / out_w;
+    let qkv = aq::matmul(be, &normalized, [tokens, in_w], fused_w, [in_w, out_w])?;
+    let q_raw = aq::take_rows(be, &qkv, 0, tokens, qd)?;
+    let k_raw = aq::take_rows(be, &qkv, tokens, tokens, kv_d)?;
+    let v_raw = aq::take_rows(be, &qkv, tokens * 2, tokens, kv_d)?;
+    let q_bias = tensor_opt(&weights.qkv.bias)?;
+    let k_bias = kv_bias(be, &weights.qkv.bias, qd, kv_d)?;
+    let v_bias = kv_bias(be, &weights.qkv.bias, qd + kv_d, kv_d)?;
+    let q = acl(aops::bias_add_fp16(ctx, stream, &q_raw, q_bias.ok_or_else(|| Error::Other("q bias".into()))?, tokens, qd))?;
+    let k = acl(aops::bias_add_fp16(ctx, stream, &k_raw, k_bias.as_ref().ok_or_else(|| Error::Other("k bias".into()))?, tokens, kv_d))?;
+    let v = acl(aops::bias_add_fp16(ctx, stream, &v_raw, v_bias.as_ref().ok_or_else(|| Error::Other("v bias".into()))?, tokens, kv_d))?;
+
+    let q_rope = apply_rope_rows(be, cache, &q, tokens, config.num_heads as i64, rope_theta, position_offset)?;
+    let k_rope = apply_rope_rows(be, cache, &k, tokens, config.num_kv_heads as i64, rope_theta, position_offset)?;
+
+    // concat prefix k/v with this chunk (rows), then full attention.
+    let pk = tensor_buf(prefix_k)?;
+    let pv = tensor_buf(prefix_v)?;
+    let prefix_tokens = (pk.len() as i64 / 2) / kv_d;
+    let total = prefix_tokens + tokens;
+    let k_all = acl(aops::cat_fp16(ctx, stream, &[pk, &k_rope], &[vec![prefix_tokens, kv_d], vec![tokens, kv_d]], 0, &[total, kv_d]))?;
+    let v_all = acl(aops::cat_fp16(ctx, stream, &[pv, &v], &[vec![prefix_tokens, kv_d], vec![tokens, kv_d]], 0, &[total, kv_d]))?;
+    let attn = acl(aops::prompt_flash_attention_bsh_fp16(ctx, stream, &q_rope, &k_all, &v_all, total, config.num_heads as i64, config.num_kv_heads as i64, config.head_dim as i64, None))?;
+
+    let proj = aq::matmul(be, &attn, [tokens, qd], tensor_buf(&weights.output.weight)?, [qd, width])?;
+    let proj = bias_add(be, &proj, weights.output.bias.as_ref(), tokens, width)?;
+    let res = aq::add(be, &proj, &normalized, &[tokens, width])?;
+    let normed = adaptive_rms(be, &res, mlp_style, tokens, width, rms_eps)?;
+
+    let gw = tensor_buf(&weights.gate_up.weight)?;
+    let inter = (gw.len() as i64 / 2) / width;
+    let gate_up = aq::matmul(be, &normed, [tokens, width], gw, [width, inter * 2])?;
+    let up = aq::take_rows(be, &gate_up, 0, tokens, inter)?;
+    let gate = aq::take_rows(be, &gate_up, tokens, tokens, inter)?;
+    let gate_g = aq::gelu(be, &gate, &[tokens, inter], true)?;
+    let act = aq::mul(be, &up, &gate_g, &[tokens, inter])?;
+    let proj2 = aq::matmul(be, &act, [tokens, inter], tensor_buf(&weights.down.weight)?, [inter, width])?;
+    let proj2 = bias_add(be, &proj2, weights.down.bias.as_ref(), tokens, width)?;
+    let hidden = aq::add(be, &proj2, &res, &[tokens, width])?;
+    let next_normalized = adaptive_rms(be, &hidden, next_norm_style, tokens, width, rms_eps)?;
+    Ok(ActionLayerOutput {
+        hidden: be.wrap_fp16(hidden, vec![tokens as usize, width as usize]),
+        next_normalized: be.wrap_fp16(next_normalized, vec![tokens as usize, width as usize]),
+    })
+}
+
