@@ -36,6 +36,11 @@ pub struct AscendCaches {
     kv_biases: std::collections::HashMap<(usize, i64, i64), Arc<DeviceBuffer>>,
     /// Pinned rope position-index rows, keyed by (tokens, heads, offset).
     pos_idx: std::collections::HashMap<(i64, i64, i64), Arc<DeviceBuffer>>,
+    /// Cached all-ones gamma rows for ada-norm rms (keyed by cols) -- the
+    /// per-call h2d was a sync memcpy inside capture windows.
+    ones_rows: std::collections::HashMap<usize, Arc<DeviceBuffer>>,
+    /// Cached device token-index rows (keyed by the id sequence).
+    pub(crate) token_idx: std::collections::HashMap<Vec<u32>, Arc<DeviceBuffer>>,
 }
 
 impl AscendCaches {
@@ -46,6 +51,8 @@ impl AscendCaches {
             style_rows: Default::default(),
             kv_biases: Default::default(),
             pos_idx: Default::default(),
+            ones_rows: Default::default(),
+            token_idx: Default::default(),
         }
     }
 }
@@ -589,11 +596,23 @@ pub fn vision_patch_embed_ascend(
         tensor_buf(&weights.weight)?, [width, out_w])?;
     let proj = bias_add(be, &proj, weights.bias.as_ref(), tokens, out_w)?;
     let p = patches_per_view as i64;
-    // cyclic per-view repeat of the [p, width] table
-    let idx: Vec<i32> = (0..tokens as usize).map(|r| (r % p as usize) as i32).collect();
-    let idx_bytes: Vec<u8> = idx.iter().flat_map(|v| v.to_le_bytes()).collect();
-    let di = acl(be.ctx().scratch_buf(idx_bytes.len()))?;
-    acl(be.ctx().copy_h2d(&di, &idx_bytes))?;
+    // cyclic per-view repeat of the [p, width] table; index row cached by
+    // (tokens, tpv) -- the per-call h2d was a sync memcpy in capture windows
+    let di = {
+        let key = (tokens, p);
+        match cache.pos_idx.get(&(-key.0, key.1, 0)) {
+            Some(v) => v.clone(),
+            None => {
+                let idx: Vec<i32> = (0..tokens as usize).map(|r| (r % p as usize) as i32).collect();
+                let idx_bytes: Vec<u8> = idx.iter().flat_map(|v| v.to_le_bytes()).collect();
+                let buf = acl(be.ctx().malloc(idx_bytes.len()))?;
+                acl(be.ctx().copy_h2d(&buf, &idx_bytes))?;
+                let buf = Arc::new(buf);
+                cache.pos_idx.insert((-key.0, key.1, 0), buf.clone());
+                buf
+            }
+        }
+    };
     let pos_rep = aq::gather_rows(be, tensor_buf(position_embedding)?, p, out_w, &di, tokens)?;
     let out = acl(aops::add_fp16(be.ctx(), be.stream(), &proj, &pos_rep, &[tokens, out_w]))?;
     Ok(be.wrap_fp16(out, vec![tokens as usize, out_w as usize]))
@@ -608,7 +627,7 @@ fn adaptive_rms(be: &AscendBackend, cache: &mut AscendCaches, x: &DeviceBuffer, 
     // rms with gamma = ones (ada-norm has no gamma)
     let zeros = be.zeros(rows as usize * cols as usize * 2)?;
     let c = cols as usize;
-    let ones = zeros_scale_buf(be, c)?;
+    let ones = zeros_scale_buf(be, cache, c)?;
     let normed = acl(aops::add_rms_norm_fp16(be.ctx(), be.stream(), x, &zeros, &ones, &[rows, cols], eps as f64))?.0;
     let key = tensor_buf(style)?.as_ptr() as usize;
     let (scale_b, shift_b) = match cache.style_rows.get(&key) {
@@ -638,13 +657,19 @@ fn adaptive_rms(be: &AscendBackend, cache: &mut AscendCaches, x: &DeviceBuffer, 
     acl(aops::add_fp16(be.ctx(), be.stream(), &scaled, &shift_mat, &[rows, cols]))
 }
 
-fn zeros_scale_buf(be: &AscendBackend, cols: usize) -> Result<Arc<DeviceBuffer>> {
+fn zeros_scale_buf(be: &AscendBackend, cache: &mut AscendCaches, cols: usize) -> Result<Arc<DeviceBuffer>> {
     // ada-norm's rms carries no gamma (the scale lives in the style
-    // projection) -- gamma = ones of exactly `cols`.
+    // projection) -- gamma = ones of exactly `cols`, cached per size:
+    // the per-call h2d was a sync memcpy inside capture windows.
+    if let Some(v) = cache.ones_rows.get(&cols) {
+        return Ok(v.clone());
+    }
     let ones = vec![0x3c00u16; cols]; // 1.0 fp16
-    let buf = acl(be.ctx().scratch_buf(cols * 2))?;
+    let buf = acl(be.ctx().malloc(cols * 2))?;
     let bytes: &[u8] = unsafe { std::slice::from_raw_parts(ones.as_ptr() as *const u8, ones.len() * 2) };
     acl(be.ctx().copy_h2d(&buf, bytes))?;
+    let buf = Arc::new(buf);
+    cache.ones_rows.insert(cols, buf.clone());
     Ok(buf)
 }
 

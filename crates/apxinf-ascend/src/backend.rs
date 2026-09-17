@@ -24,7 +24,7 @@ pub struct AscendBackend {
     ctx: Arc<AscendContext>,
     stream: Arc<AscendStream>,
     /// Zero-filled buffer reused by the rms_norm-via-add_rms_norm shim.
-    zeros: Mutex<Option<Arc<DeviceBuffer>>>,
+    zeros: Mutex<std::collections::HashMap<usize, Arc<DeviceBuffer>>>,
 }
 
 fn acl_err(e: AclError) -> Error {
@@ -35,7 +35,7 @@ impl AscendBackend {
     pub fn new(device_id: usize) -> Result<Self> {
         let ctx = AscendContext::new(device_id).map_err(acl_err)?;
         let stream = AscendStream::new().map_err(acl_err)?;
-        Ok(Self { ctx: Arc::new(ctx), stream: Arc::new(stream), zeros: Mutex::new(None) })
+        Ok(Self { ctx: Arc::new(ctx), stream: Arc::new(stream), zeros: Mutex::new(Default::default()) })
     }
 
     fn dev(&self) -> Device {
@@ -79,16 +79,14 @@ impl AscendBackend {
 
     fn zeros_like(&self, len: usize) -> Result<Arc<DeviceBuffer>> {
         let mut guard = self.zeros.lock().unwrap();
-        if let Some(z) = guard.as_ref() {
-            if z.len() == len {
-                return Ok(z.clone());
-            }
+        if let Some(z) = guard.get(&len) {
+            return Ok(z.clone());
         }
         let z = Arc::new(self.ctx.malloc(len).map_err(acl_err)?);
         // Device memory is not guaranteed zeroed; host-zero it once.
         let zeros_bytes = vec![0u8; len];
         self.ctx.copy_h2d(&z, &zeros_bytes).map_err(acl_err)?;
-        *guard = Some(z.clone());
+        guard.insert(len, z.clone());
         Ok(z)
     }
 

@@ -28,6 +28,7 @@ fn ensure_init() -> Result<()> {
 pub struct AscendContext {
     device_id: i32,
     raw: *mut c_void,
+    arena: std::sync::Mutex<Option<Arena>>,
     /// Reuse pool for short-lived scratch buffers that feed async ops.
     /// aclrtFree does not wait for the stream, so dropping a buffer whose
     /// async consumers are still queued is a use-after-free (sdma copy
@@ -52,6 +53,15 @@ impl AscendContext {
     }
 }
 
+/// Active capture-allocation arena: `malloc` bumps from `base` until
+/// `off` reaches `cap`. The backing buffer is owned by the caller that
+/// entered the arena (stored with the captured graph).
+struct Arena {
+    base: *mut c_void,
+    cap: usize,
+    off: usize,
+}
+
 // The raw context handle is opaque; ACL APIs are thread-safe for concurrent
 // use of one context (synchronize on the calling thread).
 unsafe impl Send for AscendContext {}
@@ -72,7 +82,7 @@ impl AscendContext {
             unsafe { ffi::aclrtResetDevice(id) };
             return Err(AclError { code, op: "aclrtCreateContext" });
         }
-        Ok(Self { device_id: id, raw, scratch: Default::default() })
+        Ok(Self { device_id: id, raw, scratch: Default::default(), arena: None.into() })
     }
 
     pub fn device_id(&self) -> usize {
@@ -92,13 +102,82 @@ impl AscendContext {
         self.check(unsafe { ffi::aclrtSetCurrentContext(self.raw) }, "aclrtSetCurrentContext")
     }
 
-    /// Allocate `len` bytes of device memory.
+    /// Allocate `len` bytes of device memory. While an arena is active
+    /// (see [`Self::enter_arena`]) this bumps from the arena instead --
+    /// addresses stay stable for the graph's lifetime.
     pub fn malloc(&self, len: usize) -> Result<DeviceBuffer> {
+        if self.arena.lock().unwrap().is_some() {
+            return self.arena_alloc(len).ok_or_else(|| {
+                AclError { code: -1, op: "capture arena exhausted (grow enter_arena size)" }
+            });
+        }
         let mut ptr: *mut c_void = std::ptr::null_mut();
         let code =
             unsafe { ffi::aclrtMalloc(&mut ptr, len, ffi::ACL_MEM_MALLOC_HUGE_FIRST) };
         self.check(code, "aclrtMalloc")?;
-        Ok(DeviceBuffer { ptr, len })
+        Ok(DeviceBuffer { ptr, len, owned: true })
+    }
+
+    /// Enter capture-allocation mode: subsequent `malloc`/`scratch_buf`
+    /// bump from one pre-allocated arena whose addresses the captured
+    /// graph bakes in. No allocation happens on the driver inside the
+    /// capture window. Returns nothing; pair with `exit_arena` (after
+    /// the graph is built) which reports bytes used.
+    /// Returns the arena's backing buffer -- the CALLER must keep it (and
+    /// store it with the captured graph): every bump is a slice of it, so
+    /// dropping the owner frees what the graph bakes in.
+    pub fn enter_arena(&self, bytes: usize) -> Result<std::sync::Arc<DeviceBuffer>> {
+        let owner = std::sync::Arc::new(self.malloc_outside_arena(bytes)?);
+        let mut guard = self.arena.lock().unwrap();
+        *guard = Some(Arena {
+            base: owner.as_ptr(),
+            cap: bytes,
+            off: 0,
+        });
+        Ok(owner)
+    }
+
+    /// Leave capture-allocation mode; returns bytes consumed.
+    pub fn exit_arena(&self) -> usize {
+        let guard = self.arena.lock().unwrap();
+        match guard.as_ref() {
+            Some(a) => a.off,
+            None => 0,
+        }
+        // the arena itself stays alive via the Arc held by captured
+        // resources; the flag must be cleared by the caller pairing --
+        // see `clear_arena`.
+    }
+
+    /// Drop the arena flag (the backing buffer dies when its last Arc
+    /// does -- capture outputs and the graph hold slices' parents).
+    pub fn clear_arena(&self) {
+        self.arena.lock().unwrap().take();
+    }
+
+    fn malloc_outside_arena(&self, len: usize) -> Result<DeviceBuffer> {
+        let mut ptr: *mut c_void = std::ptr::null_mut();
+        let code =
+            unsafe { ffi::aclrtMalloc(&mut ptr, len, ffi::ACL_MEM_MALLOC_HUGE_FIRST) };
+        self.check(code, "aclrtMalloc")?;
+        Ok(DeviceBuffer { ptr, len, owned: true })
+    }
+
+    fn arena_alloc(&self, len: usize) -> Option<DeviceBuffer> {
+        const ALIGN: usize = 512;
+        let mut guard = self.arena.lock().unwrap();
+        let arena = guard.as_mut()?;
+        let start = (arena.off + ALIGN - 1) / ALIGN * ALIGN;
+        let end = start.checked_add(len)?;
+        if end > arena.cap {
+            return None; // exhausted: caller falls back or errors upstream
+        }
+        arena.off = end;
+        Some(DeviceBuffer {
+            ptr: unsafe { arena.base.add(start) },
+            len,
+            owned: false,
+        })
     }
 
     /// Host → device copy.
@@ -169,6 +248,9 @@ impl Drop for AscendContext {
 pub struct DeviceBuffer {
     ptr: *mut c_void,
     len: usize,
+    // arena bumps are slices of a caller-owned backing buffer: their
+    // "free" is a no-op (the owner frees the whole arena)
+    owned: bool,
 }
 
 unsafe impl Send for DeviceBuffer {}
@@ -215,7 +297,7 @@ pub fn flush_pending_frees() {
 
 impl Drop for DeviceBuffer {
     fn drop(&mut self) {
-        if !self.ptr.is_null() {
+        if self.owned && !self.ptr.is_null() {
             PENDING_FREES.lock().unwrap().push(PendingPtr(self.ptr, self.len));
         }
     }

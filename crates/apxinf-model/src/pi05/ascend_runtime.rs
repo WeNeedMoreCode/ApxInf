@@ -25,10 +25,10 @@ pub struct AscendPrefixKvCache {
     pub tokens: usize,
 }
 
-struct AscendStepStyles {
-    attention: Vec<Tensor>,
-    mlp: Vec<Tensor>,
-    final_norm: Tensor,
+pub struct AscendStepStyles {
+    pub attention: Vec<Tensor>,
+    pub mlp: Vec<Tensor>,
+    pub final_norm: Tensor,
 }
 
 pub struct Pi05AscendRuntime {
@@ -141,15 +141,29 @@ impl Pi05AscendRuntime {
         let vocab = self.weights.token_embedding.shape().dims()[0] as i64;
         let count = token_ids.len() as i64;
 
-        let idx: Vec<i32> = token_ids.iter().map(|&v| v as i32).collect();
-        let idx_bytes: Vec<u8> = idx.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let di = be
-            .ctx()
-            .malloc(idx_bytes.len())
-            .map_err(|e| Error::Other(format!("aclnn: {e}")))?;
-        be.ctx()
-            .copy_h2d(&di, &idx_bytes)
-            .map_err(|e| Error::Other(format!("aclnn: {e}")))?;
+        // token ids are effectively static per deployment: cache the
+        // device index row by the id sequence (the per-call h2d was a
+        // sync memcpy inside capture windows)
+        let di = {
+            let mut caches = self.caches.borrow_mut();
+            match caches.token_idx.get(token_ids) {
+                Some(v) => v.clone(),
+                None => {
+                    let idx: Vec<i32> = token_ids.iter().map(|&v| v as i32).collect();
+                    let idx_bytes: Vec<u8> = idx.iter().flat_map(|v| v.to_le_bytes()).collect();
+                    let buf = be
+                        .ctx()
+                        .malloc(idx_bytes.len())
+                        .map_err(|e| Error::Other(format!("aclnn: {e}")))?;
+                    be.ctx()
+                        .copy_h2d(&buf, &idx_bytes)
+                        .map_err(|e| Error::Other(format!("aclnn: {e}")))?;
+                    let buf = std::sync::Arc::new(buf);
+                    caches.token_idx.insert(token_ids.to_vec(), buf.clone());
+                    buf
+                }
+            }
+        };
 
         let language = aq::gather_rows(
             be,
@@ -252,7 +266,7 @@ impl Pi05AscendRuntime {
         })
     }
 
-    fn prepare_all_styles(&self, time_embeddings: &[Tensor]) -> Result<Vec<AscendStepStyles>> {
+    pub fn prepare_all_styles(&self, time_embeddings: &[Tensor]) -> Result<Vec<AscendStepStyles>> {
         if time_embeddings.len() != self.config.num_flow_steps {
             return Err(Error::Other(format!(
                 "π0.5 expected {} timestep embeddings, got {}",
@@ -414,7 +428,7 @@ impl Pi05AscendRuntime {
         self.denoise_all_steps_with_styles(noise, &styles, prefix)
     }
 
-    fn infer_with_styles(
+    pub fn infer_with_styles(
         &self,
         patches: &Tensor,
         token_ids: &[u32],
