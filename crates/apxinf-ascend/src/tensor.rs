@@ -15,6 +15,35 @@ pub struct AclTensor {
 }
 
 impl AclTensor {
+    /// Build an ND fp32 descriptor (elementwise output stats, rstd etc.).
+    pub fn fp32_nd(buf: &crate::DeviceBuffer, shape: &[i64]) -> Result<Self> {
+        let elems: i64 = shape.iter().product();
+        assert_eq!(buf.len(), (elems * 4) as usize, "size mismatch for fp32 shape {shape:?}");
+        let mut stride = vec![0i64; shape.len()];
+        let mut acc = 1i64;
+        for i in (0..shape.len()).rev() {
+            stride[i] = acc;
+            acc *= shape[i].max(1);
+        }
+        let raw = unsafe {
+            ffi::aclCreateTensor(
+                shape.as_ptr(),
+                shape.len() as u64,
+                ffi::ACL_FLOAT,
+                stride.as_ptr(),
+                0,
+                ffi::ACL_FORMAT_ND,
+                shape.as_ptr(),
+                shape.len() as u64,
+                buf.as_ptr(),
+            )
+        };
+        if raw.is_null() {
+            return Err(AclError { code: -1, op: "aclCreateTensor(fp32)" });
+        }
+        Ok(Self { raw })
+    }
+
     /// Build an ND fp16 descriptor for `buf` with the given shape.
     /// `buf.len` must equal `shape.iter().product() * 2`.
     pub fn fp16_nd(buf: &crate::DeviceBuffer, shape: &[i64]) -> Result<Self> {

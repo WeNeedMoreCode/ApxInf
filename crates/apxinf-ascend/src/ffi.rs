@@ -104,6 +104,60 @@ extern "C" {
         executor: *mut c_void,
         stream: *mut c_void,
     ) -> i32;
+
+    // aclnnop/aclnn_add.h: out = self + alpha * other.
+    pub fn aclnnAddGetWorkspaceSize(
+        selfT: *mut c_void,
+        other: *mut c_void,
+        alpha: *mut c_void,
+        out: *mut c_void,
+        workspaceSize: *mut u64,
+        executor: *mut *mut c_void,
+    ) -> i32;
+    pub fn aclnnAdd(
+        workspace: *mut c_void,
+        workspaceSize: u64,
+        executor: *mut c_void,
+        stream: *mut c_void,
+    ) -> i32;
+
+    // aclnnop/aclnn_silu.h: out = silu(self), elementwise.
+    pub fn aclnnSiluGetWorkspaceSize(
+        selfT: *mut c_void,
+        out: *mut c_void,
+        workspaceSize: *mut u64,
+        executor: *mut *mut c_void,
+    ) -> i32;
+    pub fn aclnnSilu(
+        workspace: *mut c_void,
+        workspaceSize: u64,
+        executor: *mut c_void,
+        stream: *mut c_void,
+    ) -> i32;
+
+    // aclnnop/aclnn_add_rms_norm.h: fused y = rmsnorm(x1 + x2) * gamma,
+    // plus optional rstd/x outputs (buffers must be provided).
+    pub fn aclnnAddRmsNormGetWorkspaceSize(
+        x1: *mut c_void,
+        x2: *mut c_void,
+        gamma: *mut c_void,
+        epsilon: f64,
+        yOut: *mut c_void,
+        rstdOut: *mut c_void,
+        xOut: *mut c_void,
+        workspaceSize: *mut u64,
+        executor: *mut *mut c_void,
+    ) -> i32;
+    pub fn aclnnAddRmsNorm(
+        workspace: *mut c_void,
+        workspaceSize: u64,
+        executor: *mut c_void,
+        stream: *mut c_void,
+    ) -> i32;
+
+    // aclnn/acl_meta.h scalars.
+    pub fn aclCreateScalar(value: *mut c_void, dataType: u32) -> *mut c_void;
+    pub fn aclDestroyScalar(scalar: *mut c_void) -> i32;
 }
 
 // aclmdlRICaptureMode (acl_rt.h): capture scoping, mirrors CUDA's
