@@ -91,6 +91,39 @@ impl AscendBackend {
         *guard = Some(z.clone());
         Ok(z)
     }
+
+    // Accessors for the pi05 ascend executor layer (crate-public seam).
+    pub fn ctx(&self) -> &Arc<AscendContext> {
+        &self.ctx
+    }
+
+    pub fn stream(&self) -> &Arc<AscendStream> {
+        &self.stream
+    }
+
+    /// Cached zero buffer of `len` bytes (shared with rms_norm shim).
+    pub fn zeros(&self, len: usize) -> Result<Arc<DeviceBuffer>> {
+        self.zeros_like(len)
+    }
+
+    /// Wrap a device buffer as an fp16 [rows, cols] tensor.
+    pub fn wrap_fp16(&self, buf: DeviceBuffer, dims: impl Into<Vec<usize>>) -> Tensor {
+        let dims = dims.into();
+        let len = buf.len();
+        Tensor::from_raw_parts(
+            dims.into(),
+            apxinf_core::DType::F16,
+            self.dev(),
+            Storage::Gpu {
+                device: self.dev(),
+                handle: apxinf_core::storage::GpuStorageHandle {
+                    ptr: buf.as_ptr() as usize,
+                    len,
+                    _prevent_leak: Some(Arc::new(buf)),
+                },
+            },
+        )
+    }
 }
 
 struct GraphBox(AscendGraph);

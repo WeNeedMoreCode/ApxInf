@@ -5,6 +5,8 @@
 //! Thor inference shape.  Keep architecture orchestration in this module;
 //! CUDA crates expose only kernels and device primitives.
 
+#[cfg(feature = "ascend")]
+mod ascend_executor;
 #[cfg(feature = "cuda")]
 mod backend;
 #[cfg(feature = "cuda")]

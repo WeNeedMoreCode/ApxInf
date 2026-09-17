@@ -440,6 +440,53 @@ pub fn gather_rows_fp16(
     Ok(out)
 }
 
+/// Full attention in BSH layout: q [tokens, heads*d], k/v [tokens,
+/// kv_heads*d] (GQA supported via num_kv_heads), out [tokens, heads*d].
+/// Avoids any transpose between the [tokens, hidden] linear world and
+/// attention.
+pub fn prompt_flash_attention_bsh_fp16(
+    ctx: &AscendContext,
+    stream: &AscendStream,
+    q: &crate::DeviceBuffer,
+    k: &crate::DeviceBuffer,
+    v: &crate::DeviceBuffer,
+    tokens: i64,
+    heads: i64,
+    kv_heads: i64,
+    head_dim: i64,
+    scale: Option<f64>,
+) -> Result<crate::DeviceBuffer> {
+    let qd = heads * head_dim;
+    let kvd = kv_heads * head_dim;
+    let out = ctx.malloc((tokens * qd * 2) as usize)?;
+    let t1 = AclTensor::fp16_nd(q, &[1, tokens, qd])?;
+    let t2 = AclTensor::fp16_nd(k, &[1, tokens, kvd])?;
+    let t3 = AclTensor::fp16_nd(v, &[1, tokens, kvd])?;
+    let tout = AclTensor::fp16_nd(&out, &[1, tokens, qd])?;
+
+    let mut layout: [u8; 4] = *b"BSH\0";
+    let scale_value = scale.unwrap_or(1.0 / (head_dim as f64).sqrt());
+    let null = std::ptr::null_mut::<std::ffi::c_void>();
+
+    two_stage(
+        ctx,
+        stream,
+        "aclnnPromptFlashAttentionV3(BSH)",
+        |ws, ex| unsafe {
+            ffi::aclnnPromptFlashAttentionV3GetWorkspaceSize(
+                t1.handle(), t2.handle(), t3.handle(),
+                null, null, null, null, null, null, null, null, null,
+                heads, scale_value, i64::MAX, 0,
+                layout.as_mut_ptr(),
+                kv_heads, 0, 0,
+                tout.handle(), ws, ex,
+            )
+        },
+        |ws, size, ex| unsafe { ffi::aclnnPromptFlashAttentionV3(ws, size, ex, stream.handle()) },
+    )?;
+    Ok(out)
+}
+
 pub fn add_fp16(
     ctx: &AscendContext,
     stream: &AscendStream,
