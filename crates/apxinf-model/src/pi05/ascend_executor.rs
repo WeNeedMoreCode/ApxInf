@@ -40,49 +40,39 @@ impl Default for AscendCaches {
     }
 }
 
-/// Lazy per-pointer NZ weight cache: large ND weights crash the plain
-/// MatMulV2 NZ kernel on 310P3 (MTE DDR OOB), so every linear's weight
-/// is cast to FRACTAL_NZ once (aclnnNpuFormatCast) and reused, keyed
-/// by device pointer. Out-cols must be registered per pointer before
-/// first use (weights are [in, out]; `in` is inferred from size).
+/// Lazy per-pointer transposed-weight cache. The plain [k, n] row-major
+/// mat2 descriptor works in isolation but reads WRONG DATA (rel 0.79)
+/// after an AddRmsNorm has run, while the transposed-b view ([k, n]
+/// shape over physical [n, k], stride [1, k] -- torch's `a @ w.t()`
+/// layout) is both immune and numerically correct (probe 2026-09-18).
+/// So every linear weight is host-transposed once at first use and the
+/// matmul runs through the transposed path.
 pub struct NzCache {
-    nz: std::collections::HashMap<usize, (Arc<DeviceBuffer>, Vec<i64>)>,
-    strides: std::collections::HashMap<usize, Vec<i64>>,
+    transposed: std::collections::HashMap<usize, Arc<DeviceBuffer>>,
     out_cols: std::collections::HashMap<usize, i64>,
 }
 
 impl NzCache {
     pub fn new() -> Self {
-        Self { nz: Default::default(), strides: Default::default(), out_cols: Default::default() }
+        Self { transposed: Default::default(), out_cols: Default::default() }
     }
 
-    pub fn register(&mut self, w: &DeviceBuffer, cols_out: i64) {
-        self.out_cols.insert(w.as_ptr() as usize, cols_out);
-    }
-
-    pub fn get(&mut self, be: &AscendBackend, w: &DeviceBuffer, cols_out: i64) -> Result<(Arc<DeviceBuffer>, Vec<i64>)> {
+    pub fn get(&mut self, be: &AscendBackend, w: &DeviceBuffer, cols_out: i64) -> Result<Arc<DeviceBuffer>> {
         let key = w.as_ptr() as usize;
-        if let Some(v) = self.nz.get(&key) {
-            return Ok((v.0.clone(), v.1.clone()));
+        if let Some(v) = self.transposed.get(&key) {
+            return Ok(v.clone());
         }
         let cols = *self.out_cols.entry(key).or_insert(cols_out);
         let total = (w.len() / 2) as i64;
         let rows = total / cols;
-        // host reorder: d2h -> CPU 16x16 blocking -> h2d (load-time, once)
         let mut host = vec![0u8; w.len()];
         acl(be.ctx().copy_d2h(w, &mut host))?;
-        let (bytes, dims, strides) = aops::host_nz_reorder(&host, rows, cols);
+        let bytes = aops::host_transpose(&host, rows, cols);
         let buf = acl(be.ctx().malloc(bytes.len()))?;
         acl(be.ctx().copy_h2d(&buf, &bytes))?;
         acl(be.stream().synchronize())?;
-        self.nz.insert(key, (Arc::new(buf), dims.clone()));
-        self.strides.insert(key, strides);
-        let v = self.nz.get(&key).unwrap();
-        Ok((v.0.clone(), v.1.clone()))
-    }
-
-    pub fn strides_of(&self, w_ptr: usize) -> Option<&Vec<i64>> {
-        self.strides.get(&w_ptr)
+        self.transposed.insert(key, Arc::new(buf));
+        Ok(self.transposed.get(&key).unwrap().clone())
     }
 }
 
@@ -98,13 +88,8 @@ mod aq {
     use super::*;
 
     pub fn matmul(be: &AscendBackend, nz: &mut NzCache, a: &DeviceBuffer, ash: [i64; 2], b: &DeviceBuffer, bsh: [i64; 2]) -> Result<DeviceBuffer> {
-        let key = b.as_ptr() as usize;
-        let (nzbuf, dims) = nz.get(be, b, bsh[1])?;
-        let strides = nz.strides_of(key).cloned().unwrap_or_else(|| {
-            let h1 = dims[1];
-            vec![h1 * 256, 256, 16, 1]
-        });
-        acl(aops::matmul_weight_nz_fp16(be.ctx(), be.stream(), a, ash, &nzbuf, &dims, &strides, bsh[1]))
+        let bt = nz.get(be, b, bsh[1])?;
+        acl(aops::matmul_b_t_fp16(be.ctx(), be.stream(), a, ash, &bt, bsh[0], bsh[1]))
     }
     pub fn bias(be: &AscendBackend, x: &DeviceBuffer, bias: Option<&DeviceBuffer>, rows: i64, cols: i64) -> Result<DeviceBuffer> {
         acl(aops::bias_add_fp16(be.ctx(), be.stream(), x, bias.ok_or_else(|| Error::Other("bias required in aq::bias".into()))?, rows, cols))

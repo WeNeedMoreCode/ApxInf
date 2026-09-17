@@ -573,6 +573,73 @@ pub fn matmul_weight_nz_fp16(
     Ok(out)
 }
 
+/// EXPERIMENTAL: matmul where `b` physically holds the [n, k] (transposed)
+/// weight row-major and is described as a [k, n] view with transpose
+/// strides [1, k] -- the layout torch's `a @ w.t()` feeds aclnnMatmul.
+/// Hypothesis: the plain [k, n] row-major descriptor trips the
+/// MatMulV2_NZ_ND kernel's tiling on 310P3 for large shapes.
+pub fn matmul_b_t_fp16(
+    ctx: &AscendContext,
+    stream: &AscendStream,
+    a: &crate::DeviceBuffer,
+    ash: [i64; 2],
+    b_t: &crate::DeviceBuffer, // physical [n, k] row-major
+    k: i64,
+    n: i64,
+) -> Result<crate::DeviceBuffer> {
+    let out = ctx.malloc((ash[0] * n * 2) as usize)?;
+    let ta = AclTensor::fp16_nd(a, &ash)?;
+    // view [k, n] over physical [n, k]: element (i,j) at j*k + i
+    let dims = [k, n];
+    let stride = [1, k];
+    let raw = unsafe {
+        ffi::aclCreateTensor(
+            dims.as_ptr(), 2, ffi::ACL_FLOAT16,
+            stride.as_ptr(), 0, ffi::ACL_FORMAT_ND,
+            std::ptr::null(), 0, // storage dims unknown to the view
+            b_t.as_ptr(),
+        )
+    };
+    if raw.is_null() {
+        return Err(AclError { code: -1, op: "aclCreateTensor(transposed b)" });
+    }
+    let tb = AclTensor::from_raw(raw);
+    let tout = AclTensor::fp16_nd(&out, &[ash[0], n])?;
+    let mut ws_size: u64 = 0;
+    let mut executor: *mut std::ffi::c_void = std::ptr::null_mut();
+    let code = unsafe {
+        ffi::aclnnMatmulGetWorkspaceSize(ta.handle(), tb.handle(), tout.handle(), 1, &mut ws_size, &mut executor)
+    };
+    if code != 0 {
+        return Err(AclError { code, op: "aclnnMatmul(t-b) plan" });
+    }
+    let ws = if ws_size > 0 { Some(ctx.malloc(ws_size as usize)?) } else { None };
+    let code = unsafe {
+        ffi::aclnnMatmul(
+            ws.as_ref().map(|w| w.as_ptr()).unwrap_or(std::ptr::null_mut()),
+            ws_size,
+            executor,
+            stream.handle(),
+        )
+    };
+    if code != 0 {
+        return Err(AclError { code, op: "aclnnMatmul(t-b) run" });
+    }
+    Ok(out)
+}
+
+/// Host transpose [rows, cols] -> [cols, rows] (fp16 bytes).
+pub fn host_transpose(host: &[u8], rows: i64, cols: i64) -> Vec<u8> {
+    let src: Vec<u16> = host.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+    let mut out = vec![0u16; src.len()];
+    for r in 0..rows as usize {
+        for c in 0..cols as usize {
+            out[c * rows as usize + r] = src[r * cols as usize + c];
+        }
+    }
+    out.iter().flat_map(|&v| v.to_le_bytes()).collect()
+}
+
 pub fn add_fp16(
     ctx: &AscendContext,
     stream: &AscendStream,
