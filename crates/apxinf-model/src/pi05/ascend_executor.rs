@@ -32,6 +32,10 @@ pub struct AscendCaches {
     /// removes the per-layer d2h+stream-sync that broke pipelining
     /// (~540 syncs per inference at full depth).
     style_rows: std::collections::HashMap<usize, (Arc<DeviceBuffer>, Arc<DeviceBuffer>)>,
+    /// Pre-sliced qkv bias rows, keyed by (bias pointer, start, len).
+    kv_biases: std::collections::HashMap<(usize, i64, i64), Arc<DeviceBuffer>>,
+    /// Pinned rope position-index rows, keyed by (tokens, heads, offset).
+    pos_idx: std::collections::HashMap<(i64, i64, i64), Arc<DeviceBuffer>>,
 }
 
 impl AscendCaches {
@@ -40,6 +44,8 @@ impl AscendCaches {
             rope: AscendRopeCache::new(),
             nz: NzCache::new(),
             style_rows: Default::default(),
+            kv_biases: Default::default(),
+            pos_idx: Default::default(),
         }
     }
 }
@@ -291,17 +297,28 @@ fn apply_rope_rows(
     };
     let ctx = be.ctx();
     let stream = be.stream();
-    // materialize per-row cos/sin: gather table rows by position index,
-    // each position repeated `heads` times.
-    let mut pos_idx = Vec::with_capacity((tokens * heads) as usize);
-    for t in 0..tokens {
-        for _ in 0..heads {
-            pos_idx.push((pos_offset as i64 + t) as i32);
+    // per-row cos/sin: gather table rows by position index, each position
+    // repeated `heads` times. The index vector only depends on (tokens,
+    // heads, offset) -- build once, keep the device copy pinned in the cache
+    // (stable address matters for any future capture window).
+    let pos_key = (tokens, heads, pos_offset as i64);
+    let pos_buf = match cache.pos_idx.get(&pos_key) {
+        Some(v) => v.clone(),
+        None => {
+            let mut pos_idx = Vec::with_capacity((tokens * heads) as usize);
+            for t in 0..tokens {
+                for _ in 0..heads {
+                    pos_idx.push((pos_offset as i64 + t) as i32);
+                }
+            }
+            let buf = acl(ctx.malloc(pos_idx.len() * 4))?;
+            let pb = unsafe { std::slice::from_raw_parts(pos_idx.as_ptr() as *const u8, pos_idx.len() * 4) };
+            acl(ctx.copy_h2d(&buf, pb))?;
+            let buf = Arc::new(buf);
+            cache.pos_idx.insert(pos_key, buf.clone());
+            buf
         }
-    }
-    let pos_buf = acl(ctx.scratch_buf(pos_idx.len() * 4))?;
-    let pb = unsafe { std::slice::from_raw_parts(pos_idx.as_ptr() as *const u8, pos_idx.len() * 4) };
-    acl(ctx.copy_h2d(&pos_buf, pb))?;
+    };
 
     let tables: AscendRopeTableArcs = {
         let t = cache.rope.tables(be, theta, d, (pos_offset + tokens as usize).max(1))?;
@@ -330,7 +347,9 @@ fn apply_rope_rows(
             }
         }
     }
-    acl(stream.synchronize())?;
+    // no sync here: gather outputs feed the next kernels on the same
+    // stream -- ordering carries, and a sync in this spot would break a
+    // capture window
     acl(aops::rope_rotate_half_fp16(ctx, stream, x, rows, d, &cos_pos, &sin_pos, &tables.rot_idx))
 }
 
@@ -387,9 +406,9 @@ pub fn language_layer_ascend(
     let k_raw = aq::take_rows(be,&qkv, tokens, tokens, kv_d)?;
     let v_raw = aq::take_rows(be,&qkv, tokens * 2, tokens, kv_d)?;
     // qkv bias spans the fused width; slice per part.
-    let q_bias = kv_bias(be, &weights.qkv.bias, 0, qd)?;
-    let k_bias = kv_bias(be, &weights.qkv.bias, qd, kv_d)?;
-    let v_bias = kv_bias(be, &weights.qkv.bias, qd + kv_d, kv_d)?;
+    let q_bias = kv_bias(be, cache, &weights.qkv.bias, 0, qd)?;
+    let k_bias = kv_bias(be, cache, &weights.qkv.bias, qd, kv_d)?;
+    let v_bias = kv_bias(be, cache, &weights.qkv.bias, qd + kv_d, kv_d)?;
     let q = aq::bias(be,&q_raw, q_bias.as_deref(), tokens, qd)?;
     let k = aq::bias(be,&k_raw, k_bias.as_deref(), tokens, kv_d)?;
     let v = aq::bias(be,&v_raw, v_bias.as_deref(), tokens, kv_d)?;
@@ -444,18 +463,26 @@ fn tensor_opt(t: &Option<Tensor>) -> Result<Option<&DeviceBuffer>> {
     }
 }
 
-/// Slice a fused qkv bias into a kv-slice device row (host pass-through).
-fn kv_bias(be: &AscendBackend, bias: &Option<Tensor>, start: i64, len: i64) -> Result<Option<Arc<DeviceBuffer>>> {
+/// Slice a fused qkv bias into a kv-slice device row. Biases are static
+/// weights: the d2h+slice+h2d round trip happens once per (pointer,
+/// offset) and lands in `cache.kv_biases` -- steady-state calls (and any
+/// future capture window) stay device-only.
+fn kv_bias(be: &AscendBackend, cache: &mut AscendCaches, bias: &Option<Tensor>, start: i64, len: i64) -> Result<Option<Arc<DeviceBuffer>>> {
     let Some(bias) = bias else { return Ok(None) };
     let b = tensor_buf(bias)?;
+    let key = (b.as_ptr() as usize, start, len);
+    if let Some(v) = cache.kv_biases.get(&key) {
+        return Ok(Some(v.clone()));
+    }
     let bytes = (len * 2) as usize;
     let off = (start * 2) as usize;
     // full d2h then host-side slice (bias is tiny and static)
     let mut full = vec![0u8; b.len()];
     acl(be.ctx().copy_d2h(b, &mut full))?;
-    let out = acl(be.ctx().scratch_buf(bytes))?;
+    let out = acl(be.ctx().malloc(bytes))?;
     acl(be.ctx().copy_h2d(&out, &full[off..off + bytes]))?;
-    acl(be.stream().synchronize())?;
+    let out = Arc::new(out);
+    cache.kv_biases.insert(key, out.clone());
     Ok(Some(out))
 }
 
@@ -510,9 +537,9 @@ pub fn vision_layer_ascend(
     let q_raw = aq::take_rows(be,&qkv, 0, tokens, qd)?;
     let k_raw = aq::take_rows(be,&qkv, tokens, tokens, qd)?;
     let v_raw = aq::take_rows(be,&qkv, tokens * 2, tokens, qd)?;
-    let q_bias = vision_kv_bias(be, &weights.qkv.bias, 0, qd)?;
-    let k_bias = vision_kv_bias(be, &weights.qkv.bias, qd, qd)?;
-    let v_bias = vision_kv_bias(be, &weights.qkv.bias, qd * 2, qd)?;
+    let q_bias = vision_kv_bias(be, cache, &weights.qkv.bias, 0, qd)?;
+    let k_bias = vision_kv_bias(be, cache, &weights.qkv.bias, qd, qd)?;
+    let v_bias = vision_kv_bias(be, cache, &weights.qkv.bias, qd * 2, qd)?;
     let q = aq::bias(be,&q_raw, q_bias.as_deref(), tokens, qd)?;
     let k = aq::bias(be,&k_raw, k_bias.as_deref(), tokens, qd)?;
     let v = aq::bias(be,&v_raw, v_bias.as_deref(), tokens, qd)?;
@@ -661,8 +688,8 @@ fn f32_to_f16_bits(x: f32) -> u16 {
 }
 
 /// Host-side kv bias slice (same pass-through as language path).
-fn vision_kv_bias(be: &AscendBackend, bias: &Option<Tensor>, start: i64, len: i64) -> Result<Option<Arc<DeviceBuffer>>> {
-    kv_bias(be, bias, start, len)
+fn vision_kv_bias(be: &AscendBackend, cache: &mut AscendCaches, bias: &Option<Tensor>, start: i64, len: i64) -> Result<Option<Arc<DeviceBuffer>>> {
+    kv_bias(be, cache, bias, start, len)
 }
 
 /// Action expert layer with ada-norm styles and prefix KV — mirror of
@@ -717,9 +744,9 @@ pub fn action_layer_ascend(
     let q_raw = aq::take_rows(be, &qkv, 0, tokens, qd)?;
     let k_raw = aq::take_rows(be, &qkv, tokens, tokens, kv_d)?;
     let v_raw = aq::take_rows(be, &qkv, tokens * 2, tokens, kv_d)?;
-    let q_bias = kv_bias(be, &weights.qkv.bias, 0, qd)?;
-    let k_bias = kv_bias(be, &weights.qkv.bias, qd, kv_d)?;
-    let v_bias = kv_bias(be, &weights.qkv.bias, qd + kv_d, kv_d)?;
+    let q_bias = kv_bias(be, cache, &weights.qkv.bias, 0, qd)?;
+    let k_bias = kv_bias(be, cache, &weights.qkv.bias, qd, kv_d)?;
+    let v_bias = kv_bias(be, cache, &weights.qkv.bias, qd + kv_d, kv_d)?;
     let q = aq::bias(be, &q_raw, q_bias.as_deref(), tokens, qd)?;
     let k = aq::bias(be, &k_raw, k_bias.as_deref(), tokens, kv_d)?;
     let v = aq::bias(be, &v_raw, v_bias.as_deref(), tokens, kv_d)?;
