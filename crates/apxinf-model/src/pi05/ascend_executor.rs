@@ -26,11 +26,21 @@ pub(crate) fn acl<T>(r: std::result::Result<T, AclError>) -> Result<T> {
 pub struct AscendCaches {
     pub rope: AscendRopeCache,
     pub nz: NzCache,
+    /// Pre-materialized ada-norm rows, keyed by style tensor pointer:
+    /// (1+style[0:w], style[w:2w]) as device rows. Styles are computed
+    /// once per flow step and reused across the layer loop -- caching
+    /// removes the per-layer d2h+stream-sync that broke pipelining
+    /// (~540 syncs per inference at full depth).
+    style_rows: std::collections::HashMap<usize, (Arc<DeviceBuffer>, Arc<DeviceBuffer>)>,
 }
 
 impl AscendCaches {
     pub fn new() -> Self {
-        Self { rope: AscendRopeCache::new(), nz: NzCache::new() }
+        Self {
+            rope: AscendRopeCache::new(),
+            nz: NzCache::new(),
+            style_rows: Default::default(),
+        }
     }
 }
 
@@ -565,27 +575,36 @@ pub fn vision_patch_embed_ascend(
 /// ada-norm, cuda kernel semantics (normalization.cuh ada_rms_norm_bf16):
 /// y = rms(x) * (1 + style[0:cols]) + style[cols:2*cols]. The style
 /// projection outputs [3*cols]; the third segment is unused here.
-fn adaptive_rms(be: &AscendBackend, x: &DeviceBuffer, style: &Tensor, rows: i64, cols: i64, eps: f32) -> Result<DeviceBuffer> {
+/// (1+scale)/shift rows are materialized once per style tensor and
+/// cached in `cache.style_rows` -- steady-state steps run device-only.
+fn adaptive_rms(be: &AscendBackend, cache: &mut AscendCaches, x: &DeviceBuffer, style: &Tensor, rows: i64, cols: i64, eps: f32) -> Result<DeviceBuffer> {
     // rms with gamma = ones (ada-norm has no gamma)
     let zeros = be.zeros(rows as usize * cols as usize * 2)?;
     let c = cols as usize;
     let ones = zeros_scale_buf(be, c)?;
     let normed = acl(aops::add_rms_norm_fp16(be.ctx(), be.stream(), x, &zeros, &ones, &[rows, cols], eps as f64))?.0;
-    let style_h = host_f16_row(be, style, 3 * c)?;
-    let mut scale_row = vec![0u16; c];
-    let mut shift_row = vec![0u16; c];
-    for i in 0..c {
-        scale_row[i] = f32_to_f16_bits(f16_bits_to_f32(style_h[i]) + 1.0);
-        shift_row[i] = style_h[c + i];
-    }
-    let mut upload = |vals: &[u16]| -> Result<Arc<DeviceBuffer>> {
-        let buf = acl(be.ctx().scratch_buf(vals.len() * 2))?;
-        let bytes: &[u8] = unsafe { std::slice::from_raw_parts(vals.as_ptr() as *const u8, vals.len() * 2) };
-        acl(be.ctx().copy_h2d(&buf, bytes))?;
-        Ok(buf)
+    let key = tensor_buf(style)?.as_ptr() as usize;
+    let (scale_b, shift_b) = match cache.style_rows.get(&key) {
+        Some(v) => (v.0.clone(), v.1.clone()),
+        None => {
+            let style_h = host_f16_row(be, style, 3 * c)?;
+            let mut scale_row = vec![0u16; c];
+            let mut shift_row = vec![0u16; c];
+            for i in 0..c {
+                scale_row[i] = f32_to_f16_bits(f16_bits_to_f32(style_h[i]) + 1.0);
+                shift_row[i] = style_h[c + i];
+            }
+            let mut upload = |vals: &[u16]| -> Result<Arc<DeviceBuffer>> {
+                let buf = acl(be.ctx().malloc(vals.len() * 2))?;
+                let bytes: &[u8] = unsafe { std::slice::from_raw_parts(vals.as_ptr() as *const u8, vals.len() * 2) };
+                acl(be.ctx().copy_h2d(&buf, bytes))?;
+                Ok(Arc::new(buf))
+            };
+            let entry = (upload(&scale_row)?, upload(&shift_row)?);
+            cache.style_rows.insert(key, entry.clone());
+            entry
+        }
     };
-    let scale_b = upload(&scale_row)?;
-    let shift_b = upload(&shift_row)?;
     let scale_mat = acl(aops::row_replicate_fp16(be.ctx(), be.stream(), &scale_b, rows, cols))?;
     let shift_mat = acl(aops::row_replicate_fp16(be.ctx(), be.stream(), &shift_b, rows, cols))?;
     let scaled = acl(aops::mul_fp16(be.ctx(), be.stream(), &normed, &scale_mat, &[rows, cols]))?;
@@ -684,7 +703,7 @@ pub fn action_layer_ascend(
     let _ = (ctx, stream);
     let normalized = match attention_normalized {
         Some(v) => aq::take_rows(be, tensor_buf(v)?, 0, tokens, width)?,
-        None => adaptive_rms(be, input_b, attention_style, tokens, width, rms_eps)?,
+        None => adaptive_rms(be, cache, input_b, attention_style, tokens, width, rms_eps)?,
     };
     mark!("ada-norm");
 
@@ -726,7 +745,7 @@ pub fn action_layer_ascend(
     mark!("output proj");
     let proj = bias_add(be, &proj, weights.output.bias.as_ref(), tokens, width)?;
     let res = aq::add(be, &proj, &normalized, &[tokens, width])?;
-    let normed = adaptive_rms(be, &res, mlp_style, tokens, width, rms_eps)?;
+    let normed = adaptive_rms(be, cache, &res, mlp_style, tokens, width, rms_eps)?;
     mark!("mlp ada-norm");
 
     let gw = tensor_buf(&weights.gate_up.weight)?;
@@ -746,7 +765,7 @@ pub fn action_layer_ascend(
     mark!("down matmul");
     let proj2 = bias_add(be, &proj2, weights.down.bias.as_ref(), tokens, width)?;
     let hidden = aq::add(be, &proj2, &res, &[tokens, width])?;
-    let next_normalized = adaptive_rms(be, &hidden, next_norm_style, tokens, width, rms_eps)?;
+    let next_normalized = adaptive_rms(be, cache, &hidden, next_norm_style, tokens, width, rms_eps)?;
     Ok(ActionLayerOutput {
         hidden: be.wrap_fp16(hidden, vec![tokens as usize, width as usize]),
         next_normalized: be.wrap_fp16(next_normalized, vec![tokens as usize, width as usize]),
