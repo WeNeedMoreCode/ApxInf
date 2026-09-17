@@ -246,6 +246,109 @@ pub fn euler_update_fp16(
     add_fp16(ctx, stream, x0, &scaled, shape)
 }
 
+/// Copy out a row slice of a device buffer (D2D): rows
+/// [row_offset, row_offset+rows) of a [total, cols] layout. Used for
+/// QKV splits -- the aclTensor offset-view semantics proved
+/// unreliable on device, so we pay a microsecond copy for certainty.
+pub fn take_rows_fp16(
+    ctx: &AscendContext,
+    stream: &AscendStream,
+    buf: &crate::DeviceBuffer,
+    row_offset: i64,
+    rows: i64,
+    cols: i64,
+) -> Result<crate::DeviceBuffer> {
+    let bytes = (rows * cols * 2) as usize;
+    let off = (row_offset * cols * 2) as usize;
+    assert!(off + bytes <= buf.len(), "take_rows out of bounds");
+    let out = ctx.malloc(bytes)?;
+    let code = unsafe {
+        ffi::aclrtMemcpyAsync(
+            out.as_ptr(),
+            bytes,
+            (buf.as_ptr() as *const u8).add(off) as *const std::ffi::c_void,
+            bytes,
+            ffi::ACL_MEMCPY_DEVICE_TO_DEVICE,
+            stream.handle(),
+        )
+    };
+    if code != 0 {
+        return Err(AclError { code, op: "aclrtMemcpyAsync(take_rows)" });
+    }
+    Ok(out)
+}
+
+/// LayerNorm(x) via the fused aclnnAddLayerNorm(x, zeros, gamma, beta).
+/// All three extra outputs (mean/rstd/xOut) are allocated here; `zeros`
+/// must be a device-side zero buffer of x's size (caller-cached).
+pub fn layer_norm_fp16(
+    ctx: &AscendContext,
+    stream: &AscendStream,
+    x: &crate::DeviceBuffer,
+    zeros: &crate::DeviceBuffer,
+    gamma: &crate::DeviceBuffer,
+    beta: &crate::DeviceBuffer,
+    rows: i64,
+    cols: i64,
+    eps: f64,
+) -> Result<crate::DeviceBuffer> {
+    let y = ctx.malloc((rows * cols * 2) as usize)?;
+    let mean = ctx.malloc((rows * 4) as usize)?;
+    let rstd = ctx.malloc((rows * 4) as usize)?;
+    let x_out = ctx.malloc((rows * cols * 2) as usize)?;
+    let dims = [rows, cols];
+    let tx = AclTensor::fp16_nd(x, &dims)?;
+    let tz = AclTensor::fp16_nd(zeros, &dims)?;
+    let tg = AclTensor::fp16_nd(gamma, &[cols])?;
+    let tb = AclTensor::fp16_nd(beta, &[cols])?;
+    let ty = AclTensor::fp16_nd(&y, &dims)?;
+    let tmean = AclTensor::fp32_nd(&mean, &[rows, 1])?;
+    let trstd = AclTensor::fp32_nd(&rstd, &[rows, 1])?;
+    let txo = AclTensor::fp16_nd(&x_out, &dims)?;
+    two_stage(
+        ctx,
+        stream,
+        "aclnnAddLayerNorm",
+        |ws, ex| unsafe {
+            ffi::aclnnAddLayerNormGetWorkspaceSize(
+                tx.handle(), tz.handle(), tg.handle(), tb.handle(),
+                std::ptr::null_mut(), eps, false as i32 as u8 != 0,
+                ty.handle(), tmean.handle(), trstd.handle(), txo.handle(), ws, ex,
+            )
+        },
+        |ws, size, ex| unsafe { ffi::aclnnAddLayerNorm(ws, size, ex, stream.handle()) },
+    )?;
+    Ok(y)
+}
+
+/// Replicate one fp16 row [d] into [rows, d] via a dim-0 gather -- the
+/// broadcast substitute for ops that reject zero-stride descriptors
+/// (aclnnMul et al). Row indices are rebuilt per call; cache at the
+/// executor layer when rows is stable.
+pub fn row_replicate_fp16(
+    ctx: &AscendContext,
+    stream: &AscendStream,
+    row: &crate::DeviceBuffer,
+    rows: i64,
+    d: i64,
+) -> Result<crate::DeviceBuffer> {
+    let idx: Vec<i32> = vec![0; rows as usize];
+    let di = ctx.malloc(rows as usize * 4)?;
+    ctx.copy_h2d(&di, unsafe { std::slice::from_raw_parts(idx.as_ptr() as *const u8, rows as usize * 4) })?;
+    let out = ctx.malloc((rows * d * 2) as usize)?;
+    let tr = AclTensor::fp16_nd(row, &[1, d])?;
+    let ti = AclTensor::i32_nd(&di, &[rows])?;
+    let to = AclTensor::fp16_nd(&out, &[rows, d])?;
+    two_stage(
+        ctx,
+        stream,
+        "aclnnGatherV2(replicate)",
+        |ws, ex| unsafe { ffi::aclnnGatherV2GetWorkspaceSize(tr.handle(), 0, ti.handle(), to.handle(), ws, ex) },
+        |ws, size, ex| unsafe { ffi::aclnnGatherV2(ws, size, ex, stream.handle()) },
+    )?;
+    Ok(out)
+}
+
 /// Rotate-half RoPE for one [rows, d] tensor, composed from verified ops
 /// (gather + mul + add). The fused aclnn rope entries hard-reject pi0.5's
 /// head_dims on 310P3 (ApplyRotaryPosEmb: d must be 64/128;

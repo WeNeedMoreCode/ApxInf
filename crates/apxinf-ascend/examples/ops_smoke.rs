@@ -4,7 +4,8 @@
 //!   source /data/apxinf/rust_env.sh
 //!   ASCEND_RT_VISIBLE_DEVICES=5 cargo run --example ops_smoke --release
 
-use apxinf_ascend::ops::{add_fp16, add_rms_norm_fp16, bias_add_fp16, cat_fp16, euler_update_fp16, gather_rows_fp16, gelu_fp16, muls_fp16, silu_fp16};
+use apxinf_ascend::ops::{add_fp16, add_rms_norm_fp16, bias_add_fp16, cat_fp16, euler_update_fp16, gather_rows_fp16, gelu_fp16, layer_norm_fp16, muls_fp16, row_replicate_fp16, silu_fp16};
+use apxinf_ascend::AclTensor;
 use apxinf_ascend::{AscendContext, AscendStream};
 use half::f16;
 
@@ -177,6 +178,52 @@ fn main() {
     }
     println!("gather(embedding) exact: {ok}");
     assert!(ok, "gather wrong rows");
+
+    // ---- layer_norm (fused AddLayerNorm + zeros) ----
+    let zeros: Vec<u8> = vec![0; n * 2];
+    let dz = ctx.malloc(n * 2).unwrap();
+    ctx.copy_h2d(&dz, &zeros).unwrap();
+    let hgam: Vec<f16> = (0..cols).map(|i| f16::from_f32(1.0 + 0.01 * i as f32)).collect();
+    let hbet: Vec<f16> = (0..cols).map(|i| f16::from_f32(0.001 * i as f32)).collect();
+    let dgam = ctx.malloc(cols * 2).unwrap();
+    let dbet = ctx.malloc(cols * 2).unwrap();
+    ctx.copy_h2d(&dgam, bytemuck::cast_slice(&hgam)).unwrap();
+    ctx.copy_h2d(&dbet, bytemuck::cast_slice(&hbet)).unwrap();
+    let dln = layer_norm_fp16(&ctx, &stream, &da, &dz, &dgam, &dbet, rows as i64, cols as i64, 1e-6).expect("layer_norm");
+    stream.synchronize().unwrap();
+    ctx.copy_d2h(&dln, &mut back).unwrap();
+    let got: Vec<f16> = bytemuck::cast_slice(&back).to_vec();
+    let mut max_err = 0f32;
+    for r in 0..rows {
+        let row: Vec<f32> = (0..cols).map(|c| ha[r * cols + c].to_f32()).collect();
+        let mean = row.iter().sum::<f32>() / cols as f32;
+        let var = row.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / cols as f32;
+        for c in 0..cols {
+            let want = (row[c] - mean) / (var + 1e-6).sqrt() * hgam[c].to_f32() + hbet[c].to_f32();
+            max_err = max_err.max((got[r * cols + c].to_f32() - want).abs());
+        }
+    }
+    println!("layer_norm max abs err {max_err:.5}");
+    assert!(max_err < 0.02, "layer_norm out of tolerance");
+
+    // ---- row_replicate (gather broadcast substitute) ----
+    let drep = row_replicate_fp16(&ctx, &stream, &dbias, rows as i64, cols as i64).expect("replicate");
+    stream.synchronize().unwrap();
+    ctx.copy_d2h(&drep, &mut back).unwrap();
+    let got: Vec<f16> = bytemuck::cast_slice(&back).to_vec();
+    let ok = (0..rows).all(|r| (0..cols).all(|c| got[r * cols + c].to_f32() == hbias[c].to_f32()));
+    println!("row_replicate exact: {ok}");
+    assert!(ok);
+
+    // ---- take_rows (D2D split, QKV 用) ----
+    let dsplit = apxinf_ascend::ops::take_rows_fp16(&ctx, &stream, &da, (rows / 2) as i64, (rows / 2) as i64, cols as i64).expect("take_rows");
+    stream.synchronize().unwrap();
+    let mut sback2 = vec![0u8; (rows / 2) * cols * 2];
+    ctx.copy_d2h(&dsplit, &mut sback2).unwrap();
+    let srow: Vec<f16> = bytemuck::cast_slice(&sback2).to_vec();
+    let sok = (0..(rows / 2) * cols).all(|i| srow[i].to_f32() == ha[(rows / 2) * cols + i].to_f32());
+    println!("take_rows exact: {sok}");
+    assert!(sok);
 
     println!("OPS_SMOKE_OK");
 }

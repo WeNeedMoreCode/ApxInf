@@ -44,6 +44,13 @@ impl AclTensor {
         Ok(Self { raw })
     }
 
+    // NOTE: no offset-view constructor. aclCreateTensor's `offset`
+    // semantics proved unreliable on device (neither element- nor
+    // byte-units produced the expected slice through a gather), so row
+    // splits use ops::take_rows_fp16 -- a D2D memcpy with explicit,
+    // verified semantics. Do not reintroduce views without a device
+    // probe proving the offset unit.
+
     /// fp16 [rows, cols] descriptor whose row stride is 0 -- broadcasts a
     /// [cols] bias across rows in aclnnAdd without materializing.
     pub fn fp16_row_broadcast(buf: &crate::DeviceBuffer, rows: i64, cols: i64) -> Result<Self> {

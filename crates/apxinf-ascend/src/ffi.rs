@@ -196,6 +196,31 @@ extern "C" {
         stream: *mut c_void,
     ) -> i32;
 
+    // aclnnop/aclnn_add_layer_norm.h: y = LayerNorm(x1 + x2) * gamma + beta,
+    // with optional bias and extra outputs (mean/rstd/x). Used as plain
+    // LayerNorm by passing a zeros second input.
+    pub fn aclnnAddLayerNormGetWorkspaceSize(
+        x1: *mut c_void,
+        x2: *mut c_void,
+        gamma: *mut c_void,
+        beta: *mut c_void,
+        biasOptional: *mut c_void,
+        epsilon: f64,
+        additionalOutput: bool,
+        yOut: *mut c_void,
+        meanOut: *mut c_void,
+        rstdOut: *mut c_void,
+        xOut: *mut c_void,
+        workspaceSize: *mut u64,
+        executor: *mut *mut c_void,
+    ) -> i32;
+    pub fn aclnnAddLayerNorm(
+        workspace: *mut c_void,
+        workspaceSize: u64,
+        executor: *mut c_void,
+        stream: *mut c_void,
+    ) -> i32;
+
     // aclnnop/aclnn_gelu_v2.h: gelu with an `approximate` selector
     // (0 = erf, 1 = tanh), the PyTorch-compatible semantics torch_npu
     // dispatches to. This is the ONLY working gelu entry on 310P3:
