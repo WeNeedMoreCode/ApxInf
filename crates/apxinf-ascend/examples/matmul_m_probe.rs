@@ -17,7 +17,7 @@ fn main() {
         ((seed >> 33) as i32 % 1000 - 500) as f32 / 500.0
     };
 
-    for n in [8192i64, 16384] {
+    for n in [8192i64, 16384, 32768] {
         let hb: Vec<f16> = (0..(k * n) as usize).map(|_| f16::from_f32(rnd())).collect();
         let db = ctx.malloc((k * n * 2) as usize).unwrap();
         ctx.copy_h2d(&db, bytemuck::cast_slice(&hb)).unwrap();
@@ -25,7 +25,7 @@ fn main() {
         let dbt = ctx.malloc(ht.len()).unwrap();
         ctx.copy_h2d(&dbt, &ht).unwrap();
         println!("N={n}:");
-        for m in [8i64, 16, 32, 64, 128, 256] {
+        for m in [8i64, 16, 32, 64, 128, 256, 812, 820, 828, 832] {
             let ha: Vec<f16> = (0..(m * k) as usize).map(|_| f16::from_f32(rnd())).collect();
             let da = ctx.malloc((m * k * 2) as usize).unwrap();
             ctx.copy_h2d(&da, bytemuck::cast_slice(&ha)).unwrap();

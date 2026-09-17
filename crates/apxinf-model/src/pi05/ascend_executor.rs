@@ -18,7 +18,7 @@ use super::{
 };
 
 /// Bridge aclnn errors into apxinf_core::Error.
-fn acl<T>(r: std::result::Result<T, AclError>) -> Result<T> {
+pub(crate) fn acl<T>(r: std::result::Result<T, AclError>) -> Result<T> {
     r.map_err(|e| Error::Other(format!("aclnn: {e}")))
 }
 
@@ -65,6 +65,9 @@ impl NzCache {
         let cols = *self.out_cols.entry(key).or_insert(cols_out);
         let total = (w.len() / 2) as i64;
         let rows = total / cols;
+        if std::env::var("APXINF_ASCEND_TRACE").is_ok() {
+            eprintln!("[trace] nz: transposing [{rows},{cols}] from {:p}", w.as_ptr());
+        }
         let mut host = vec![0u8; w.len()];
         acl(be.ctx().copy_d2h(w, &mut host))?;
         let bytes = aops::host_transpose(&host, rows, cols);
@@ -84,7 +87,7 @@ impl Default for NzCache {
 
 /// acl()-bridged mirrors of the apxinf-ascend op functions so call sites
 /// can use `?` directly against apxinf_core::Error.
-mod aq {
+pub(crate) mod aq {
     use super::*;
 
     pub fn matmul(be: &AscendBackend, nz: &mut NzCache, a: &DeviceBuffer, ash: [i64; 2], b: &DeviceBuffer, bsh: [i64; 2]) -> Result<DeviceBuffer> {
@@ -114,6 +117,20 @@ mod aq {
     }
     pub fn pfa_bsh(be: &AscendBackend, q: &DeviceBuffer, k: &DeviceBuffer, v: &DeviceBuffer, tokens: i64, heads: i64, kv: i64, hd: i64) -> Result<DeviceBuffer> {
         acl(aops::prompt_flash_attention_bsh_fp16(be.ctx(), be.stream(), q, k, v, tokens, heads, kv, hd, None))
+    }
+    pub fn silu(be: &AscendBackend, x: &DeviceBuffer, sh: &[i64]) -> Result<DeviceBuffer> {
+        acl(aops::silu_fp16(be.ctx(), be.stream(), x, sh))
+    }
+    pub fn gather_rows(be: &AscendBackend, table: &DeviceBuffer, vocab: i64, dim: i64, indices: &DeviceBuffer, n: i64) -> Result<DeviceBuffer> {
+        acl(aops::gather_rows_fp16(be.ctx(), be.stream(), table, vocab, dim, indices, n))
+    }
+    pub fn euler(be: &AscendBackend, x0: &DeviceBuffer, x1: &DeviceBuffer, sigma: f32, sh: &[i64]) -> Result<DeviceBuffer> {
+        acl(aops::euler_update_fp16(be.ctx(), be.stream(), x0, x1, sigma, sh))
+    }
+    pub fn cat2(be: &AscendBackend, a: &DeviceBuffer, ash: [i64; 2], b: &DeviceBuffer, bsh: [i64; 2]) -> Result<DeviceBuffer> {
+        let rows = ash[0] + bsh[0];
+        let cols = ash[1];
+        acl(aops::cat_fp16(be.ctx(), be.stream(), &[a, b], &[vec![ash[0], cols], vec![bsh[0], cols]], 0, &[rows, cols]))
     }
 }
 
@@ -305,13 +322,16 @@ fn apply_rope_rows(
 }
 
 /// bias + reshape helper: y = x + bias (row broadcast), staying in buffers.
-fn bias_add(be: &AscendBackend, x: &DeviceBuffer, bias: Option<&Tensor>, rows: i64, cols: i64) -> Result<DeviceBuffer> {
-    let Some(bias) = bias else { return acl(aops::take_rows_fp16(be.ctx(), be.stream(), x, 0, (x.len() / 2) as i64, 2)) };
+pub(crate) fn bias_add(be: &AscendBackend, x: &DeviceBuffer, bias: Option<&Tensor>, rows: i64, cols: i64) -> Result<DeviceBuffer> {
+    let Some(bias) = bias else {
+        // identity copy: one fp16 element per "row" covers the whole buffer
+        return acl(aops::take_rows_fp16(be.ctx(), be.stream(), x, 0, (x.len() / 2) as i64, 1))
+    };
     let b = tensor_buf(bias)?;
     acl(aops::bias_add_fp16(be.ctx(), be.stream(), x, b, rows, cols))
 }
 
-fn tensor_buf(t: &Tensor) -> Result<&DeviceBuffer> {
+pub(crate) fn tensor_buf(t: &Tensor) -> Result<&DeviceBuffer> {
     match t.storage() {
         apxinf_core::Storage::Gpu { handle, .. } => handle
             ._prevent_leak
@@ -388,10 +408,11 @@ pub fn language_layer_ascend(
     let inter = (tensor_buf(&weights.gate_up.weight)?.len() / 2 / (width as usize * 2)) as i64;
     let gate_up = aq::matmul(be, &mut cache.nz,fused_norm_b, [tokens, width],
         tensor_buf(&weights.gate_up.weight)?, [width, inter * 2])?;
-    let up = aq::take_rows(be,&gate_up, 0, tokens, inter)?;
-    let gate = aq::take_rows(be,&gate_up, tokens, tokens, inter)?;
+    // from_host_parts packs [gate, up] -- first half is the gelu input.
+    let gate = aq::take_rows(be,&gate_up, 0, tokens, inter)?;
+    let up = aq::take_rows(be,&gate_up, tokens, tokens, inter)?;
     let gate_g = aq::gelu(be,&gate, &[tokens, inter], true)?;
-    let activated = aq::mul(be,&up, &gate_g, &[tokens, inter])?;
+    let activated = aq::mul(be,&gate_g, &up, &[tokens, inter])?;
     let projected2 = aq::matmul(be, &mut cache.nz,&activated, [tokens, inter],
         tensor_buf(&weights.down.weight)?, [inter, width])?;
     let biased2 = bias_add(be, &projected2, weights.down.bias.as_ref(), tokens, width)?;
@@ -464,7 +485,7 @@ pub fn vision_layer_ascend(
     let tokens = input.shape().dims()[0] as i64;
     let width = input.shape().dims()[1] as i64;
     let input_b = tensor_buf(input)?;
-    let zeros = be.zeros(width as usize * tokens as usize)?;
+    let zeros = be.zeros(width as usize * tokens as usize * 2)?;
 
     let normalized = aq::layer_norm(be,input_b, &zeros,
         tensor_buf(&weights.norm1.weight)?, tensor_buf(&weights.norm1.bias)?,
@@ -483,7 +504,14 @@ pub fn vision_layer_ascend(
     let k = aq::bias(be,&k_raw, k_bias.as_ref(), tokens, qd)?;
     let v = aq::bias(be,&v_raw, v_bias.as_ref(), tokens, qd)?;
 
-    let attn = pfa_full(be, &q, &k, &v, tokens, heads as i64, heads as i64, hd)?;
+    // SigLIP attends WITHIN each view's window: [views, tpv] batched PFA
+    // over the same contiguous [tokens, qd] buffers.
+    let views = tokens / patches_per_view as i64;
+    debug_assert_eq!(views * patches_per_view as i64, tokens);
+    let attn = acl(aops::prompt_flash_attention_bsh_batch_fp16(
+        be.ctx(), be.stream(), &q, &k, &v,
+        views, patches_per_view as i64, heads as i64, heads as i64, hd, None,
+    ))?;
     let proj = aq::matmul(be, &mut cache.nz,&attn, [tokens, qd],
         tensor_buf(&weights.output.weight)?, [qd, width])?;
     let proj = bias_add(be, &proj, weights.output.bias.as_ref(), tokens, width)?;
@@ -503,8 +531,9 @@ pub fn vision_layer_ascend(
     Ok(buf_tensor(be, res2, tokens as usize, width as usize))
 }
 
-/// Patch embedding: projection + bias + position table (the position
-/// rows repeat per view: cat(position, position) covers both views).
+/// Patch embedding: projection + bias + position table. The position
+/// table has `patches_per_view` rows and repeats cyclically per view
+/// (cuda kernel semantics: row r reads table[r % tpv]) -- any view count.
 pub fn vision_patch_embed_ascend(
     be: &AscendBackend,
     cache: &mut AscendCaches,
@@ -515,15 +544,19 @@ pub fn vision_patch_embed_ascend(
 ) -> Result<Tensor> {
     let tokens = patches.shape().dims()[0] as i64;
     let width = patches.shape().dims()[1] as i64;
+    let out_w = weights.weight.shape().dims()[1] as i64;
     let proj = aq::matmul(be, &mut cache.nz, tensor_buf(patches)?, [tokens, width],
-        tensor_buf(&weights.weight)?, [width, weights.weight.shape().dims()[1] as i64])?;
-    let proj = bias_add(be, &proj, weights.bias.as_ref(), tokens, width)?;
-    let pos = tensor_buf(position_embedding)?;
+        tensor_buf(&weights.weight)?, [width, out_w])?;
+    let proj = bias_add(be, &proj, weights.bias.as_ref(), tokens, out_w)?;
     let p = patches_per_view as i64;
-    let pos2 = acl(aops::cat_fp16(be.ctx(), be.stream(), &[pos, pos],
-        &[vec![p, width], vec![p, width]], 0, &[2 * p, width]))?;
-    let out = acl(aops::add_fp16(be.ctx(), be.stream(), &proj, &pos2, &[tokens, width]))?;
-    Ok(be.wrap_fp16(out, vec![tokens as usize, width as usize]))
+    // cyclic per-view repeat of the [p, width] table
+    let idx: Vec<i32> = (0..tokens as usize).map(|r| (r % p as usize) as i32).collect();
+    let idx_bytes: Vec<u8> = idx.iter().flat_map(|v| v.to_le_bytes()).collect();
+    let di = acl(be.ctx().malloc(idx_bytes.len()))?;
+    acl(be.ctx().copy_h2d(&di, &idx_bytes))?;
+    let pos_rep = aq::gather_rows(be, tensor_buf(position_embedding)?, p, out_w, &di, tokens)?;
+    let out = acl(aops::add_fp16(be.ctx(), be.stream(), &proj, &pos_rep, &[tokens, out_w]))?;
+    Ok(be.wrap_fp16(out, vec![tokens as usize, out_w as usize]))
 }
 
 /// ada-norm: y = rms_norm(x) * (1 + style), style is a [width] row.
@@ -628,12 +661,22 @@ pub fn action_layer_ascend(
     let tokens = input.shape().dims()[0] as i64;
     let width = input.shape().dims()[1] as i64;
     let input_b = tensor_buf(input)?;
+    let trace = std::env::var("APXINF_ASCEND_TRACE").is_ok();
+    macro_rules! mark {
+        ($tag:expr) => {
+            if trace {
+                be.synchronize()?;
+                eprintln!("[trace] action: {}", $tag);
+            }
+        };
+    }
 
     let _ = (ctx, stream);
     let normalized = match attention_normalized {
         Some(v) => aq::take_rows(be, tensor_buf(v)?, 0, tokens, width)?,
         None => adaptive_rms(be, input_b, attention_style, tokens, width, rms_eps)?,
     };
+    mark!("ada-norm");
 
     let qd = config.num_heads as i64 * config.head_dim as i64;
     let kv_d = config.num_kv_heads as i64 * config.head_dim as i64;
@@ -641,6 +684,7 @@ pub fn action_layer_ascend(
     let out_w = qd + 2 * kv_d;
     let in_w = (fused_w.len() / 2) as i64 / out_w;
     let qkv = aq::matmul(be, &mut cache.nz, &normalized, [tokens, in_w], fused_w, [in_w, out_w])?;
+    mark!("qkv matmul");
     let q_raw = aq::take_rows(be, &qkv, 0, tokens, qd)?;
     let k_raw = aq::take_rows(be, &qkv, tokens, tokens, kv_d)?;
     let v_raw = aq::take_rows(be, &qkv, tokens * 2, tokens, kv_d)?;
@@ -653,6 +697,7 @@ pub fn action_layer_ascend(
 
     let q_rope = apply_rope_rows(be, cache, &q, tokens, config.num_heads as i64, rope_theta, position_offset)?;
     let k_rope = apply_rope_rows(be, cache, &k, tokens, config.num_kv_heads as i64, rope_theta, position_offset)?;
+    mark!("ropes");
 
     // concat prefix k/v with this chunk (rows), then full attention.
     let pk = tensor_buf(prefix_k)?;
@@ -661,21 +706,34 @@ pub fn action_layer_ascend(
     let total = prefix_tokens + tokens;
     let k_all = acl(aops::cat_fp16(ctx, stream, &[pk, &k_rope], &[vec![prefix_tokens, kv_d], vec![tokens, kv_d]], 0, &[total, kv_d]))?;
     let v_all = acl(aops::cat_fp16(ctx, stream, &[pv, &v], &[vec![prefix_tokens, kv_d], vec![tokens, kv_d]], 0, &[total, kv_d]))?;
-    let attn = acl(aops::prompt_flash_attention_bsh_fp16(ctx, stream, &q_rope, &k_all, &v_all, total, config.num_heads as i64, config.num_kv_heads as i64, config.head_dim as i64, None))?;
+    let attn = acl(aops::prompt_flash_attention_cross_bsh_fp16(
+        ctx, stream, &q_rope, &k_all, &v_all, tokens, total,
+        config.num_heads as i64, config.num_kv_heads as i64, config.head_dim as i64, None,
+    ))?;
+    mark!("cross pfa");
 
     let proj = aq::matmul(be, &mut cache.nz, &attn, [tokens, qd], tensor_buf(&weights.output.weight)?, [qd, width])?;
+    mark!("output proj");
     let proj = bias_add(be, &proj, weights.output.bias.as_ref(), tokens, width)?;
     let res = aq::add(be, &proj, &normalized, &[tokens, width])?;
     let normed = adaptive_rms(be, &res, mlp_style, tokens, width, rms_eps)?;
+    mark!("mlp ada-norm");
 
     let gw = tensor_buf(&weights.gate_up.weight)?;
-    let inter = (gw.len() as i64 / 2) / width;
+    // fused weight is [width, 2*inter] -- divide the doubled width out
+    // (the old `... / width` read the FUSED width as inter, then doubled
+    // it again in bsh -> 2x-OOB b descriptor -> aicore MTE fault)
+    let inter = (gw.len() as i64 / 2) / (width * 2);
     let gate_up = aq::matmul(be, &mut cache.nz, &normed, [tokens, width], gw, [width, inter * 2])?;
-    let up = aq::take_rows(be, &gate_up, 0, tokens, inter)?;
-    let gate = aq::take_rows(be, &gate_up, tokens, tokens, inter)?;
+    mark!("gate_up matmul");
+    // [gate; up] concat order (from_host_parts) -- gelu on the first half.
+    let gate = aq::take_rows(be, &gate_up, 0, tokens, inter)?;
+    let up = aq::take_rows(be, &gate_up, tokens, tokens, inter)?;
     let gate_g = aq::gelu(be, &gate, &[tokens, inter], true)?;
-    let act = aq::mul(be, &up, &gate_g, &[tokens, inter])?;
+    let act = aq::mul(be, &gate_g, &up, &[tokens, inter])?;
+    mark!("geglu");
     let proj2 = aq::matmul(be, &mut cache.nz, &act, [tokens, inter], tensor_buf(&weights.down.weight)?, [inter, width])?;
+    mark!("down matmul");
     let proj2 = bias_add(be, &proj2, weights.down.bias.as_ref(), tokens, width)?;
     let hidden = aq::add(be, &proj2, &res, &[tokens, width])?;
     let next_normalized = adaptive_rms(be, &hidden, next_norm_style, tokens, width, rms_eps)?;

@@ -7,6 +7,8 @@
 
 #[cfg(feature = "ascend")]
 mod ascend_executor;
+#[cfg(feature = "ascend")]
+mod ascend_runtime;
 #[cfg(feature = "cuda")]
 mod backend;
 #[cfg(feature = "cuda")]
@@ -53,6 +55,8 @@ pub use ascend_executor::{
     action_layer_ascend, language_layer_ascend, vision_layer_ascend, vision_patch_embed_ascend,
     AscendCaches, AscendRopeCache,
 };
+#[cfg(feature = "ascend")]
+pub use ascend_runtime::{AscendPrefixKvCache, Pi05AscendRuntime};
 #[cfg(feature = "cuda")]
 pub use calibration::Pi05CalibrationObserver;
 pub use config::{GemmaVariantConfig, Pi05Config, Pi05PerformanceProfile};

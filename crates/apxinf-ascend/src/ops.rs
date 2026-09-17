@@ -10,14 +10,14 @@ use crate::{AclError, Result};
 /// fp16 out on 310P3, which has no bf16 unit).
 const CUBE_MATH_KEEP_DTYPE: i8 = 1;
 
-/// Minimum M for the aclnn matmul kernels on 310P3: m=8 x wide N (>=12288)
-/// trips an aicore tiling fault (507015 at sync) on both the plain and
-/// transposed-b descriptors, while m>=16 is verified correct through
-/// N=16384 (m-ladder probe, 2026-09-18). Smaller M is zero-padded to this
-/// floor; the extra output rows are sliced off.
-const MATMUL_MIN_M: i64 = 16;
+/// M alignment for the aclnn matmul kernels on 310P3: with wide N
+/// (>=12288), any M that is not a multiple of 16 trips an aicore tiling
+/// fault (507015 at sync) on BOTH descriptors (m-ladder probe 2026-09-18:
+/// 812/820/828 x N16384/32768 all fault, 832 all correct; N<=8192 is
+/// immune). Zero-pad M up to the next multiple, slice the real rows back.
+const MATMUL_M_ALIGN: i64 = 16;
 
-/// Run `f` on a zero-padded [MATMUL_MIN_M, k] copy of `a`, slice the real
+/// Run `f` on a zero-padded [target_m, k] copy of `a`, slice the real
 /// `m` rows back out. Padding appends whole rows so the real data is one
 /// contiguous leading block -- a single D2D copy after a stream-ordered
 /// memset.
@@ -28,9 +28,10 @@ fn with_m_padded(
     m: i64,
     k: i64,
     n: i64,
+    target_m: i64,
     f: impl FnOnce(&crate::DeviceBuffer, i64) -> Result<crate::DeviceBuffer>,
 ) -> Result<crate::DeviceBuffer> {
-    let padded = ctx.malloc((MATMUL_MIN_M * k * 2) as usize)?;
+    let padded = ctx.malloc((target_m * k * 2) as usize)?;
     ctx.memset_async(&padded, 0, stream)?;
     let bytes = (m * k * 2) as usize;
     let code = unsafe {
@@ -46,8 +47,25 @@ fn with_m_padded(
     if code != 0 {
         return Err(AclError { code, op: "aclrtMemcpyAsync(m-pad)" });
     }
-    let full = f(&padded, MATMUL_MIN_M)?;
+    let full = f(&padded, target_m)?;
     take_rows_fp16(ctx, stream, &full, 0, m, n)
+}
+
+/// Pad `a`'s row count up to a multiple of MATMUL_M_ALIGN when needed.
+fn matmul_m_pad(
+    ctx: &AscendContext,
+    stream: &AscendStream,
+    a: &crate::DeviceBuffer,
+    m: i64,
+    k: i64,
+    n: i64,
+    f: impl FnOnce(&crate::DeviceBuffer, i64) -> Result<crate::DeviceBuffer>,
+) -> Result<crate::DeviceBuffer> {
+    let target = (m + MATMUL_M_ALIGN - 1) / MATMUL_M_ALIGN * MATMUL_M_ALIGN;
+    if target == m {
+        return f(a, m);
+    }
+    with_m_padded(ctx, stream, a, m, k, n, target, f)
 }
 
 /// out = a @ b for fp16 ND matrices, executed on `stream`.
@@ -65,8 +83,8 @@ pub fn matmul_fp16(
     let [m, k] = a_shape;
     let [k2, n] = b_shape;
     assert_eq!(k, k2, "inner dims must match: {a_shape:?} x {b_shape:?}");
-    if m < MATMUL_MIN_M {
-        return with_m_padded(ctx, stream, a, m, k, n, |a2, m2| {
+    if m % MATMUL_M_ALIGN != 0 {
+        return matmul_m_pad(ctx, stream, a, m, k, n, |a2, m2| {
             matmul_fp16(ctx, stream, a2, [m2, k], b, b_shape)
         });
     }
@@ -532,6 +550,103 @@ pub fn prompt_flash_attention_bsh_fp16(
     Ok(out)
 }
 
+/// Batched BSH PFA: q/k/v are [batch * seq, heads*d] contiguous, viewed
+/// as [batch, seq, heads*d]. Vision attends within each view's seq
+/// window (SigLIP per-image attention), unlike the batch=1 entry above
+/// which spans the whole row range.
+#[allow(clippy::too_many_arguments)]
+pub fn prompt_flash_attention_bsh_batch_fp16(
+    ctx: &AscendContext,
+    stream: &AscendStream,
+    q: &crate::DeviceBuffer,
+    k: &crate::DeviceBuffer,
+    v: &crate::DeviceBuffer,
+    batch: i64,
+    seq: i64,
+    heads: i64,
+    kv_heads: i64,
+    head_dim: i64,
+    scale: Option<f64>,
+) -> Result<crate::DeviceBuffer> {
+    let qd = heads * head_dim;
+    let kvd = kv_heads * head_dim;
+    let out = ctx.malloc((batch * seq * qd * 2) as usize)?;
+    let t1 = AclTensor::fp16_nd(q, &[batch, seq, qd])?;
+    let t2 = AclTensor::fp16_nd(k, &[batch, seq, kvd])?;
+    let t3 = AclTensor::fp16_nd(v, &[batch, seq, kvd])?;
+    let tout = AclTensor::fp16_nd(&out, &[batch, seq, qd])?;
+
+    let mut layout: [u8; 4] = *b"BSH\0";
+    let scale_value = scale.unwrap_or(1.0 / (head_dim as f64).sqrt());
+    let null = std::ptr::null_mut::<std::ffi::c_void>();
+
+    two_stage(
+        ctx,
+        stream,
+        "aclnnPromptFlashAttentionV3(BSH,batch)",
+        |ws, ex| unsafe {
+            ffi::aclnnPromptFlashAttentionV3GetWorkspaceSize(
+                t1.handle(), t2.handle(), t3.handle(),
+                null, null, null, null, null, null, null, null, null,
+                heads, scale_value, i64::MAX, 0,
+                layout.as_mut_ptr(),
+                kv_heads, 0, 0,
+                tout.handle(), ws, ex,
+            )
+        },
+        |ws, size, ex| unsafe { ffi::aclnnPromptFlashAttentionV3(ws, size, ex, stream.handle()) },
+    )?;
+    Ok(out)
+}
+
+/// Cross-length BSH PFA for prefix attention: q covers `q_tokens` rows
+/// while k/v cover `kv_tokens` (prefix + chunk). Same contiguous
+/// [rows, heads*d] buffers, described with their own sequence lengths.
+#[allow(clippy::too_many_arguments)]
+pub fn prompt_flash_attention_cross_bsh_fp16(
+    ctx: &AscendContext,
+    stream: &AscendStream,
+    q: &crate::DeviceBuffer,
+    k: &crate::DeviceBuffer,
+    v: &crate::DeviceBuffer,
+    q_tokens: i64,
+    kv_tokens: i64,
+    heads: i64,
+    kv_heads: i64,
+    head_dim: i64,
+    scale: Option<f64>,
+) -> Result<crate::DeviceBuffer> {
+    let qd = heads * head_dim;
+    let kvd = kv_heads * head_dim;
+    let out = ctx.malloc((q_tokens * qd * 2) as usize)?;
+    let t1 = AclTensor::fp16_nd(q, &[1, q_tokens, qd])?;
+    let t2 = AclTensor::fp16_nd(k, &[1, kv_tokens, kvd])?;
+    let t3 = AclTensor::fp16_nd(v, &[1, kv_tokens, kvd])?;
+    let tout = AclTensor::fp16_nd(&out, &[1, q_tokens, qd])?;
+
+    let mut layout: [u8; 4] = *b"BSH\0";
+    let scale_value = scale.unwrap_or(1.0 / (head_dim as f64).sqrt());
+    let null = std::ptr::null_mut::<std::ffi::c_void>();
+
+    two_stage(
+        ctx,
+        stream,
+        "aclnnPromptFlashAttentionV3(BSH,cross)",
+        |ws, ex| unsafe {
+            ffi::aclnnPromptFlashAttentionV3GetWorkspaceSize(
+                t1.handle(), t2.handle(), t3.handle(),
+                null, null, null, null, null, null, null, null, null,
+                heads, scale_value, i64::MAX, 0,
+                layout.as_mut_ptr(),
+                kv_heads, 0, 0,
+                tout.handle(), ws, ex,
+            )
+        },
+        |ws, size, ex| unsafe { ffi::aclnnPromptFlashAttentionV3(ws, size, ex, stream.handle()) },
+    )?;
+    Ok(out)
+}
+
 /// Host-side FRACTAL_NZ reordering: pull the weight back, rearrange into
 /// 16x16 blocks on the CPU, upload once. Replaces aclnnNpuFormatCast,
 /// whose descriptor expectations (undocumented ori-shape semantics) we
@@ -632,8 +747,8 @@ pub fn matmul_b_t_fp16(
     k: i64,
     n: i64,
 ) -> Result<crate::DeviceBuffer> {
-    if ash[0] < MATMUL_MIN_M {
-        return with_m_padded(ctx, stream, a, ash[0], ash[1], n, |a2, m2| {
+    if ash[0] % MATMUL_M_ALIGN != 0 {
+        return matmul_m_pad(ctx, stream, a, ash[0], ash[1], n, |a2, m2| {
             matmul_b_t_fp16(ctx, stream, a2, [m2, ash[1]], b_t, k, n)
         });
     }
