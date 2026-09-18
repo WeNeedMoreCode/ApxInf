@@ -1,9 +1,8 @@
-//! Matmul entry-point bake-off under graph replay: msprof shows a 334us
-//! average gap BEFORE each MatMulCommon task (324ms of the 680ms chain) --
-//! if aclnnMm/aclnnGemm tasks start faster, swapping the entry point is
-//! the biggest remaining lever. 100 repeats captured into one graph so
-//! replay timing is pure device-side.
-//!   ASCEND_RT_VISIBLE_DEVICES=5 cargo run --example matmul_entry_probe --release -p apxinf-ascend
+//! Matmul per-task fixed-cost isolation: capture N back-to-back
+//! matmul_b_t reps into one graph, replay, time per matmul at several m.
+// time = a*m + b -> b is the per-task "start tax" with NO profiler
+// attached (the msprof-measured 334us gap needs an independent check).
+//!   ASCEND_RT_VISIBLE_DEVICES=5 PROBE_SWEEP=1 cargo run --example matmul_entry_probe --release -p apxinf-ascend
 use apxinf_ascend::ops;
 use apxinf_core::Backend as _;
 use half::f16;
@@ -12,85 +11,47 @@ fn main() {
     let be = apxinf_ascend::AscendBackend::new(0).expect("be");
     let ctx = be.ctx();
     let stream = be.stream();
+    let (k, n) = (2048i64, 32768i64);
 
-    // prefix gate_up shape family; m=64 first to smoke the entries
-    let (m, k, n) = match std::env::var("PROBE_BIG").is_ok() {
-        true => (832i64, 2048i64, 32768i64),
-        false => (64i64, 2048i64, 32768i64),
-    };
     let mut seed = 7u32;
-    let mut rnd = || {
+    let mut next = || {
         seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
-        f16::from_f32(((*seedref(&mut seed) >> 16) as i32 % 200 - 100) as f32 / 400.0)
+        f16::from_f32(((*&seed >> 16) as i32 % 200 - 100) as f32 / 400.0)
     };
-    let a_h: Vec<f16> = (0..m * k).map(|_| rnd()).collect();
-    let b_h: Vec<f16> = (0..n * k).map(|_| rnd()).collect();
-    let upload = |vals: &[f16]| -> apxinf_ascend::DeviceBuffer {
-        let bytes: &[u8] = bytemuck::cast_slice(vals);
-        let buf = ctx.malloc(bytes.len()).expect("malloc");
-        ctx.copy_h2d(&buf, bytes).expect("h2d");
-        buf
+    let b_h: Vec<f16> = (0..n * k).map(|_| next()).collect();
+    let bytes: &[u8] = bytemuck::cast_slice(&b_h);
+    let b_t = ctx.malloc(bytes.len()).expect("b malloc");
+    ctx.copy_h2d(&b_t, bytes).expect("b h2d");
+    drop(stream.synchronize());
+
+    let ms: Vec<i64> = if std::env::var("PROBE_SWEEP").is_ok() {
+        vec![64, 128, 256, 512, 832]
+    } else {
+        vec![64]
     };
-    let a = upload(&a_h);
-    let b_t = upload(&b_h);
-    let _ = stream.synchronize();
 
-    let reps: usize = if std::env::var("PROBE_BIG").is_ok() { 16 } else { 100 };
-
-    let entries: [(&str, Box<dyn Fn() -> apxinf_ascend::DeviceBuffer>); 3] = [
-        (
-            "matmul_b_t (MatMulCommon, production)",
-            Box::new({
-                let ctx = &ctx;
-                let stream = &stream;
-                let a = &a;
-                let b_t = &b_t;
-                move || ops::matmul_b_t_fp16(ctx, stream, a, [m, k], b_t, k, n).expect("matmul_b_t")
-            }),
-        ),
-        (
-            "mm (aclnnMm)",
-            Box::new({
-                let ctx = &ctx;
-                let stream = &stream;
-                let a = &a;
-                let b_t = &b_t;
-                // perf probe only: [k,n] descriptor over the [n,k] buffer --
-                // same shapes/strides cost, data correctness irrelevant here
-                move || ops::mm_fp16(ctx, stream, a, [m, k], b_t, [k, n]).expect("mm")
-            }),
-        ),
-        (
-            "gemm_b_t (aclnnGemm)",
-            Box::new({
-                let ctx = &ctx;
-                let stream = &stream;
-                let a = &a;
-                let b_t = &b_t;
-                move || ops::gemm_b_t_fp16(ctx, stream, a, [m, k], b_t, k, n).expect("gemm_b_t")
-            }),
-        ),
-    ];
-
-    for (name, run_once) in entries {
-        // warm the entry once (plan cache) then capture 100 reps
-        drop(run_once());
-        let _ = stream.synchronize();
+    let mut samples: Vec<(i64, f64)> = Vec::new();
+    for m in ms {
+        let a_h: Vec<f16> = (0..m * k).map(|_| next()).collect();
+        let abytes: &[u8] = bytemuck::cast_slice(&a_h);
+        let a = ctx.malloc(abytes.len()).expect("a malloc");
+        ctx.copy_h2d(&a, abytes).expect("a h2d");
+        drop(stream.synchronize());
         apxinf_ascend::flush_pending_frees();
+
+        // warm once, then capture reps into one graph
+        drop(ops::matmul_b_t_fp16(ctx, stream, &a, [m, k], &b_t, k, n).expect("warm"));
+        drop(stream.synchronize());
+        apxinf_ascend::flush_pending_frees();
+
+        let reps: usize = if m >= 512 { 24 } else { 100 };
         let arena = be.ctx().enter_arena(10 << 30).expect("arena");
         be.begin_capture().expect("begin");
         for _ in 0..reps {
-            drop(run_once());
+            drop(ops::matmul_b_t_fp16(ctx, stream, &a, [m, k], &b_t, k, n).expect("mm"));
         }
-        let graph = match be.end_capture() {
-            Ok(g) => g,
-            Err(e) => {
-                eprintln!("[{name}] capture failed: {e:?}");
-                be.ctx().clear_arena();
-                continue;
-            }
-        };
-        let used = be.ctx().exit_arena();
+        let graph = be.end_capture().expect("end");
+        drop(be.ctx().exit_arena());
         be.ctx().clear_arena();
         let mut ts = Vec::new();
         for i in 0..10 {
@@ -102,15 +63,25 @@ fn main() {
             }
         }
         ts.sort_by(|x, y| x.partial_cmp(y).unwrap());
-        println!("[{name}] {ts:?} ms/matmul (arena {used}B)");
+        let med = ts[ts.len() / 2];
+        println!("m={m:4}: {med:.4} ms/matmul (median of {} reps x{} replays)", reps, ts.len());
+        samples.push((m, med));
         drop(graph);
         drop(arena);
-        let _ = stream.synchronize();
+        drop(stream.synchronize());
         apxinf_ascend::flush_pending_frees();
     }
-    println!("MATMUL_ENTRY_PROBE_DONE");
-}
 
-fn seedref(seed: &mut u32) -> &u32 {
-    seed
+    // least-squares fit time = a*m + b
+    if samples.len() >= 3 {
+        let np = samples.len() as f64;
+        let sx: f64 = samples.iter().map(|(m, _)| *m as f64).sum();
+        let sy: f64 = samples.iter().map(|(_, t)| *t).sum();
+        let sxx: f64 = samples.iter().map(|(m, _)| (*m as f64).powi(2)).sum();
+        let sxy: f64 = samples.iter().map(|(m, t)| *m as f64 * t).sum();
+        let a = (np * sxy - sx * sy) / (np * sxx - sx * sx);
+        let b = (sy - a * sx) / np;
+        println!("FIT: {a:.6} ms/row + {b:.4} ms/task  (b*1000 = {:.0}us per-task fixed cost)", b * 1000.0);
+    }
+    println!("MATMUL_ENTRY_PROBE_DONE");
 }
