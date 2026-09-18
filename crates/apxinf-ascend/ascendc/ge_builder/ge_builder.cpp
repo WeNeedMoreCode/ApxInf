@@ -405,6 +405,89 @@ extern "C" int geb_add_op(const char *name, const char *type) {
     return 0;
 }
 
+// DYNAMIC_INPUT ports are NOT pre-created by CreateOperatorByName (probe:
+// GetDynamicInputNum("x") == 0) and the toolkit ships no op_desc.h /
+// op_desc_utils.h -- but the symbols live in libgraph_base with the
+// pre-CXX11-string ABI we already compile against (_GLIBCXX_USE_CXX11_ABI=0).
+// Redeclare the exact signatures (from the open GE source tree) and link.
+namespace ge {
+class OpDesc;
+class OpDescUtils {
+public:
+    static std::shared_ptr<OpDesc> GetOpDescFromOperator(const Operator &oprt);
+};
+class OpDesc {
+public:
+    graphStatus AddDynamicInputDesc(const std::string &name, const uint32_t num,
+                                    const bool is_push_back);
+};
+}  // namespace ge
+
+// Register n dynamic input ports (base name "x" -> x0..x{n-1}) on an op.
+// Call right after geb_add_op, BEFORE any desc/link on those ports.
+extern "C" int geb_dyn_inputs(const char *op_name, const char *base_name, int32_t n) {
+    GebModel *m = Cur();
+    if (m == nullptr) {
+        return -1;
+    }
+    ge::Operator *op = FindOp(*m, op_name, "dyn_inputs");
+    if (op == nullptr) {
+        return -2;
+    }
+    std::shared_ptr<ge::OpDesc> desc = ge::OpDescUtils::GetOpDescFromOperator(*op);
+    if (desc == nullptr) {
+        return -3;
+    }
+    if (desc->AddDynamicInputDesc(std::string(base_name), static_cast<uint32_t>(n), true) !=
+        ge::GRAPH_SUCCESS) {
+        std::cerr << "[geb] dyn_inputs: op '" << op_name << "' AddDynamicInputDesc('" << base_name
+                  << "', " << n << ") failed" << std::endl;
+        return -4;
+    }
+    return 0;
+}
+
+// Dynamic-input port count probe (diagnostics; 0 until geb_dyn_inputs runs).
+extern "C" int geb_dyn_probe(const char *op_name, const char *base_name) {
+    GebModel *m = Cur();
+    if (m == nullptr) {
+        return -1;
+    }
+    ge::Operator *op = FindOp(*m, op_name, "dyn_probe");
+    if (op == nullptr) {
+        return -2;
+    }
+    int32_t n = op->GetDynamicInputNum(std::string(base_name));
+    std::cerr << "[geb] dyn_probe: op '" << op_name << "' base '" << base_name << "' num=" << n
+              << std::endl;
+    return n;
+}
+
+// SetInput with a numeric dst port (DYNAMIC_INPUT ports after registration
+// also work by name x0/x1, but the index form is handy for callers):
+// SetInput(dst_index, src_oprt, src_index).
+extern "C" int geb_link_idx(const char *dst_op, int32_t dst_index, const char *src_op,
+                            int32_t src_index) {
+    GebModel *m = Cur();
+    if (m == nullptr) {
+        return -1;
+    }
+    ge::Operator *dst = FindOp(*m, dst_op, "link_idx(dst)");
+    if (dst == nullptr) {
+        return -2;
+    }
+    if (std::string(dst_op) == std::string(src_op)) {
+        (void)dst->SetInput(static_cast<uint32_t>(dst_index), *dst, static_cast<uint32_t>(src_index));
+        return 0;
+    }
+    ge::Operator *src = FindOp(*m, src_op, "link_idx(src)");
+    if (src == nullptr) {
+        return -3;
+    }
+    (void)dst->SetInput(static_cast<uint32_t>(dst_index), *src, static_cast<uint32_t>(src_index));
+    return 0;
+}
+
 extern "C" int geb_set_input_desc(const char *op_name, const char *port, const int64_t *dims,
                                   int32_t n_dims, const char *dtype) {
     GebModel *m = Cur();

@@ -233,6 +233,79 @@ impl GeGraph {
         Ok(())
     }
 
+    /// 动态输入端口注册（DYNAMIC_INPUT 算子——CreateOperatorByName 不预建
+    /// 端口，probe num=0；ge_builder 经 libgraph_base 符号直链
+    /// OpDescUtils::GetOpDescFromOperator + OpDesc::AddDynamicInputDesc，
+    /// TF parser 同款路径）。端口名 = base+序号（x0/x1/...）。
+    /// 用法：add_op 后、desc/link 前调用（如 ConcatD 的 dyn_inputs("x", 2)）。
+    pub fn dyn_inputs(&self, op: &str, base: &str, n: i32) -> Result<()> {
+        type F = unsafe extern "C" fn(
+            *const std::os::raw::c_char,
+            *const std::os::raw::c_char,
+            i32,
+        ) -> i32;
+        let l = lib().map_err(|e| {
+            eprintln!("[ge_builder] {e}");
+            AclError { code: -1, op: "ge load" }
+        })?;
+        let f: Symbol<F> = unsafe { l.get(b"geb_dyn_inputs") }.map_err(|e| {
+            eprintln!("[ge_builder] dlsym geb_dyn_inputs: {e}");
+            AclError { code: -1, op: "ge dlsym" }
+        })?;
+        let o = CString::new(op).expect("op");
+        let b = CString::new(base).expect("base");
+        let rc = unsafe { f(o.as_ptr(), b.as_ptr(), n) };
+        if rc != 0 {
+            return Err(cerr("geb_dyn_inputs", rc));
+        }
+        Ok(())
+    }
+
+    /// 动态输入端口数探测（诊断用）
+    pub fn dyn_probe(&self, op: &str, base: &str) -> Result<i32> {
+        type F = unsafe extern "C" fn(*const std::os::raw::c_char, *const std::os::raw::c_char) -> i32;
+        let l = lib().map_err(|e| {
+            eprintln!("[ge_builder] {e}");
+            AclError { code: -1, op: "ge load" }
+        })?;
+        let f: Symbol<F> = unsafe { l.get(b"geb_dyn_probe") }.map_err(|e| {
+            eprintln!("[ge_builder] dlsym geb_dyn_probe: {e}");
+            AclError { code: -1, op: "ge dlsym" }
+        })?;
+        let o = CString::new(op).expect("op");
+        let b = CString::new(base).expect("base");
+        let rc = unsafe { f(o.as_ptr(), b.as_ptr()) };
+        if rc < 0 {
+            return Err(cerr("geb_dyn_probe", rc));
+        }
+        Ok(rc)
+    }
+
+    /// index 版连边：SetInput(dst_index, src, src_index)
+    pub fn link_idx(&self, dst: &str, dst_index: i32, src: &str, src_index: i32) -> Result<()> {
+        type F = unsafe extern "C" fn(
+            *const std::os::raw::c_char,
+            i32,
+            *const std::os::raw::c_char,
+            i32,
+        ) -> i32;
+        let l = lib().map_err(|e| {
+            eprintln!("[ge_builder] {e}");
+            AclError { code: -1, op: "ge load" }
+        })?;
+        let f: Symbol<F> = unsafe { l.get(b"geb_link_idx") }.map_err(|e| {
+            eprintln!("[ge_builder] dlsym geb_link_idx: {e}");
+            AclError { code: -1, op: "ge dlsym" }
+        })?;
+        let d = CString::new(dst).expect("dst");
+        let sc = CString::new(src).expect("src");
+        let rc = unsafe { f(d.as_ptr(), dst_index, sc.as_ptr(), src_index) };
+        if rc != 0 {
+            return Err(cerr("geb_link_idx", rc));
+        }
+        Ok(())
+    }
+
     fn set_desc(&self, sym: &[u8], op: &'static str, op_name: &str, port: &str, dims: &[i64],
                 dtype: Dtype) -> Result<()> {
         type F = unsafe extern "C" fn(
