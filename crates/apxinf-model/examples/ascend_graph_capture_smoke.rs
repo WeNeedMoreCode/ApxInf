@@ -95,18 +95,39 @@ fn main() {
     be.ctx().clear_arena();
     println!("captured graph built (arena used {used} bytes)");
 
-    // 3) replay x2, compare with eager
-    for i in 0..2 {
+    // 3) replay: warm once, then time it and diff against eager
+    let mut timings = Vec::new();
+    for i in 0..12 {
+        let t0 = std::time::Instant::now();
         graph.replay().expect("replay");
         be.synchronize().expect("sync after replay");
+        if i >= 2 {
+            timings.push(t0.elapsed().as_secs_f64() * 1000.0);
+        }
         let host = be.to_cpu(&captured).unwrap();
         let vals = host.to_f32_vec().unwrap();
         let finite = vals.iter().filter(|v| v.is_finite()).count();
         let max_diff = vals.iter().zip(&eager_h).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
-        println!("replay {i}: finite={}/{} max_diff_vs_eager={max_diff:.6}", finite, vals.len());
-        assert_eq!(finite, vals.len());
-        assert!(max_diff < 0.05, "replay diverged from eager: {max_diff}");
+        if i < 2 {
+            println!("replay {i}: finite={}/{} max_diff_vs_eager={max_diff:.6}", finite, vals.len());
+            assert_eq!(finite, vals.len());
+            assert!(max_diff < 0.05, "replay diverged from eager: {max_diff}");
+        }
     }
+    timings.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    // eager comparison timing (same shapes, caches warm)
+    let t0 = std::time::Instant::now();
+    let eager3 = runtime.infer_with_styles(&patches_d, &token_ids, &noise, &styles).expect("eager3");
+    be.synchronize().unwrap();
+    let eager_ms = t0.elapsed().as_secs_f64() * 1000.0;
+    drop(eager3);
+    println!(
+        "REPLAY_BENCH: graph p50={:.1}ms (n={}) vs eager {:.1}ms -- {:.2}x",
+        timings[timings.len() / 2],
+        timings.len(),
+        eager_ms,
+        eager_ms / timings[timings.len() / 2]
+    );
     drop(graph);
     drop(captured);
     drop(arena_owner); // frees the arena backing once the graph is gone

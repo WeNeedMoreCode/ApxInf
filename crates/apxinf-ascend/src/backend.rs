@@ -245,7 +245,11 @@ impl Backend for AscendBackend {
     }
 
     fn begin_capture(&self) -> Result<()> {
-        graph::begin(&self.stream, graph::CaptureMode::ThreadLocal).map_err(acl_err)
+        // RELAXED: aclnn executors run internal sync memcpys (scalar /
+        // small-param uploads) that GLOBAL/THREAD_LOCAL reject with
+        // 107030 mid-capture; our own window is sync-free by design, and
+        // the remaining syncs are constant uploads -- capture-safe.
+        graph::begin(&self.stream, graph::CaptureMode::Relaxed).map_err(acl_err)
     }
 
     fn end_capture(&self) -> Result<Box<dyn Graph>> {

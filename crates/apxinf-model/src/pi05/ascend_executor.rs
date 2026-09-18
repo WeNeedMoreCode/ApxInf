@@ -22,6 +22,50 @@ pub(crate) fn acl<T>(r: std::result::Result<T, AclError>) -> Result<T> {
     r.map_err(|e| Error::Other(format!("aclnn: {e}")))
 }
 
+/// Euler flow step without aclnnMuls: `x0' = (1+s)*x0 + s*x1` via two
+/// tensor muls over cached constant matrices. The scalar op's host
+/// aclScalar forces an internal h2d that capture windows reject
+/// (107030); sigma is step-constant so the matrices build once.
+pub(crate) fn euler_mul(
+    be: &AscendBackend,
+    cache: &mut AscendCaches,
+    x0: &DeviceBuffer,
+    x1: &DeviceBuffer,
+    sigma: f32,
+    rows: i64,
+    cols: i64,
+) -> Result<DeviceBuffer> {
+    let key = (sigma.to_bits(), rows, cols);
+    let (c1, c2) = match cache.euler_consts.get(&key) {
+        Some(v) => (v.0.clone(), v.1.clone()),
+        None => {
+            let mut upload = |val: f32| -> Result<Arc<DeviceBuffer>> {
+                let bits = f32_to_f16_bits(val);
+                let row_vals = vec![bits; cols as usize];
+                let row = acl(be.ctx().malloc(row_vals.len() * 2))?;
+                let bytes: &[u8] = unsafe {
+                    std::slice::from_raw_parts(row_vals.as_ptr() as *const u8, row_vals.len() * 2)
+                };
+                acl(be.ctx().copy_h2d(&row, bytes))?;
+                let mat = acl(aops::row_replicate_fp16(be.ctx(), be.stream(), &row, rows, cols))?;
+                Ok(Arc::new(mat))
+            };
+            let entry = (upload(1.0 + sigma)?, upload(sigma)?);
+            cache.euler_consts.insert(key, entry.clone());
+            entry
+        }
+    };
+    if std::env::var("APXINF_ASCEND_TRACE").is_ok() {
+        eprintln!("[trace] euler consts resolved");
+    }
+    let a = acl(aops::mul_fp16(be.ctx(), be.stream(), x0, &c1, &[rows, cols]))?;
+    if std::env::var("APXINF_ASCEND_TRACE").is_ok() {
+        eprintln!("[trace] euler mul1 done");
+    }
+    let b = acl(aops::mul_fp16(be.ctx(), be.stream(), x1, &c2, &[rows, cols]))?;
+    acl(aops::add_fp16(be.ctx(), be.stream(), &a, &b, &[rows, cols]))
+}
+
 /// Combined executor caches threaded through layer calls.
 pub struct AscendCaches {
     pub rope: AscendRopeCache,
@@ -41,6 +85,10 @@ pub struct AscendCaches {
     ones_rows: std::collections::HashMap<usize, Arc<DeviceBuffer>>,
     /// Cached device token-index rows (keyed by the id sequence).
     pub(crate) token_idx: std::collections::HashMap<Vec<u32>, Arc<DeviceBuffer>>,
+    /// Euler constant matrices ((1+s), s) keyed by (sigma bits, rows, cols)
+    /// -- replaces the scalar aclnnMuls whose host scalar forces an
+    /// internal h2d inside capture windows.
+    pub(crate) euler_consts: std::collections::HashMap<(u32, i64, i64), (Arc<DeviceBuffer>, Arc<DeviceBuffer>)>,
 }
 
 impl AscendCaches {
@@ -53,6 +101,7 @@ impl AscendCaches {
             pos_idx: Default::default(),
             ones_rows: Default::default(),
             token_idx: Default::default(),
+            euler_consts: Default::default(),
         }
     }
 }
@@ -746,7 +795,6 @@ pub fn action_layer_ascend(
     macro_rules! mark {
         ($tag:expr) => {
             if trace {
-                be.synchronize()?;
                 eprintln!("[trace] action: {}", $tag);
             }
         };

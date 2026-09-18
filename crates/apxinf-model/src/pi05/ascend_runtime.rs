@@ -297,8 +297,8 @@ impl Pi05AscendRuntime {
         let be = &*self.backend;
         let trace = std::env::var("APXINF_ASCEND_TRACE").is_ok();
         let mut mark = |tag: &str| -> Result<()> {
+            // print-only: a stream sync inside a capture window is rejected
             if trace {
-                be.synchronize()?;
                 eprintln!("[trace] {tag}");
             }
             Ok(())
@@ -375,12 +375,14 @@ impl Pi05AscendRuntime {
             out_w,
         )?;
         mark("action_out matmul")?;
-        let updated = aq::euler(
+        let updated = super::ascend_executor::euler_mul(
             be,
+            &mut self.caches.borrow_mut(),
             tensor_buf(state)?,
             &velocity,
             dt,
-            &[rows, out_w],
+            rows,
+            out_w,
         )?;
         mark("euler")?;
         Ok(be.wrap_fp16(updated, vec![rows as usize, out_w as usize]))
