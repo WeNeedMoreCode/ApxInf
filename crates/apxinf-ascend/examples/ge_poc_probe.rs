@@ -39,9 +39,9 @@ fn main() {
     let (m, k, n) = (832i32, 2048i32, 32768i32);
     let pairs = 8; // 16 matmuls per execute
     let mut seed = 7u32;
-    let mut next = || {
+    let mut next = |div: f32| {
         seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
-        f16::from_f32(((*&seed >> 16) as i32 % 200 - 100) as f32 / 400.0)
+        f16::from_f32(((*&seed >> 16) as i32 % 200 - 100) as f32 / div)
     };
     let upload = |vals: &[f16]| -> apxinf_ascend::DeviceBuffer {
         let bytes: &[u8] = bytemuck::cast_slice(vals);
@@ -49,9 +49,11 @@ fn main() {
         ctx.copy_h2d(&buf, bytes).expect("h2d");
         buf
     };
-    let x_h: Vec<f16> = (0..m as usize * k as usize).map(|_| next()).collect();
-    let w1_h: Vec<f16> = (0..k as usize * n as usize).map(|_| next()).collect();
-    let w2_h: Vec<f16> = (0..n as usize * k as usize).map(|_| next()).collect();
+    // 权重幅度缩到 ~±0.05：每对 matmul 增益 ≈1，16 连发后仍在 fp16 normal
+    // 域（±0.25 权重会让幅值 24×/对爆炸，双路径在 ±65504 饱和异号）
+    let x_h: Vec<f16> = (0..m as usize * k as usize).map(|_| next(400.0)).collect();
+    let w1_h: Vec<f16> = (0..k as usize * n as usize).map(|_| next(2000.0)).collect();
+    let w2_h: Vec<f16> = (0..n as usize * k as usize).map(|_| next(2000.0)).collect();
     let x = upload(&x_h);
     let w1 = upload(&w1_h);
     let w2 = upload(&w2_h);

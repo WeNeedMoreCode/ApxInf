@@ -16,6 +16,7 @@ pub mod ada_rms;
 pub mod backend;
 pub mod context;
 pub mod ffi;
+pub mod ge_builder;
 pub mod graph;
 pub mod ops;
 pub mod stream;
