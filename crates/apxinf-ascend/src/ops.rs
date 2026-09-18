@@ -501,6 +501,71 @@ pub fn rope_rotate_half_flat_fp16(
     add_fp16(ctx, stream, &t1, &t2, &[flat_rows, half])
 }
 
+/// out = self + 1.0 * t1 * t2, elementwise fp16 via aclnnAddcmul.
+/// ⚠ Measured a wash vs mul+add on 310P3 (2026-09-19: parity drifts to
+/// 0.048 from the different fp16 accumulation order, no time win) --
+/// kept for reference, not used by production paths.
+#[allow(dead_code)]
+pub fn addcmul_fp16(
+    ctx: &AscendContext,
+    stream: &AscendStream,
+    bias: &crate::DeviceBuffer,
+    t1: &crate::DeviceBuffer,
+    t2: &crate::DeviceBuffer,
+    shape: &[i64],
+) -> Result<crate::DeviceBuffer> {
+    let out = ctx.malloc(t1.len())?;
+    let ts = AclTensor::fp16_nd(bias, shape)?;
+    let a = AclTensor::fp16_nd(t1, shape)?;
+    let b = AclTensor::fp16_nd(t2, shape)?;
+    let tout = AclTensor::fp16_nd(&out, shape)?;
+    let mut one: f32 = 1.0;
+    let value = ScalarFp32::new(&mut one);
+    two_stage(
+        ctx,
+        stream,
+        "aclnnAddcmul",
+        |ws, ex| unsafe {
+            ffi::aclnnAddcmulGetWorkspaceSize(ts.handle(), a.handle(), b.handle(), value.handle(), tout.handle(), ws, ex)
+        },
+        |ws, size, ex| unsafe { ffi::aclnnAddcmul(ws, size, ex, stream.handle()) },
+    )?;
+    Ok(out)
+}
+
+/// GeGLU on a fused [rows, 2*cols] projection: splits along dim 1 and
+/// computes gelu(first half) * second half in one kernel. `tanh_approx`
+/// mirrors the GeluV2 selector (PaliGemma mlp uses tanh).
+/// ⚠ HANGS on 310P3 (2026-09-19: two-stage call never returns; torch_npu
+/// ships no dispatch for it and GE graphs never fuse it) -- do not wire
+/// into production paths on this SoC.
+#[allow(dead_code)]
+pub fn geglu_fp16(
+    ctx: &AscendContext,
+    stream: &AscendStream,
+    x: &crate::DeviceBuffer,
+    rows: i64,
+    cols: i64,
+    tanh_approx: bool,
+) -> Result<crate::DeviceBuffer> {
+    let out = ctx.malloc((rows * cols * 2) as usize)?;
+    let out_gelu = ctx.malloc((rows * cols * 2) as usize)?;
+    let tx = AclTensor::fp16_nd(x, &[rows, cols * 2])?;
+    let tout = AclTensor::fp16_nd(&out, &[rows, cols])?;
+    let tout_gelu = AclTensor::fp16_nd(&out_gelu, &[rows, cols])?;
+    let approximate: i64 = if tanh_approx { 1 } else { 0 };
+    two_stage(
+        ctx,
+        stream,
+        "aclnnGeGlu",
+        |ws, ex| unsafe {
+            ffi::aclnnGeGluGetWorkspaceSize(tx.handle(), 1, approximate, tout.handle(), tout_gelu.handle(), ws, ex)
+        },
+        |ws, size, ex| unsafe { ffi::aclnnGeGlu(ws, size, ex, stream.handle()) },
+    )?;
+    Ok(out)
+}
+
 /// out = gelu(a), elementwise fp16 via aclnnGeluV2. `tanh_approx` selects
 /// the tanh approximation (PaliGemma/gelu_tanh semantics) vs exact erf.
 pub fn gelu_fp16(

@@ -527,6 +527,8 @@ pub fn language_layer_ascend(
     let gate_up = aq::matmul(be, &mut cache.nz,fused_norm_b, [tokens, width],
         tensor_buf(&weights.gate_up.weight)?, [width, inter * 2])?;
     // from_host_parts packs [gate, up] -- first half is the gelu input.
+    // (aclnnGeGlu hangs on 310P3 -- torch_npu has no dispatch for it and
+    // the GE graphs never fuse it; keep the split+gelu+mul composition)
     let gate = aq::take_rows(be,&gate_up, 0, tokens, inter)?;
     let up = aq::take_rows(be,&gate_up, tokens, tokens, inter)?;
     let gate_g = aq::gelu(be,&gate, &[tokens, inter], true)?;
@@ -752,6 +754,9 @@ fn adaptive_rms(be: &AscendBackend, cache: &mut AscendCaches, x: &DeviceBuffer, 
             (scale_mat, shift_mat)
         }
     };
+    // (aclnnAddcmul measured a wash on 310P3 -- its 3-input kernel is no
+    // faster than the mul+add pair and drifts parity to 0.048; keep the
+    // plain composition)
     let scaled = acl(aops::mul_fp16(be.ctx(), be.stream(), &normed, &scale_mat, &[rows, cols]))?;
     acl(aops::add_fp16(be.ctx(), be.stream(), &scaled, &shift_mat, &[rows, cols]))
 }
@@ -906,6 +911,7 @@ pub fn action_layer_ascend(
     let gate_up = aq::matmul(be, &mut cache.nz, &normed, [tokens, width], gw, [width, inter * 2])?;
     mark!("gate_up matmul");
     // [gate; up] concat order (from_host_parts) -- gelu on the first half.
+    // (aclnnGeGlu hangs on 310P3; keep the split+gelu+mul composition)
     let gate = aq::take_rows(be, &gate_up, 0, tokens, inter)?;
     let up = aq::take_rows(be, &gate_up, tokens, tokens, inter)?;
     let gate_g = aq::gelu(be, &gate, &[tokens, inter], true)?;

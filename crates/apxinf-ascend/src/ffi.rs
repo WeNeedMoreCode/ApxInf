@@ -319,6 +319,45 @@ extern "C" {
         stream: *mut c_void,
     ) -> i32;
 
+    // aclnnop/aclnn_addcmul.h: out = self + value * tensor1 * tensor2
+    // (torch Addcmul). Lets ada-norm fold its scale-mul and shift-add
+    // into one kernel (msprof 2026-09-19: the separate add was 78ms/infer).
+    pub fn aclnnAddcmulGetWorkspaceSize(
+        selfT: *mut c_void,
+        tensor1: *mut c_void,
+        tensor2: *mut c_void,
+        value: *mut c_void,
+        out: *mut c_void,
+        workspaceSize: *mut u64,
+        executor: *mut *mut c_void,
+    ) -> i32;
+    pub fn aclnnAddcmul(
+        workspace: *mut c_void,
+        workspaceSize: u64,
+        executor: *mut c_void,
+        stream: *mut c_void,
+    ) -> i32;
+
+    // aclnnop/aclnn_geglu.h: self [.., 2c] splits along `dim`, out =
+    // gelu(one half) * other half in one kernel (approximate: 0 = erf,
+    // 1 = tanh, same selector as GeluV2). outGelu is the intermediate
+    // gelu half (unused by callers but required to bind).
+    pub fn aclnnGeGluGetWorkspaceSize(
+        selfT: *mut c_void,
+        dim: i64,
+        approximate: i64,
+        out: *mut c_void,
+        outGelu: *mut c_void,
+        workspaceSize: *mut u64,
+        executor: *mut *mut c_void,
+    ) -> i32;
+    pub fn aclnnGeGlu(
+        workspace: *mut c_void,
+        workspaceSize: u64,
+        executor: *mut c_void,
+        stream: *mut c_void,
+    ) -> i32;
+
     // aclnnop/aclnn_gather_v2.h: out[i..] = self[index[i]..] along `dim`.
     pub fn aclnnGatherV2GetWorkspaceSize(
         selfT: *mut c_void,
