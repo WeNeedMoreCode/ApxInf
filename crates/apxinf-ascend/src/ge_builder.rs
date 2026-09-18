@@ -373,6 +373,35 @@ impl GeGraph {
         Ok(())
     }
 
+    /// dst.SetInput(port, src, src_port)——显式源输出端口。多输出算子
+    /// （AddRmsNorm 的 y/rstd/x_out、ARPE 的 q/k）必须用这个：默认输出
+    /// 解析会静默失败，边不落图（dump 见 in0<-<none>，编译死在断边处）。
+    pub fn link_out(&self, dst: &str, port: &str, src: &str, src_port: &str) -> Result<()> {
+        type F = unsafe extern "C" fn(
+            *const std::os::raw::c_char,
+            *const std::os::raw::c_char,
+            *const std::os::raw::c_char,
+            *const std::os::raw::c_char,
+        ) -> i32;
+        let l = lib().map_err(|e| {
+            eprintln!("[ge_builder] {e}");
+            AclError { code: -1, op: "ge load" }
+        })?;
+        let f: Symbol<F> = unsafe { l.get(b"geb_link_out") }.map_err(|e| {
+            eprintln!("[ge_builder] dlsym geb_link_out: {e}");
+            AclError { code: -1, op: "ge dlsym" }
+        })?;
+        let d = CString::new(dst).expect("dst");
+        let p = CString::new(port).expect("port");
+        let s = CString::new(src).expect("src");
+        let sp = CString::new(src_port).expect("src port");
+        let rc = unsafe { f(d.as_ptr(), p.as_ptr(), s.as_ptr(), sp.as_ptr()) };
+        if rc != 0 {
+            return Err(cerr("geb_link_out", rc));
+        }
+        Ok(())
+    }
+
     /// dst.SetInput(port, src)——连线登记在 OperatorImpl 双侧，build 时物化。
     pub fn link(&self, dst: &str, port: &str, src: &str) -> Result<()> {
         type F = unsafe extern "C" fn(
@@ -425,6 +454,27 @@ impl GeGraph {
     /// 图输出（按算子名在物化图中定位）。
     pub fn graph_outputs(&self, names: &[&str]) -> Result<()> {
         self.name_list(b"geb_graph_outputs", "geb_graph_outputs", names)
+    }
+
+    /// 图输出 + 显式输出端口索引（多输出算子必用：RmsNorm 的 REQUIRED
+    /// rstd=1、ARPE 的 key=1——必选输出作中间节点死端会静默杀死编译）。
+    pub fn graph_outputs_idx(&self, names: &[&str], idxs: &[i32]) -> Result<()> {
+        type F = unsafe extern "C" fn(*const *const std::os::raw::c_char, *const i32, i32) -> i32;
+        let l = lib().map_err(|e| {
+            eprintln!("[ge_builder] {e}");
+            AclError { code: -1, op: "ge load" }
+        })?;
+        let f: Symbol<F> = unsafe { l.get(b"geb_graph_outputs_idx") }.map_err(|e| {
+            eprintln!("[ge_builder] dlsym geb_graph_outputs_idx: {e}");
+            AclError { code: -1, op: "ge dlsym" }
+        })?;
+        let cstrs: Vec<CString> = names.iter().map(|n| CString::new(*n).expect("name")).collect();
+        let ptrs: Vec<*const std::os::raw::c_char> = cstrs.iter().map(|c| c.as_ptr()).collect();
+        let rc = unsafe { f(ptrs.as_ptr(), idxs.as_ptr(), ptrs.len() as i32) };
+        if rc != 0 {
+            return Err(cerr("geb_graph_outputs_idx", rc));
+        }
+        Ok(())
     }
 
     /// 物化 + aclgrphBuildModel 内存编译 + 加载（首编秒级~分钟级，产物走 save 缓存）。

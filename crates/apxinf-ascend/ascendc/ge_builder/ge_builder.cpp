@@ -51,7 +51,13 @@ struct GebModel {
     ge::Graph graph;
     std::map<std::string, ge::Operator> ops;
     std::vector<ge::Operator> in_ops;   // graph inputs, in binding order
-    std::vector<ge::Operator> out_ops;  // graph outputs
+    std::vector<ge::Operator> out_ops;  // graph outputs (default port)
+    // outputs with explicit port index -- multi-output ops (RmsNorm's
+    // REQUIRED rstd, ApplyRotaryPosEmb's q/k pair, Split) need the indexed
+    // SetOutputs variant; a required output left dead-ended as an
+    // intermediate node silently kills aclgrphBuildModel (empirical,
+    // FormatAndShapeProcess stops without an error line)
+    std::vector<std::pair<ge::Operator, std::vector<size_t>>> out_pairs;
     std::map<ge::AscendString, ge::AscendString> options;
     ge::ModelBufferData buf{};
     uint32_t model_id = 0;
@@ -257,7 +263,9 @@ extern "C" int geb_model_build(int64_t h) {
     // a slot is single-build by design. NB: SetInputs/SetOutputs return a
     // chainable Graph& (not graphStatus, 9.0.1) -- IsValid below is the check
     (void)m->graph.SetInputs(m->in_ops);
-    if (!m->out_ops.empty()) {
+    if (!m->out_pairs.empty()) {
+        (void)m->graph.SetOutputs(m->out_pairs);
+    } else if (!m->out_ops.empty()) {
         (void)m->graph.SetOutputs(m->out_ops);
     }
     if (!m->graph.IsValid()) {
@@ -571,6 +579,26 @@ extern "C" int geb_link(const char *dst_op, const char *dst_port, const char *sr
     return 0;
 }
 
+// link with an explicit SOURCE output port. SetInput(dst, src_op) resolves
+// the src's default output -- for multi-output ops (AddRmsNorm's
+// y/rstd/x_out, ARPE's q/k) that resolution silently fails and the edge
+// never attaches (dump shows in0<-<none>, compile then dies at the
+// unlinked consumer). Always use this form when the src has >1 output.
+extern "C" int geb_link_out(const char *dst_op, const char *dst_port, const char *src_op,
+                            const char *src_out_port) {
+    GebModel *m = Cur();
+    if (m == nullptr) {
+        return -1;
+    }
+    ge::Operator *dst = FindOp(*m, dst_op, "link_out");
+    ge::Operator *src = FindOp(*m, src_op, "link_out");
+    if ((dst == nullptr) || (src == nullptr)) {
+        return -2;
+    }
+    (void)dst->SetInput(std::string(dst_port), *src, std::string(src_out_port));
+    return 0;
+}
+
 extern "C" int geb_graph_inputs(const char *const *names, int32_t n) {
     GebModel *m = Cur();
     if (m == nullptr) {
@@ -594,6 +622,7 @@ extern "C" int geb_graph_outputs(const char *const *names, int32_t n) {
         return -1;
     }
     m->out_ops.clear();
+    m->out_pairs.clear();
     for (int32_t i = 0; i < n; i++) {
         ge::Operator *op = FindOp(*m, names[i], "graph_outputs");
         if (op == nullptr) {
@@ -601,6 +630,26 @@ extern "C" int geb_graph_outputs(const char *const *names, int32_t n) {
             return -2;
         }
         m->out_ops.push_back(*op);
+    }
+    return 0;
+}
+
+// graph outputs with explicit output-port index: entry i binds output port
+// out_idxs[i] of operator names[i] (RmsNorm rstd=1, ARPE key=1, ...)
+extern "C" int geb_graph_outputs_idx(const char *const *names, const int32_t *out_idxs, int32_t n) {
+    GebModel *m = Cur();
+    if (m == nullptr) {
+        return -1;
+    }
+    m->out_ops.clear();
+    m->out_pairs.clear();
+    for (int32_t i = 0; i < n; i++) {
+        ge::Operator *op = FindOp(*m, names[i], "graph_outputs_idx");
+        if (op == nullptr) {
+            m->out_pairs.clear();
+            return -2;
+        }
+        m->out_pairs.emplace_back(*op, std::vector<size_t>{static_cast<size_t>(out_idxs[i])});
     }
     return 0;
 }
