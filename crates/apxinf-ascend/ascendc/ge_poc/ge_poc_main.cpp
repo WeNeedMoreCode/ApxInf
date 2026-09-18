@@ -65,12 +65,25 @@ static void *Upload(aclrtContext ctx, const std::vector<uint16_t> &h) {
     return p;
 }
 
+static int32_t EnvInt(const char *name, int32_t fallback) {
+    const char *v = getenv(name);
+    return (v != nullptr) ? static_cast<int32_t>(std::atoi(v)) : fallback;
+}
+
 int main(int argc, char **argv) {
     const bool verify = (argc > 1) && (std::strcmp(argv[1], "verify") == 0);
-    const int32_t m = verify ? 64 : 832;
-    const int32_t k = verify ? 512 : 2048;
-    const int32_t n = verify ? 256 : 32768;
-    const int32_t pairs = verify ? 1 : 8;
+    int32_t m = verify ? 64 : 832;
+    int32_t k = verify ? 512 : 2048;
+    int32_t n = verify ? 256 : 32768;
+    int32_t pairs = verify ? 1 : 8;
+    if (!verify) {
+        // bench shape override for the m-scaling fit (time = a*m + b separates
+        // per-row compute from per-task dispatch tax)
+        m = EnvInt("GE_POC_M", m);
+        k = EnvInt("GE_POC_K", k);
+        n = EnvInt("GE_POC_N", n);
+        pairs = EnvInt("GE_POC_PAIRS", pairs);
+    }
 
     if (aclInit(nullptr) != ACL_SUCCESS) {
         // already-inited is fine in some hosts; only abort on real failure
@@ -126,6 +139,15 @@ int main(int argc, char **argv) {
             maxDiff = std::max(maxDiff, std::fabs(HalfToF(yh[i]) - ref[i]));
         }
         std::printf("verify: max_diff=%f (fp16 chain vs fp32 ref)\n", maxDiff);
+        std::printf("verify: y[0..3]=%.4f,%.4f,%.4f,%.4f ref[0..3]=%.4f,%.4f,%.4f,%.4f\n", HalfToF(yh[0]),
+                    HalfToF(yh[1]), HalfToF(yh[2]), HalfToF(yh[3]), ref[0], ref[1], ref[2], ref[3]);
+        size_t zeros = 0;
+        for (size_t i = 0; i < yh.size(); i++) {
+            if (yh[i] == 0U) {
+                zeros++;
+            }
+        }
+        std::printf("verify: zeros=%zu/%zu\n", zeros, yh.size());
     } else {
         // bench: back-to-back executes
         for (int w = 0; w < 3; w++) {
