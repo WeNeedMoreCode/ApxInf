@@ -705,12 +705,8 @@ pub fn vision_patch_embed_ascend(
 /// (1+scale)/shift rows are materialized once per style tensor and
 /// cached in `cache.style_rows` -- steady-state steps run device-only.
 fn adaptive_rms(be: &AscendBackend, cache: &mut AscendCaches, x: &DeviceBuffer, style: &Tensor, rows: i64, cols: i64, eps: f32) -> Result<DeviceBuffer> {
-    // rms with gamma = ones (ada-norm has no gamma)
-    let zeros = be.zeros(rows as usize * cols as usize * 2)?;
-    let c = cols as usize;
-    let ones = zeros_scale_buf(be, cache, c)?;
-    let normed = acl(aops::add_rms_norm_fp16(be.ctx(), be.stream(), x, &zeros, &ones, &[rows, cols], eps as f64))?.0;
     let key = tensor_buf(style)?.as_ptr() as usize;
+    let c = cols as usize;
     let (scale_b, shift_b) = match cache.style_rows.get(&key) {
         Some(v) => (v.0.clone(), v.1.clone()),
         None => {
@@ -732,6 +728,29 @@ fn adaptive_rms(be: &AscendBackend, cache: &mut AscendCaches, x: &DeviceBuffer, 
             entry
         }
     };
+    // fused AscendC path: one kernel reads x + the folded style rows and
+    // writes y (rows indexed in-kernel -- no broadcast matrices). Falls
+    // back to the aclnn composition when the .so is absent.
+    if apxinf_ascend::ada_rms::available() {
+        let y = acl(be.ctx().malloc((rows * cols * 2) as usize))?;
+        acl(apxinf_ascend::ada_rms::run(
+            be.stream(),
+            x,
+            &scale_b,
+            &shift_b,
+            &y,
+            rows as i32,
+            cols as i32,
+            eps,
+            8,
+            0,
+        ))?;
+        return Ok(y);
+    }
+    // rms with gamma = ones (ada-norm has no gamma)
+    let zeros = be.zeros(rows as usize * cols as usize * 2)?;
+    let ones = zeros_scale_buf(be, cache, c)?;
+    let normed = acl(aops::add_rms_norm_fp16(be.ctx(), be.stream(), x, &zeros, &ones, &[rows, cols], eps as f64))?.0;
     let mat_key = (key, rows);
     let (scale_mat, shift_mat) = match cache.style_mats.get(&mat_key) {
         Some(v) => (v.0.clone(), v.1.clone()),

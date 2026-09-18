@@ -12,6 +12,7 @@
 //! (`acl_base.h`, `acl_rt.h`) — no bindgen/clang dependency. Keep them in
 //! sync manually when the toolkit moves.
 
+pub mod ada_rms;
 pub mod backend;
 pub mod context;
 pub mod ffi;
