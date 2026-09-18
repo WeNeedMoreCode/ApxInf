@@ -76,10 +76,21 @@ pub struct AscendCaches {
     /// removes the per-layer d2h+stream-sync that broke pipelining
     /// (~540 syncs per inference at full depth).
     style_rows: std::collections::HashMap<usize, (Arc<DeviceBuffer>, Arc<DeviceBuffer>)>,
+    /// Row-broadcast (scale|shift) matrices keyed by (style ptr, rows) --
+    /// the two per-call row_replicate launches were the dominant ada-norm
+    /// cost (~400 ada-norm calls x2 broadcasts per inference).
+    style_mats: std::collections::HashMap<(usize, i64), (Arc<DeviceBuffer>, Arc<DeviceBuffer>)>,
     /// Pre-sliced qkv bias rows, keyed by (bias pointer, start, len).
     kv_biases: std::collections::HashMap<(usize, i64, i64), Arc<DeviceBuffer>>,
     /// Pinned rope position-index rows, keyed by (tokens, heads, offset).
     pos_idx: std::collections::HashMap<(i64, i64, i64), Arc<DeviceBuffer>>,
+    /// Gathered rope cos/sin rows [tokens*heads, d] keyed by (tokens,
+    /// heads, offset, theta bits, d) -- pure constants; re-gathering per
+    /// layer cost 0.4-6.5ms each (msprof 2026-09-19).
+    rope_pos: std::collections::HashMap<(i64, i64, i64, u32, i64), (Arc<DeviceBuffer>, Arc<DeviceBuffer>)>,
+    /// Neighbour-swap index (1,0,3,2,...) for the flat rotate-half
+    /// gather, keyed by flat row count.
+    rope_swap: std::collections::HashMap<i64, Arc<DeviceBuffer>>,
     /// Cached all-ones gamma rows for ada-norm rms (keyed by cols) -- the
     /// per-call h2d was a sync memcpy inside capture windows.
     ones_rows: std::collections::HashMap<usize, Arc<DeviceBuffer>>,
@@ -97,8 +108,11 @@ impl AscendCaches {
             rope: AscendRopeCache::new(),
             nz: NzCache::new(),
             style_rows: Default::default(),
+            style_mats: Default::default(),
             kv_biases: Default::default(),
             pos_idx: Default::default(),
+            rope_pos: Default::default(),
+            rope_swap: Default::default(),
             ones_rows: Default::default(),
             token_idx: Default::default(),
             euler_consts: Default::default(),
@@ -184,8 +198,8 @@ pub(crate) mod aq {
     pub fn take_rows(be: &AscendBackend, buf: &DeviceBuffer, off: i64, rows: i64, cols: i64) -> Result<DeviceBuffer> {
         acl(aops::take_rows_fp16(be.ctx(), be.stream(), buf, off, rows, cols))
     }
-    pub fn rope(be: &AscendBackend, x: &DeviceBuffer, rows: i64, d: i64, cos: &DeviceBuffer, sin: &DeviceBuffer, rot: &DeviceBuffer) -> Result<DeviceBuffer> {
-        acl(aops::rope_rotate_half_fp16(be.ctx(), be.stream(), x, rows, d, cos, sin, rot))
+    pub fn rope_flat(be: &AscendBackend, x: &DeviceBuffer, rows: i64, d: i64, cos: &DeviceBuffer, sin: &DeviceBuffer, swap: &DeviceBuffer) -> Result<DeviceBuffer> {
+        acl(aops::rope_rotate_half_flat_fp16(be.ctx(), be.stream(), x, rows, d, cos, sin, swap))
     }
     pub fn layer_norm(be: &AscendBackend, x: &DeviceBuffer, zeros: &DeviceBuffer, g: &DeviceBuffer, b: &DeviceBuffer, rows: i64, cols: i64, eps: f64) -> Result<DeviceBuffer> {
         acl(aops::layer_norm_fp16(be.ctx(), be.stream(), x, zeros, g, b, rows, cols, eps))
@@ -248,17 +262,15 @@ pub struct ActionLayerOutput {
 struct AscendRopeTableArcs {
     cos: Arc<DeviceBuffer>,
     sin_signed: Arc<DeviceBuffer>,
-    rot_idx: Arc<DeviceBuffer>,
     max_pos: usize,
 }
 
-/// Per-(theta, head_dim) RoPE constants on device: cos table [max_pos, d],
-/// sign-folded sin table [max_pos, d], channel gather index [d].
-/// Built lazily by [`AscendRopeCache::tables`].
+/// Per-(theta, head_dim) RoPE constants on device: cos table [max_pos, d]
+/// and sign-folded sin table [max_pos, d]. Built lazily by
+/// [`AscendRopeCache::tables`].
 pub struct AscendRopeTables {
     pub cos: Arc<DeviceBuffer>,
     pub sin_signed: Arc<DeviceBuffer>,
-    pub rot_idx: Arc<DeviceBuffer>,
     pub d: i64,
     pub theta: f32,
     pub max_pos: usize,
@@ -293,7 +305,6 @@ impl AscendRopeCache {
         Ok(AscendRopeTableArcs {
             cos: t.cos.clone(),
             sin_signed: t.sin_signed.clone(),
-            rot_idx: t.rot_idx.clone(),
             max_pos: t.max_pos,
         })
     }
@@ -326,13 +337,8 @@ fn build_rope_tables(be: &AscendBackend, theta: f32, d: i64, max_pos: usize) -> 
     let sin_signed = acl(ctx.malloc(sin_h.len() * 2))?;
     acl(ctx.copy_h2d(&cos, &f32_to_f16_bytes(&cos_h)))?;
     acl(ctx.copy_h2d(&sin_signed, &f32_to_f16_bytes(&sin_h)))?;
-    let rot_idx: Vec<i32> = (0..d as usize).map(|i| if i < half { i + half } else { i - half } as i32).collect();
-    let rot_idx_buf = acl(ctx.malloc(rot_idx.len() * 4))?;
-    let idx_bytes =
-        unsafe { std::slice::from_raw_parts(rot_idx.as_ptr() as *const u8, rot_idx.len() * 4) };
-    acl(ctx.copy_h2d(&rot_idx_buf, idx_bytes))?;
     acl(stream.synchronize())?;
-    Ok(AscendRopeTables { cos: Arc::new(cos), sin_signed: Arc::new(sin_signed), rot_idx: Arc::new(rot_idx_buf), d, theta, max_pos })
+    Ok(AscendRopeTables { cos: Arc::new(cos), sin_signed: Arc::new(sin_signed), d, theta, max_pos })
 }
 
 /// Apply rotate-half rope to a [tokens * heads, d] view of `x` using the
@@ -354,59 +360,83 @@ fn apply_rope_rows(
     let ctx = be.ctx();
     let stream = be.stream();
     // per-row cos/sin: gather table rows by position index, each position
-    // repeated `heads` times. The index vector only depends on (tokens,
-    // heads, offset) -- build once, keep the device copy pinned in the cache
-    // (stable address matters for any future capture window).
-    let pos_key = (tokens, heads, pos_offset as i64);
-    let pos_buf = match cache.pos_idx.get(&pos_key) {
-        Some(v) => v.clone(),
+    // repeated `heads` times. The gathered rows AND the flat swap index
+    // are pure constants per (tokens, heads, offset) -- cached so layer
+    // loops (and capture replays) never re-gather them.
+    let tkey = (tokens, heads, pos_offset as i64, theta.to_bits(), d);
+    let (cos_pos, sin_pos) = match cache.rope_pos.get(&tkey) {
+        Some(v) => (v.0.clone(), v.1.clone()),
         None => {
-            let mut pos_idx = Vec::with_capacity((tokens * heads) as usize);
-            for t in 0..tokens {
-                for _ in 0..heads {
-                    pos_idx.push((pos_offset as i64 + t) as i32);
+            let pos_key = (tokens, heads, pos_offset as i64);
+            let pos_buf = match cache.pos_idx.get(&pos_key) {
+                Some(v) => v.clone(),
+                None => {
+                    let mut pos_idx = Vec::with_capacity((tokens * heads) as usize);
+                    for t in 0..tokens {
+                        for _ in 0..heads {
+                            pos_idx.push((pos_offset as i64 + t) as i32);
+                        }
+                    }
+                    let buf = acl(ctx.malloc(pos_idx.len() * 4))?;
+                    let pb = unsafe {
+                        std::slice::from_raw_parts(pos_idx.as_ptr() as *const u8, pos_idx.len() * 4)
+                    };
+                    acl(ctx.copy_h2d(&buf, pb))?;
+                    let buf = Arc::new(buf);
+                    cache.pos_idx.insert(pos_key, buf.clone());
+                    buf
+                }
+            };
+            let tables: AscendRopeTableArcs = {
+                let t = cache.rope.tables(be, theta, d, (pos_offset + tokens as usize).max(1))?;
+                AscendRopeTableArcs { cos: t.cos.clone(), sin_signed: t.sin_signed.clone(), max_pos: t.max_pos }
+            };
+            let rows = tokens * heads;
+            let max_pos = tables.max_pos as i64;
+            let t_cos_tab = acl(apxinf_ascend::AclTensor::fp16_nd(&tables.cos, &[max_pos, d]))?;
+            let t_sin_tab = acl(apxinf_ascend::AclTensor::fp16_nd(&tables.sin_signed, &[max_pos, d]))?;
+            let t_pos = acl(apxinf_ascend::AclTensor::i32_nd(&pos_buf, &[rows]))?;
+            let cos_pos = acl(ctx.malloc((rows * d * 2) as usize))?;
+            let sin_pos = acl(ctx.malloc((rows * d * 2) as usize))?;
+            let t_cp = acl(apxinf_ascend::AclTensor::fp16_nd(&cos_pos, &[rows, d]))?;
+            let t_sp = acl(apxinf_ascend::AclTensor::fp16_nd(&sin_pos, &[rows, d]))?;
+            for (tab, out) in [(t_cos_tab.handle(), t_cp.handle()), (t_sin_tab.handle(), t_sp.handle())] {
+                let mut ws = 0u64;
+                let mut ex: *mut std::ffi::c_void = std::ptr::null_mut();
+                unsafe {
+                    let p = apxinf_ascend::ffi::aclnnGatherV2GetWorkspaceSize(tab, 0, t_pos.handle(), out, &mut ws, &mut ex);
+                    if p != 0 {
+                        return Err(Error::Other(format!("rope pos-gather plan {p}")));
+                    }
+                    let r = apxinf_ascend::ffi::aclnnGatherV2(std::ptr::null_mut(), ws, ex, stream.handle());
+                    if r != 0 {
+                        return Err(Error::Other(format!("rope pos-gather run {r}")));
+                    }
                 }
             }
-            let buf = acl(ctx.malloc(pos_idx.len() * 4))?;
-            let pb = unsafe { std::slice::from_raw_parts(pos_idx.as_ptr() as *const u8, pos_idx.len() * 4) };
-            acl(ctx.copy_h2d(&buf, pb))?;
+            let entry = (Arc::new(cos_pos), Arc::new(sin_pos));
+            cache.rope_pos.insert(tkey, entry.clone());
+            entry
+        }
+    };
+    let rows = tokens * heads;
+    let flat_rows = rows * 2;
+    let swap_idx = match cache.rope_swap.get(&flat_rows) {
+        Some(v) => v.clone(),
+        None => {
+            let idx: Vec<i32> = (0..flat_rows as usize).map(|r| (r ^ 1) as i32).collect();
+            let bytes =
+                unsafe { std::slice::from_raw_parts(idx.as_ptr() as *const u8, idx.len() * 4) };
+            let buf = acl(ctx.malloc(bytes.len()))?;
+            acl(ctx.copy_h2d(&buf, bytes))?;
             let buf = Arc::new(buf);
-            cache.pos_idx.insert(pos_key, buf.clone());
+            cache.rope_swap.insert(flat_rows, buf.clone());
             buf
         }
     };
-
-    let tables: AscendRopeTableArcs = {
-        let t = cache.rope.tables(be, theta, d, (pos_offset + tokens as usize).max(1))?;
-        AscendRopeTableArcs { cos: t.cos.clone(), sin_signed: t.sin_signed.clone(), rot_idx: t.rot_idx.clone(), max_pos: t.max_pos }
-    };
-    let rows = tokens * heads;
-    let max_pos = tables.max_pos as i64;
-    let t_cos_tab = acl(apxinf_ascend::AclTensor::fp16_nd(&tables.cos, &[max_pos, d]))?;
-    let t_sin_tab = acl(apxinf_ascend::AclTensor::fp16_nd(&tables.sin_signed, &[max_pos, d]))?;
-    let t_pos = acl(apxinf_ascend::AclTensor::i32_nd(&pos_buf, &[rows]))?;
-    let cos_pos = acl(ctx.scratch_buf((rows * d * 2) as usize))?;
-    let sin_pos = acl(ctx.scratch_buf((rows * d * 2) as usize))?;
-    let t_cp = acl(apxinf_ascend::AclTensor::fp16_nd(&cos_pos, &[rows, d]))?;
-    let t_sp = acl(apxinf_ascend::AclTensor::fp16_nd(&sin_pos, &[rows, d]))?;
-    for (tab, out) in [(t_cos_tab.handle(), t_cp.handle()), (t_sin_tab.handle(), t_sp.handle())] {
-        let mut ws = 0u64;
-        let mut ex: *mut std::ffi::c_void = std::ptr::null_mut();
-        unsafe {
-            let p = apxinf_ascend::ffi::aclnnGatherV2GetWorkspaceSize(tab, 0, t_pos.handle(), out, &mut ws, &mut ex);
-            if p != 0 {
-                return Err(Error::Other(format!("rope pos-gather plan {p}")));
-            }
-            let r = apxinf_ascend::ffi::aclnnGatherV2(std::ptr::null_mut(), ws, ex, stream.handle());
-            if r != 0 {
-                return Err(Error::Other(format!("rope pos-gather run {r}")));
-            }
-        }
-    }
-    // no sync here: gather outputs feed the next kernels on the same
-    // stream -- ordering carries, and a sync in this spot would break a
-    // capture window
-    acl(aops::rope_rotate_half_fp16(ctx, stream, x, rows, d, &cos_pos, &sin_pos, &tables.rot_idx))
+    // flat-view rotate-half: axis-0 contiguous row swap instead of the
+    // axis-1 channel gather (6.5ms per language layer, msprof 2026-09-19)
+    acl(aops::rope_rotate_half_flat_fp16(ctx, stream, x, rows, d, &cos_pos, &sin_pos, &swap_idx))
 }
 
 /// bias + reshape helper: y = x + bias (row broadcast), staying in buffers.
@@ -700,8 +730,28 @@ fn adaptive_rms(be: &AscendBackend, cache: &mut AscendCaches, x: &DeviceBuffer, 
             entry
         }
     };
-    let scale_mat = acl(aops::row_replicate_fp16(be.ctx(), be.stream(), &scale_b, rows, cols))?;
-    let shift_mat = acl(aops::row_replicate_fp16(be.ctx(), be.stream(), &shift_b, rows, cols))?;
+    let mat_key = (key, rows);
+    let (scale_mat, shift_mat) = match cache.style_mats.get(&mat_key) {
+        Some(v) => (v.0.clone(), v.1.clone()),
+        None => {
+            let scale_mat = Arc::new(acl(aops::row_replicate_fp16(
+                be.ctx(),
+                be.stream(),
+                &scale_b,
+                rows,
+                cols,
+            ))?);
+            let shift_mat = Arc::new(acl(aops::row_replicate_fp16(
+                be.ctx(),
+                be.stream(),
+                &shift_b,
+                rows,
+                cols,
+            ))?);
+            cache.style_mats.insert(mat_key, (scale_mat.clone(), shift_mat.clone()));
+            (scale_mat, shift_mat)
+        }
+    };
     let scaled = acl(aops::mul_fp16(be.ctx(), be.stream(), &normed, &scale_mat, &[rows, cols]))?;
     acl(aops::add_fp16(be.ctx(), be.stream(), &scaled, &shift_mat, &[rows, cols]))
 }

@@ -42,13 +42,18 @@ pub struct AscendContext {
 impl AscendContext {
     /// Get a pooled scratch buffer of exactly `len` bytes (zeroed by the
     /// caller before use as an accumulator input; contents are undefined).
+    /// Same-size requests share ONE buffer for the process lifetime --
+    /// single-stream ordering makes that sequentially safe, and inside a
+    /// capture arena it means one slice per size (not one per op; the
+    /// full-depth graph would otherwise bump ~8GB of duplicated
+    /// workspaces into the arena).
     pub fn scratch_buf(&self, len: usize) -> Result<std::sync::Arc<DeviceBuffer>> {
         let mut pool = self.scratch.lock().unwrap();
-        if let Some(buf) = pool.get_mut(&len).and_then(|v| v.pop()) {
-            return Ok(buf);
+        if let Some(buf) = pool.get(&len).and_then(|v| v.last()) {
+            return Ok(buf.clone());
         }
         let buf = std::sync::Arc::new(self.malloc(len)?);
-        pool.entry(len).or_default().reserve(1);
+        pool.entry(len).or_default().push(buf.clone());
         Ok(buf)
     }
 }

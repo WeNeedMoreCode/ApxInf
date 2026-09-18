@@ -461,6 +461,46 @@ pub fn rope_rotate_half_fp16(
     add_fp16(ctx, stream, &t1, &t2, &[rows, d])
 }
 
+/// Flat-view rotate-half rope: reinterprets x [rows, d] as [rows*2, d/2]
+/// (even rows = first half channels), so rotate-half becomes a
+/// neighbouring-row swap -- an axis-0 gather on contiguous rows instead
+/// of the axis-1 channel gather that cost 6.5ms per language layer on
+/// 310P3 (49x its bandwidth floor, msprof 2026-09-19). cos/sin pos
+/// tables take the same flat view: cos repeats over halves host-side and
+/// sin carries the folded signs, so the flattened layouts line up.
+/// swap_idx: i32 [rows*2] = 1,0,3,2,...
+pub fn rope_rotate_half_flat_fp16(
+    ctx: &AscendContext,
+    stream: &AscendStream,
+    x: &crate::DeviceBuffer,
+    rows: i64,
+    d: i64,
+    cos_pos: &crate::DeviceBuffer,
+    sin_signed: &crate::DeviceBuffer,
+    swap_idx: &crate::DeviceBuffer,
+) -> Result<crate::DeviceBuffer> {
+    debug_assert_eq!(d % 2, 0);
+    let half = d / 2;
+    let flat_rows = rows * 2;
+    let t_x = AclTensor::fp16_nd(x, &[flat_rows, half])?;
+    let t_idx = AclTensor::i32_nd(swap_idx, &[flat_rows])?;
+    let q_rot = ctx.malloc((rows * d * 2) as usize)?;
+    let t_qrot = AclTensor::fp16_nd(&q_rot, &[flat_rows, half])?;
+    two_stage(
+        ctx,
+        stream,
+        "aclnnGatherV2(rope-swap)",
+        |ws, ex| unsafe {
+            ffi::aclnnGatherV2GetWorkspaceSize(t_x.handle(), 0, t_idx.handle(), t_qrot.handle(), ws, ex)
+        },
+        |ws, size, ex| unsafe { ffi::aclnnGatherV2(ws, size, ex, stream.handle()) },
+    )?;
+    // out = x * cos + swap(x) * sin_signed, all on the flat view
+    let t1 = mul_fp16(ctx, stream, x, cos_pos, &[flat_rows, half])?;
+    let t2 = mul_fp16(ctx, stream, &q_rot, sin_signed, &[flat_rows, half])?;
+    add_fp16(ctx, stream, &t1, &t2, &[flat_rows, half])
+}
+
 /// out = gelu(a), elementwise fp16 via aclnnGeluV2. `tanh_approx` selects
 /// the tanh approximation (PaliGemma/gelu_tanh semantics) vs exact erf.
 pub fn gelu_fp16(

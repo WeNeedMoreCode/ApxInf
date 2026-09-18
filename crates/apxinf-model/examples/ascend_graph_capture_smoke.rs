@@ -1,11 +1,13 @@
 //! ACLGraph capture smoke (perf phase, 2026-09-18): warm the caches
 //! eagerly, capture a full inference into a graph with all allocations
 //! bumping from one arena, then replay twice and diff against the eager
-//! output. Depth 2/2/2 keeps the turn-around fast.
+//! output. Depth 2/2/2 by default; APXINF_FULL_DEPTH=1 captures the real
+//! 27/18/18 model (the doc'd ~2000 graph cap is a per-INSTANCE stream
+//! budget, not a per-graph node limit -- see roadmap 2026-09-19).
 //!   ASCEND_RT_VISIBLE_DEVICES=5 cargo run --example ascend_graph_capture_smoke --features ascend --release -p apxinf-model
 use std::sync::Arc;
 
-use apxinf_core::{Backend as _, Graph as _, Tensor};
+use apxinf_core::{Backend as _, Graph, Tensor};
 use half::bf16;
 
 use apxinf_model::pi05::{
@@ -24,10 +26,17 @@ fn rand_host(rows: usize, cols: usize, seed: &mut u32) -> Tensor {
 fn main() {
     let be = Arc::new(apxinf_ascend::AscendBackend::new(0).expect("backend"));
     let mut config = Pi05Config::default();
-    config.vision_depth = 2;
-    config.vocab_size = 2048;
-    config.language = GemmaVariantConfig { depth: 2, ..GemmaVariantConfig::GEMMA_2B };
-    config.action_expert = GemmaVariantConfig { depth: 2, ..GemmaVariantConfig::GEMMA_300M };
+    let full_depth = std::env::var("APXINF_FULL_DEPTH").is_ok();
+    let arena_gb: usize = std::env::var("APXINF_ARENA_GB")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(if full_depth { 12 } else { 2 });
+    if !full_depth {
+        config.vision_depth = 2;
+        config.vocab_size = 2048;
+        config.language = GemmaVariantConfig { depth: 2, ..GemmaVariantConfig::GEMMA_2B };
+        config.action_expert = GemmaVariantConfig { depth: 2, ..GemmaVariantConfig::GEMMA_300M };
+    }
     let host_weights = Pi05Weights::synthetic(&config, 1234).expect("synthetic weights");
     let weights = Arc::new(StaticBf16Pi05Weights::from_host(&host_weights, be.as_ref(), false).unwrap());
     let runtime = Pi05AscendRuntime::new(be.clone(), Arc::new(config.clone()), weights).unwrap();
@@ -71,6 +80,8 @@ fn main() {
 
     // 2) styles precomputed OUTSIDE the window (their first-use row
     //    materialization is host work); pre-warm them + arena capture
+    let segment_bench = std::env::var("APXINF_SEGMENT_BENCH").is_ok();
+    //    materialization is host work); pre-warm them + arena capture
     let styles = runtime.prepare_all_styles(&time_embeddings).expect("styles");
     let _prewarm = runtime
         .infer_with_styles(&patches_d, &token_ids, &noise, &styles)
@@ -79,8 +90,96 @@ fn main() {
     drop(_prewarm);
     apxinf_ascend::flush_pending_frees();
 
-    const ARENA: usize = 2 * 1024 * 1024 * 1024;
-    let arena_owner = be.ctx().enter_arena(ARENA).expect("arena");
+    const ARENA_GB_BYTES: usize = 1024 * 1024 * 1024;
+    if segment_bench {
+        // three consecutive segments, each with its own graph + arena:
+        // chained replay must reproduce the eager output, and per-segment
+        // replay timing localizes where the ~907ms full-depth time goes
+        // (hotspot-fusion targeting). This is also the multi-graph relay
+        // prototype should a future need ever force segmentation.
+        // per-segment arenas sized to measured usage (single die is ~22GB;
+        // one shared 12GB reservation x3 does not fit next to the weights)
+        let seg_arenas = [2, 6, 3];
+        let seg_bytes = |i: usize| seg_arenas[i] * ARENA_GB_BYTES;
+        let owner1 = be.ctx().enter_arena(seg_bytes(0)).expect("arena1");
+        be.begin_capture().expect("begin1");
+        let vision = runtime.encode_vision(&patches_d).expect("seg1 vision");
+        let prefix_in = runtime.embed_prefix(&vision, &token_ids).expect("seg1 embed");
+        let g1 = be.end_capture().expect("g1");
+        let used1 = be.ctx().exit_arena();
+        be.ctx().clear_arena();
+        drop(vision); // arena slice underneath: drop is a no-op free
+        println!("seg1 vision+embed captured (arena {used1} bytes)");
+
+        let owner2 = be.ctx().enter_arena(seg_bytes(1)).expect("arena2");
+        be.begin_capture().expect("begin2");
+        let kv = runtime.prefix_forward(&prefix_in).expect("seg2 prefix");
+        let g2 = be.end_capture().expect("g2");
+        let used2 = be.ctx().exit_arena();
+        be.ctx().clear_arena();
+        println!("seg2 prefix captured (arena {used2} bytes)");
+
+        let owner3 = be.ctx().enter_arena(seg_bytes(2)).expect("arena3");
+        be.begin_capture().expect("begin3");
+        let out = runtime
+            .denoise_all_steps_with_styles(&noise, &styles, &kv)
+            .expect("seg3 flow");
+        let g3 = be.end_capture().expect("g3");
+        let used3 = be.ctx().exit_arena();
+        be.ctx().clear_arena();
+        println!("seg3 flow captured (arena {used3} bytes)");
+
+        for i in 0..2 {
+            g1.replay().expect("r1");
+            g2.replay().expect("r2");
+            g3.replay().expect("r3");
+            be.synchronize().expect("sync");
+            let host = be.to_cpu(&out).unwrap();
+            let vals = host.to_f32_vec().unwrap();
+            let finite = vals.iter().filter(|v| v.is_finite()).count();
+            let max_diff =
+                vals.iter().zip(&eager_h).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+            println!(
+                "chained replay {i}: finite={}/{} max_diff_vs_eager={max_diff:.6}",
+                finite,
+                vals.len()
+            );
+            assert_eq!(finite, vals.len());
+            assert!(max_diff < 0.05, "segmented replay diverged: {max_diff}");
+        }
+
+        let mut bench = |name: &str, g: &dyn Graph| -> f64 {
+            let mut ts = Vec::new();
+            for i in 0..8 {
+                let t0 = std::time::Instant::now();
+                g.replay().expect("replay");
+                be.synchronize().expect("sync");
+                if i >= 2 {
+                    ts.push(t0.elapsed().as_secs_f64() * 1000.0);
+                }
+            }
+            ts.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let p50 = ts[ts.len() / 2];
+            println!("SEG_BENCH {name}: p50={p50:.1}ms (n={})", ts.len());
+            p50
+        };
+        let t1 = bench("vision+embed", g1.as_ref());
+        let t2 = bench("prefix", g2.as_ref());
+        let t3 = bench("flow", g3.as_ref());
+        println!("SEG_BENCH total(sum)={:.1}ms", t1 + t2 + t3);
+        drop(g1);
+        drop(g2);
+        drop(g3);
+        drop(out);
+        drop(kv);
+        drop(prefix_in);
+        drop(owner1);
+        drop(owner2);
+        drop(owner3);
+        println!("ASCEND_SEGMENT_BENCH_OK");
+        return;
+    }
+    let arena_owner = be.ctx().enter_arena(arena_gb * ARENA_GB_BYTES).expect("arena");
     be.begin_capture().expect("begin capture");
     let captured = match runtime.infer_with_styles(&patches_d, &token_ids, &noise, &styles) {
         Ok(t) => t,

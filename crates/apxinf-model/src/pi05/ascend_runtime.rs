@@ -399,7 +399,7 @@ impl Pi05AscendRuntime {
         self.denoise_step_with_styles(state, &styles, prefix, dt)
     }
 
-    fn denoise_all_steps_with_styles(
+    pub fn denoise_all_steps_with_styles(
         &self,
         noise: &Tensor,
         styles: &[AscendStepStyles],
