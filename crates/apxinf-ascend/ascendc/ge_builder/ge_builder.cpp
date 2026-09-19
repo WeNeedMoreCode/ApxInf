@@ -38,6 +38,8 @@
 #include <cstring>
 #include <iostream>
 #include <map>
+
+extern "C" char **environ;
 #include <string>
 #include <vector>
 
@@ -220,6 +222,21 @@ int CacheIo(GebModel &m) {
 extern "C" int geb_init(const char *soc_version) {
     std::map<ge::AscendString, ge::AscendString> opts;
     opts.emplace(ge::AscendString("ge.socVersion"), ge::AscendString(soc_version));
+    // GEB_INIT_OPT_<key>=<value>: init 级选项直通（aclgrphBuildInitialize
+    // 白名单，如 ge.enableSingleStream / ge.streamMaxParallelNum——都是
+    // init scope，不在 graph build options 里）
+    for (int i = 0; environ[i] != nullptr; ++i) {
+        const std::string entry(environ[i]);
+        const std::string prefix = "GEB_INIT_OPT_";
+        const auto pos = entry.find('=');
+        if (entry.rfind(prefix, 0) != 0 || pos == std::string::npos) {
+            continue;
+        }
+        const std::string key = entry.substr(prefix.size(), pos - prefix.size());
+        const std::string value = entry.substr(pos + 1);
+        opts.emplace(ge::AscendString(key.c_str()), ge::AscendString(value.c_str()));
+        std::cerr << "[geb] init opt: " << key << " = " << value << std::endl;
+    }
     if (ge::aclgrphBuildInitialize(opts) != ge::GRAPH_SUCCESS) {
         std::cerr << "[geb] aclgrphBuildInitialize failed (env checklist: python3-config on PATH, "
                      "PYTHONPATH=CANN site-packages)" << std::endl;
@@ -401,6 +418,25 @@ extern "C" int geb_add_op(const char *name, const char *type) {
         return -1;
     }
     ge::Operator op = ge::OperatorFactory::CreateOperator(name, type);
+    m->ops.emplace(name, op);
+    return 0;
+}
+
+// Const 节点（int32 一维张量 attr）——给 Reshape/LayerNormV4 的 shape 类
+// 输入用。Data 输入的 shape 张量会让消费算子输出 desc 变 unknown →
+// DynamicShapePartitioner 把图按未知 shape 拆子图、unknown 部分走 host
+// 调度（每边界 ~20ms 停顿，vision_ma profile 取证 3220 个 unknown 标记）。
+// Const 在编译期被常量折叠 → 消费算子静态 infershape。
+extern "C" int geb_add_const_i32(const char *name, const int32_t *vals, int32_t n) {
+    GebModel *m = Cur();
+    if (m == nullptr) {
+        return -1;
+    }
+    ge::TensorDesc td(ge::Shape(std::vector<int64_t>(1, static_cast<int64_t>(n))), ge::FORMAT_ND, ge::DT_INT32);
+    ge::Tensor t(td, reinterpret_cast<const uint8_t *>(vals), static_cast<size_t>(n) * sizeof(int32_t));
+    ge::Operator op = ge::OperatorFactory::CreateOperator(name, "Const");
+    (void)op.SetAttr(std::string("value"), t);
+    (void)op.UpdateOutputDesc("y", td);
     m->ops.emplace(name, op);
     return 0;
 }

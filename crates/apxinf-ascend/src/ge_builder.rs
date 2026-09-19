@@ -233,6 +233,27 @@ impl GeGraph {
         Ok(())
     }
 
+    /// Const 节点（int32 一维）——shape 类输入（Reshape 的 shape、
+    /// LayerNormV4 的 normalized_shape）必须编译期常量：Data 输入会让
+    /// 消费算子 desc 变 unknown → 动态 shape 拆分 → host 调度停顿。
+    pub fn add_const_i32(&self, name: &str, vals: &[i32]) -> Result<()> {
+        type F = unsafe extern "C" fn(*const std::os::raw::c_char, *const i32, i32) -> i32;
+        let l = lib().map_err(|e| {
+            eprintln!("[ge_builder] {e}");
+            AclError { code: -1, op: "ge load" }
+        })?;
+        let f: Symbol<F> = unsafe { l.get(b"geb_add_const_i32") }.map_err(|e| {
+            eprintln!("[ge_builder] dlsym geb_add_const_i32: {e}");
+            AclError { code: -1, op: "ge dlsym" }
+        })?;
+        let n = CString::new(name).expect("name");
+        let rc = unsafe { f(n.as_ptr(), vals.as_ptr(), vals.len() as i32) };
+        if rc != 0 {
+            return Err(cerr("geb_add_const_i32", rc));
+        }
+        Ok(())
+    }
+
     /// 动态输入端口注册（DYNAMIC_INPUT 算子——CreateOperatorByName 不预建
     /// 端口，probe num=0；ge_builder 经 libgraph_base 符号直链
     /// OpDescUtils::GetOpDescFromOperator + OpDesc::AddDynamicInputDesc，

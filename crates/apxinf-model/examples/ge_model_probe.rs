@@ -157,9 +157,13 @@ fn wbuf_t(ctx: &AscendContext, host: &[f16], rows: i64, cols: i64) -> DeviceBuff
 
 /// host LayerNorm 参考（f32 计算）：aclnnAddLayerNorm 在 [768,1152] 有
 /// kernel 级放大（2026-09-19），eager 参考路径的 LN 用 host 计算。
+/// ⚠ 入参 stream 先同步——同步 d2h（aclrtMemcpy）不等待 compute 流上的
+/// 生产 kernel，不同步则读到跑赢/滞后的数据（eager 全 device kernel 时
+/// 确定性错排 98.2% 取证；PFA 模式被 host 回调串行化掩盖）。
 fn host_ln(
-    ctx: &AscendContext, x: &DeviceBuffer, g: &[f16], b: &[f16], rows: i64, cols: i64,
+    ctx: &AscendContext, stream: &AscendStream, x: &DeviceBuffer, g: &[f16], b: &[f16], rows: i64, cols: i64,
 ) -> DeviceBuffer {
+    drop(stream.synchronize());
     let xh = download_f16(ctx, x, (rows * cols) as usize);
     let mut out = vec![f16::from_f32(0.0); (rows * cols) as usize];
     for r in 0..rows as usize {
@@ -301,6 +305,16 @@ impl Seg {
         self.names.push(name.to_string());
         self.shapes.push(dims.to_vec());
         self.binds.push(buf);
+        self.datas.insert(name.to_string());
+        name.to_string()
+    }
+
+    /// Const shape 张量（非图输入，编译期常量折叠）。⚠ shape 类输入用
+    /// data_i32（Data）会让消费算子（Reshape/LayerNormV4）输出 desc 变
+    /// unknown → DynamicShapePartitioner 拆子图 → unknown 部分走 host
+    /// 调度（每边界 ~20ms 停顿；vision_ma OM 3220 个 unknown 标记取证）
+    fn const_i32(&mut self, name: &str, vals: &[i32]) -> String {
+        self.g.add_const_i32(name, vals).unwrap();
         self.datas.insert(name.to_string());
         name.to_string()
     }
@@ -574,6 +588,145 @@ impl Seg {
         self.add2(name, &n, &sbc, dims)
     }
 
+    /// 手工 attention（MHA 版，ma 验证 0.26%）：q/k/v3 [bh,s,d] →
+    /// bmm(q,kᵀ) → SoftmaxV2(axes=-1) → bmm(·,v)。scale 由调用方折进
+    /// q 侧权重+bias（PFA 的 host 回调 InnerPFA 每次执行 ~20ms 停顿的
+    /// 替代；AttentionScore 310P 无 kernel——asc 三变体编译崩）。
+    fn attn_manual(&mut self, name: &str, q3: &str, k3: &str, v3: &str, bh: i64, s: i64, d: i64) -> String {
+        let (sc, sm, bm) = (format!("{name}_sc"), format!("{name}_sm"), format!("{name}_bm"));
+        self.g.add_op(&sc, "BatchMatMulV2").unwrap();
+        self.g.set_input_desc(&sc, "x1", &[bh, s, d], Dtype::Fp16).unwrap();
+        self.g.set_input_desc(&sc, "x2", &[bh, s, d], Dtype::Fp16).unwrap();
+        self.g.set_output_desc(&sc, "y", &[bh, s, s], Dtype::Fp16).unwrap();
+        self.g.set_attr_bool(&sc, "adj_x1", false).unwrap();
+        self.g.set_attr_bool(&sc, "adj_x2", true).unwrap();
+        self.wire(&sc, "x1", q3);
+        self.wire(&sc, "x2", k3);
+        let scr = self.reg_out(&sc, "y");
+        self.g.add_op(&sm, "SoftmaxV2").unwrap();
+        self.g.set_input_desc(&sm, "x", &[bh, s, s], Dtype::Fp16).unwrap();
+        self.g.set_output_desc(&sm, "y", &[bh, s, s], Dtype::Fp16).unwrap();
+        self.g.set_attr_int_list(&sm, "axes", &[-1]).unwrap();
+        self.g.set_attr_bool(&sm, "half_to_float", false).unwrap();
+        self.wire(&sm, "x", &scr);
+        let smr = self.reg_out(&sm, "y");
+        self.g.add_op(&bm, "BatchMatMulV2").unwrap();
+        self.g.set_input_desc(&bm, "x1", &[bh, s, s], Dtype::Fp16).unwrap();
+        self.g.set_input_desc(&bm, "x2", &[bh, s, d], Dtype::Fp16).unwrap();
+        self.g.set_output_desc(&bm, "y", &[bh, s, d], Dtype::Fp16).unwrap();
+        self.g.set_attr_bool(&bm, "adj_x1", false).unwrap();
+        self.g.set_attr_bool(&bm, "adj_x2", false).unwrap();
+        self.wire(&bm, "x1", &smr);
+        self.wire(&bm, "x2", v3);
+        self.reg_out(&bm, "y")
+    }
+
+    /// GQA 版（ma2 验证 0.24%）：k3/v3 [1,skv,d] TileD 广播到 bh 头。
+    /// q3 [bh,sq,d]。返回 [bh,sq,d]。
+    fn attn_manual_gqa(
+        &mut self, name: &str, q3: &str, k3: &str, v3: &str,
+        bh: i64, sq: i64, skv: i64, d: i64,
+    ) -> String {
+        let tile = |s: &mut Self, name: &str, src: &str| -> String {
+            s.g.add_op(name, "TileD").unwrap();
+            s.g.set_input_desc(name, "x", &[1, skv, d], Dtype::Fp16).unwrap();
+            s.g.set_output_desc(name, "y", &[bh, skv, d], Dtype::Fp16).unwrap();
+            s.g.set_attr_int_list(name, "multiples", &[bh, 1, 1]).unwrap();
+            s.wire(name, "x", src);
+            s.reg_out(name, "y")
+        };
+        let kt = tile(self, &format!("{name}_kt"), k3);
+        let vt = tile(self, &format!("{name}_vt"), v3);
+        let (sc, sm, bm) = (format!("{name}_sc"), format!("{name}_sm"), format!("{name}_bm"));
+        self.g.add_op(&sc, "BatchMatMulV2").unwrap();
+        self.g.set_input_desc(&sc, "x1", &[bh, sq, d], Dtype::Fp16).unwrap();
+        self.g.set_input_desc(&sc, "x2", &[bh, skv, d], Dtype::Fp16).unwrap();
+        self.g.set_output_desc(&sc, "y", &[bh, sq, skv], Dtype::Fp16).unwrap();
+        self.g.set_attr_bool(&sc, "adj_x1", false).unwrap();
+        self.g.set_attr_bool(&sc, "adj_x2", true).unwrap();
+        self.wire(&sc, "x1", q3);
+        self.wire(&sc, "x2", &kt);
+        let scr = self.reg_out(&sc, "y");
+        self.g.add_op(&sm, "SoftmaxV2").unwrap();
+        self.g.set_input_desc(&sm, "x", &[bh, sq, skv], Dtype::Fp16).unwrap();
+        self.g.set_output_desc(&sm, "y", &[bh, sq, skv], Dtype::Fp16).unwrap();
+        self.g.set_attr_int_list(&sm, "axes", &[-1]).unwrap();
+        self.g.set_attr_bool(&sm, "half_to_float", false).unwrap();
+        self.wire(&sm, "x", &scr);
+        let smr = self.reg_out(&sm, "y");
+        self.g.add_op(&bm, "BatchMatMulV2").unwrap();
+        self.g.set_input_desc(&bm, "x1", &[bh, sq, skv], Dtype::Fp16).unwrap();
+        self.g.set_input_desc(&bm, "x2", &[bh, skv, d], Dtype::Fp16).unwrap();
+        self.g.set_output_desc(&bm, "y", &[bh, sq, d], Dtype::Fp16).unwrap();
+        self.g.set_attr_bool(&bm, "adj_x1", false).unwrap();
+        self.g.set_attr_bool(&bm, "adj_x2", false).unwrap();
+        self.wire(&bm, "x1", &smr);
+        self.wire(&bm, "x2", &vt);
+        self.reg_out(&bm, "y")
+    }
+
+    /// token 主序 [views*s, h*d] → 头主序 [views*h, s, d]（bmm 布局）。
+    /// ⚠ 直接 Reshape 是错排（[768,1152]→[48,256,72] 把头/序混排——
+    /// d1 manual 98.2% 取证）：正确变换 = Reshape[views,s,h,d] →
+    /// TransposeD(0,2,1,3) → Reshape[views*h,s,d]。
+    fn headsplit(
+        &mut self, name: &str, x: &str, t: i64, views: i64, s: i64, h: i64, d: i64,
+        shp_vs4: &str, shp_bh3: &str,
+    ) -> String {
+        let (r4, tp, r3) = (format!("{name}_r4"), format!("{name}_tp"), format!("{name}_r3"));
+        let qd = h * d;
+        self.g.add_op(&r4, "Reshape").unwrap();
+        self.g.set_input_desc(&r4, "x", &[t, qd], Dtype::Fp16).unwrap();
+        self.g.set_input_desc(&r4, "shape", &[4], Dtype::Int32).unwrap();
+        self.g.set_output_desc(&r4, "y", &[views, s, h, d], Dtype::Fp16).unwrap();
+        self.wire(&r4, "x", x);
+        self.g.link(&r4, "shape", shp_vs4).unwrap();
+        let r4o = self.reg_out(&r4, "y");
+        self.g.add_op(&tp, "TransposeD").unwrap();
+        self.g.set_input_desc(&tp, "x", &[views, s, h, d], Dtype::Fp16).unwrap();
+        self.g.set_output_desc(&tp, "y", &[views, h, s, d], Dtype::Fp16).unwrap();
+        self.g.set_attr_int_list(&tp, "perm", &[0, 2, 1, 3]).unwrap();
+        self.wire(&tp, "x", &r4o);
+        let tpo = self.reg_out(&tp, "y");
+        self.g.add_op(&r3, "Reshape").unwrap();
+        self.g.set_input_desc(&r3, "x", &[views, h, s, d], Dtype::Fp16).unwrap();
+        self.g.set_input_desc(&r3, "shape", &[3], Dtype::Int32).unwrap();
+        self.g.set_output_desc(&r3, "y", &[views * h, s, d], Dtype::Fp16).unwrap();
+        self.wire(&r3, "x", &tpo);
+        self.g.link(&r3, "shape", shp_bh3).unwrap();
+        self.reg_out(&r3, "y")
+    }
+
+    /// headsplit 的逆：[views*h, s, d] → [views*s, h*d]
+    fn headmerge(
+        &mut self, name: &str, x: &str, views: i64, s: i64, h: i64, d: i64,
+        shp_vh4: &str, shp_flat2: &str,
+    ) -> String {
+        let (r4, tp, r2) = (format!("{name}_r4"), format!("{name}_tp"), format!("{name}_r2"));
+        let t = views * s;
+        let qd = h * d;
+        self.g.add_op(&r4, "Reshape").unwrap();
+        self.g.set_input_desc(&r4, "x", &[views * h, s, d], Dtype::Fp16).unwrap();
+        self.g.set_input_desc(&r4, "shape", &[4], Dtype::Int32).unwrap();
+        self.g.set_output_desc(&r4, "y", &[views, h, s, d], Dtype::Fp16).unwrap();
+        self.wire(&r4, "x", x);
+        self.g.link(&r4, "shape", shp_vh4).unwrap();
+        let r4o = self.reg_out(&r4, "y");
+        self.g.add_op(&tp, "TransposeD").unwrap();
+        self.g.set_input_desc(&tp, "x", &[views, h, s, d], Dtype::Fp16).unwrap();
+        self.g.set_output_desc(&tp, "y", &[views, s, h, d], Dtype::Fp16).unwrap();
+        self.g.set_attr_int_list(&tp, "perm", &[0, 2, 1, 3]).unwrap();
+        self.wire(&tp, "x", &r4o);
+        let tpo = self.reg_out(&tp, "y");
+        self.g.add_op(&r2, "Reshape").unwrap();
+        self.g.set_input_desc(&r2, "x", &[views, s, h, d], Dtype::Fp16).unwrap();
+        self.g.set_input_desc(&r2, "shape", &[2], Dtype::Int32).unwrap();
+        self.g.set_output_desc(&r2, "y", &[t, qd], Dtype::Fp16).unwrap();
+        self.wire(&r2, "x", &tpo);
+        self.g.link(&r2, "shape", shp_flat2).unwrap();
+        self.reg_out(&r2, "y")
+    }
+
     fn finish(&mut self, out_names: &[&str]) {
         if std::env::var("GEB_LOAD").is_ok() {
             // 缓存加载模式：跳过编译，parity_and_bench 里替换为磁盘 OM
@@ -587,7 +740,9 @@ impl Seg {
             .map(|(n, d)| (n.as_str(), d.as_slice()))
             .collect();
         self.g.graph_inputs(&names).unwrap();
-        if self.ln_aux.is_empty() {
+        // GEB_NO_AUX=1：跳过 LN 辅输出绑定（mean/rstd 死端会让 y 爆——
+        // trap #17，数值坏但 bench 计时有效；用于隔离 111 图输出假设）
+        if self.ln_aux.is_empty() || std::env::var("GEB_NO_AUX").is_ok() {
             self.g.graph_outputs(out_names).unwrap();
         } else {
             // 主输出 idx0 + 每个 LayerNormV4 的 mean(idx1)/rstd(idx2)
@@ -602,6 +757,13 @@ impl Seg {
             self.g.graph_outputs_idx(&all, &idxs).unwrap();
         }
         self.g.set_nd_input_shape(&shape_refs).unwrap();
+        // GEB_OPT_<key>=<value>：build option 直通口（A/B 实验，如
+        // GEB_OPT_ge.streamMaxParallelNum=AIcoreEngine:1,VectorEngine:1）
+        for (k, v) in std::env::vars().filter(|(k, _)| k.starts_with("GEB_OPT_")) {
+            let key = &k["GEB_OPT_".len()..];
+            self.g.set_option(key, &v).unwrap();
+            println!("[geb-opt] {key} = {v}");
+        }
         self.g.build().expect("build");
     }
 }
@@ -664,6 +826,21 @@ fn parity_and_bench(
     seg.g.run(&ins, &out_refs, stream).expect("ge run");
     drop(stream.synchronize());
 
+    // GEB_DBG：打印每个图输出缓冲的 |max| + head（层 0 各级绑成图输出后
+    // 与 eager 的 GEB_TRACE 逐级对照用——|max| 同但 head 异 = 排列错位类）
+    if std::env::var("GEB_DBG").is_ok() {
+        for i in 0..n_out {
+            let n = (seg.g.output_size(i).unwrap_or(0) / 2).min(4_000_000) as usize;
+            if n == 0 {
+                continue;
+            }
+            let h = download_f16(ctx, &outs[i], n);
+            let m = h.iter().fold(0f32, |m, v| m.max(v.to_f32().abs()));
+            let head: Vec<f32> = h[..6.min(h.len())].iter().map(|v| v.to_f32()).collect();
+            println!("[dbg out{i}] n={n} |max|={m:.4} head={head:?}");
+        }
+    }
+
     // 对拍（主输出——LayerNormV4 的 mean/rstd aux 输出跳过）。断言用
     // 相对误差：GE 静态 OM 与 eager aclnn 允许不同 tiling 变体（这正是
     // C 路线的性能来源），单算子/小图逐位一致（C1 验证），全量多层图
@@ -704,23 +881,28 @@ fn parity_and_bench(
     }
 
     if bench {
+        // GEB_ROUNDS/GEB_PER：bench 规模参数化——假设检验用小配置
+        // （如 ROUNDS=5 PER=3，十几秒出数），全深度留作最终确认
+        let rounds = envi("GEB_ROUNDS", 30) as usize;
+        let per = envi("GEB_PER", 10).max(1) as usize;
+        let skip = rounds.min(3);
         for _ in 0..3 {
             seg.g.run(&ins, &out_refs, stream).unwrap();
         }
         drop(stream.synchronize());
         let mut ts = Vec::new();
-        for r in 0..30 {
+        for r in 0..rounds {
             let t0 = std::time::Instant::now();
-            for _ in 0..10 {
+            for _ in 0..per {
                 seg.g.run(&ins, &out_refs, stream).unwrap();
             }
             drop(stream.synchronize());
-            if r >= 3 {
-                ts.push(t0.elapsed().as_secs_f64() * 1000.0 / 10.0);
+            if r >= skip {
+                ts.push(t0.elapsed().as_secs_f64() * 1000.0 / per as f64);
             }
         }
         ts.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        println!("{tag} GE OM: {:.4} ms (median/10)", ts[ts.len() / 2]);
+        println!("{tag} GE OM: {:.4} ms (median/{per}, rounds={rounds})", ts[ts.len() / 2]);
     }
 }
 
@@ -736,6 +918,11 @@ fn seg_vision(be: &AscendBackend, bench: bool) {
     let t = VT;
     let vqd = V_HEADS * V_HD; // 1152
     let qkvw = vqd * 3;
+    // GEB_ATTN=manual：手工 attention（bmm+softmax+bmm 全静态，ma 验证）。
+    // 默认 pfa（PromptFlashAttention——静态 OM 里走 InnerPFA host 回调，
+    // ~20ms/层停顿，见 C2 性能攻坚 profile 取证）
+    let attn_manual = std::env::var("GEB_ATTN").map(|v| v == "manual").unwrap_or(false);
+    let vscale = if attn_manual { 1.0f32 / (V_HD as f32).sqrt() } else { 1.0 };
     let mut seed = 0xC0DEu32;
     let mut s = Seg::new("ge_vision");
 
@@ -760,9 +947,14 @@ fn seg_vision(be: &AscendBackend, bench: bool) {
         s.data(ctx, "pos_rep", &[t, VW], &rep);
     }
     s.data_zeros(ctx, "zeros", t, VW);
-    s.data_i32(ctx, "shp_v3", &[3], &[VIEWS as i32, VPV as i32, vqd as i32]);
-    s.data_i32(ctx, "shp_flat2", &[2], &[t as i32, vqd as i32]);
-    s.data_i32(ctx, "nsh", &[1], &[VW as i32]); // LayerNormV4 normalized_shape
+    // shape 类输入一律 Const（Data 会让 desc 变 unknown → host 调度停顿）
+    s.const_i32("shp_v3", &[VIEWS as i32, VPV as i32, vqd as i32]);
+    s.const_i32("shp_flat2", &[t as i32, vqd as i32]);
+    s.const_i32("nsh", &[VW as i32]); // LayerNormV4 normalized_shape
+    // 手工 attention 的头主序桥 shape（headsplit/headmerge 用）
+    s.const_i32("shp_at3", &[(VIEWS * V_HEADS) as i32, VPV as i32, V_HD as i32]);
+    s.const_i32("shp_vs4", &[VIEWS as i32, VPV as i32, V_HEADS as i32, V_HD as i32]);
+    s.const_i32("shp_vh4", &[VIEWS as i32, V_HEADS as i32, VPV as i32, V_HD as i32]);
 
     // ---- 图：patch embed ----
     let mut cur = s.mm("pemb", "patches", &[t, V_PATCH_W], "patch_wt", &[VW, V_PATCH_W], &[t, VW]);
@@ -778,6 +970,9 @@ fn seg_vision(be: &AscendBackend, bench: bool) {
     // norm gamma/beta 的 host 副本（eager 参考 host LN 用）
     let mut eager_norms: Vec<(Vec<f16>, Vec<f16>, Vec<f16>, Vec<f16>)> = Vec::new();
     let mut layer_bases = Vec::with_capacity(depth);
+    // GEB_DBG：层 0 各级额外绑图输出（parity_and_bench 的 [dbg outN] 打印）
+    let dbg = std::env::var("GEB_DBG").is_ok();
+    let mut dbg_outs: Vec<String> = Vec::new();
     for i in 0..depth {
         let base = s.binds.len();
         layer_bases.push(base);
@@ -788,21 +983,36 @@ fn seg_vision(be: &AscendBackend, bench: bool) {
         s.data(ctx, &format!("{}n1b", p), &[VW], &n1b_h);
         {
             // host 三块 [VW, vqd] → GE 拼接 [VW, qkvw] 转置上传；
-            // eager 三块各自转置上传；bias 整条（GE）/host 切三段（eager）
+            // eager 三块各自转置上传；bias 整条（GE）/host 切三段（eager）。
+            // manual attention 时 GE 侧 q 块（权重+bias）预乘 1/√hd（图内
+            // 无 scale 算子）；eager 侧保持原值（PFA 的 scale_value attr 承担）
             let wq = rand_f16((VW * vqd) as usize, &mut seed, 30000.0);
             let wk = rand_f16((VW * vqd) as usize, &mut seed, 30000.0);
             let wv = rand_f16((VW * vqd) as usize, &mut seed, 30000.0);
+            let wq_s: Vec<f16> = if attn_manual {
+                wq.iter().map(|v| f16::from_f32(v.to_f32() * vscale)).collect()
+            } else {
+                wq.clone()
+            };
             let mut fused = Vec::with_capacity((VW * qkvw) as usize);
             for r in 0..VW as usize {
                 let base = r * vqd as usize;
-                fused.extend_from_slice(&wq[base..base + vqd as usize]);
+                fused.extend_from_slice(&wq_s[base..base + vqd as usize]);
                 fused.extend_from_slice(&wk[base..base + vqd as usize]);
                 fused.extend_from_slice(&wv[base..base + vqd as usize]);
             }
             let b = wbuf_t(ctx, &fused, VW, qkvw);
             s.data_buf(&format!("{}qkvwt", p), &[qkvw, VW], b);
             let bias = rand_f16(qkvw as usize, &mut seed, 12000.0);
-            s.data(ctx, &format!("{}qkvb", p), &[1, qkvw], &bias);
+            let bias_s: Vec<f16> = if attn_manual {
+                bias.iter()
+                    .enumerate()
+                    .map(|(i, v)| f16::from_f32(v.to_f32() * if (i as i64) < vqd { vscale } else { 1.0 }))
+                    .collect()
+            } else {
+                bias.clone()
+            };
+            s.data(ctx, &format!("{}qkvb", p), &[1, qkvw], &bias_s);
             let bq = upload(ctx, &bias[0..vqd as usize]);
             let bk = upload(ctx, &bias[vqd as usize..2 * vqd as usize]);
             let bv = upload(ctx, &bias[2 * vqd as usize..]);
@@ -835,18 +1045,33 @@ fn seg_vision(be: &AscendBackend, bench: bool) {
         }
         s.data(ctx, &format!("{}fc2b", p), &[1, VW], &rand_f16(VW as usize, &mut seed, 12000.0));
 
-        // attention（v3 方案：rank-2 列切 → Reshape rank-3 桥 → batch PFA）
+        // attention（v3 方案：rank-2 列切 → Reshape rank-3 桥）。
+        // manual：[b*h,s,d] 桥 + bmm/softmax/bmm（全静态）；pfa：batch PFA
         let ln1 = s.addln(&format!("{}ln1", p), &cur, &format!("{}n1w", p), &format!("{}n1b", p), "nsh", &[t, VW]);
         let qkv = s.mm(&format!("{}qkv", p), &ln1, &[t, VW], &format!("{}qkvwt", p), &[qkvw, VW], &[t, qkvw]);
         let qkvb = s.bias(&format!("{}qkvb", p), &qkv, &[t, qkvw], &format!("{}qkvb", p));
         let q2 = s.slice2(&format!("{}q2", p), &qkvb, &[t, qkvw], 0, vqd);
         let k2 = s.slice2(&format!("{}k2", p), &qkvb, &[t, qkvw], vqd, vqd);
         let v2 = s.slice2(&format!("{}v2", p), &qkvb, &[t, qkvw], vqd * 2, vqd);
-        let q3 = s.reshape(&format!("{}q3", p), &q2, &[t, vqd], "shp_v3", &[VIEWS, VPV, vqd]);
-        let k3 = s.reshape(&format!("{}k3", p), &k2, &[t, vqd], "shp_v3", &[VIEWS, VPV, vqd]);
-        let v3 = s.reshape(&format!("{}v3", p), &v2, &[t, vqd], "shp_v3", &[VIEWS, VPV, vqd]);
-        let pfa = s.pfa(&format!("{}pfa", p), &q3, &k3, &v3, &[VIEWS, VPV, vqd], &[VIEWS, VPV, vqd], V_HEADS, V_HEADS, V_HD);
-        let a2 = s.reshape(&format!("{}a2", p), &pfa, &[VIEWS, VPV, vqd], "shp_flat2", &[t, vqd]);
+        let attn = if attn_manual {
+            // 头主序桥（headsplit：Reshape[3,256,16,72]→TransposeD(0,2,1,3)
+            // →Reshape[48,256,72]）——直接 Reshape 是错排
+            let q3 = s.headsplit(&format!("{}qh", p), &q2, t, VIEWS, VPV, V_HEADS, V_HD, "shp_vs4", "shp_at3");
+            let k3 = s.headsplit(&format!("{}kh", p), &k2, t, VIEWS, VPV, V_HEADS, V_HD, "shp_vs4", "shp_at3");
+            let v3 = s.headsplit(&format!("{}vh", p), &v2, t, VIEWS, VPV, V_HEADS, V_HD, "shp_vs4", "shp_at3");
+            let bh = VIEWS * V_HEADS;
+            s.attn_manual(&format!("{}attn", p), &q3, &k3, &v3, bh, VPV, V_HD)
+        } else {
+            let q3 = s.reshape(&format!("{}q3", p), &q2, &[t, vqd], "shp_v3", &[VIEWS, VPV, vqd]);
+            let k3 = s.reshape(&format!("{}k3", p), &k2, &[t, vqd], "shp_v3", &[VIEWS, VPV, vqd]);
+            let v3 = s.reshape(&format!("{}v3", p), &v2, &[t, vqd], "shp_v3", &[VIEWS, VPV, vqd]);
+            s.pfa(&format!("{}pfa", p), &q3, &k3, &v3, &[VIEWS, VPV, vqd], &[VIEWS, VPV, vqd], V_HEADS, V_HEADS, V_HD)
+        };
+        let a2 = if attn_manual {
+            s.headmerge(&format!("{}am", p), &attn, VIEWS, VPV, V_HEADS, V_HD, "shp_vh4", "shp_flat2")
+        } else {
+            s.reshape(&format!("{}a2", p), &attn, &[VIEWS * V_HEADS, VPV, V_HD], "shp_flat2", &[t, vqd])
+        };
         let proj = s.mm(&format!("{}proj", p), &a2, &[t, vqd], &format!("{}outwt", p), &[VW, vqd], &[t, VW]);
         let projb = s.bias(&format!("{}projb", p), &proj, &[t, VW], &format!("{}outb", p));
         let res1 = s.add2(&format!("{}res1", p), &projb, &cur, &[t, VW]);
@@ -859,6 +1084,14 @@ fn seg_vision(be: &AscendBackend, bench: bool) {
         let fc2 = s.mm(&format!("{}fc2", p), &act, &[t, V_INTER], &format!("{}fc2wt", p), &[VW, V_INTER], &[t, VW]);
         let fc2b = s.bias(&format!("{}fc2b", p), &fc2, &[t, VW], &format!("{}fc2b", p));
         cur = s.add2(&format!("{}out", p), &fc2b, &res1, &[t, VW]);
+        if i == 0 && dbg {
+            // ⚠ attn（bmm/PFA 输出）及其直接下游（proj mm）绑图输出时 desc
+            // 动态（[-1,-1,-1] / [-1,1152]，size ~1e18 → malloc 崩）——
+            // 动态 desc 只传一层；res1 起恢复静态
+            for st in [&ln1, &qkvb, &res1, &ln2, &fc1b, &act, &fc2b, &cur] {
+                dbg_outs.push(st.clone());
+            }
+        }
     }
 
     // ---- post norm + projector ----
@@ -875,7 +1108,11 @@ fn seg_vision(be: &AscendBackend, bench: bool) {
     let pln = s.addln("pln", &cur, "pnw", "pnb", "nsh", &[t, VW]);
     let proj = s.mm("proj", &pln, &[t, VW], "projwt", &[PW, VW], &[t, PW]);
     let out = s.bias("out", &proj, &[t, PW], "projb");
-    s.finish(&[&out]);
+    let mut fin: Vec<&str> = vec![&out];
+    if dbg {
+        fin.extend(dbg_outs.iter().map(|x| x.as_str()));
+    }
+    s.finish(&fin);
     println!("vision OM built: depth={depth} n_in={} n_out=1", s.binds.len());
 
     // ---- eager 参考（vision_layer_ascend 序列镜像；qkv 独立投影）----
@@ -883,10 +1120,14 @@ fn seg_vision(be: &AscendBackend, bench: bool) {
     let eager = |b: &[DeviceBuffer]| -> Vec<DeviceBuffer> {
         let mut mx = |tag: &str, buf: &DeviceBuffer| {
             if trace {
+                // d2h memcpy 非流序——先同步再读，否则竞态脏读（l0 out head
+                // 全 0 取证：大 kernel 后下载抢跑）
+                drop(stream.synchronize());
                 let n = buf.len() / 2;
                 let h = download_f16(ctx, buf, n);
                 let m = h.iter().fold(0f32, |m, v| m.max(v.to_f32().abs()));
-                println!("[trace] {tag}: |max|={m:.3}");
+                let head: Vec<f32> = h[..6.min(h.len())].iter().map(|v| v.to_f32()).collect();
+                println!("[trace] {tag}: |max|={m:.3} head={head:?}");
                 if tag == "emb" {
                     let row: Vec<f32> = h[..1152].iter().map(|v| v.to_f32()).collect();
                     let mean = row.iter().sum::<f32>() / row.len() as f32;
@@ -904,7 +1145,7 @@ fn seg_vision(be: &AscendBackend, bench: bool) {
             let w = &b[layer_bases[li]..layer_bases[li] + 12];
             let (wq, wk, wv, bq, bk, bv) = &eager_qkv[li];
             let (n1w_h, n1b_h, n2w_h, n2b_h) = &eager_norms[li];
-            let normed = host_ln(ctx, &h, n1w_h, n1b_h, t, VW);
+            let normed = host_ln(ctx, stream, &h, n1w_h, n1b_h, t, VW);
             mx(&format!("l{li} ln1"), &normed);
             let q = aops::bias_add_fp16(ctx, stream,
                 &aops::matmul_b_t_fp16(ctx, stream, &normed, [t, VW], wq, VW, vqd).unwrap(), bq, t, vqd).unwrap();
@@ -919,19 +1160,29 @@ fn seg_vision(be: &AscendBackend, bench: bool) {
             let proj = aops::bias_add_fp16(ctx, stream, &proj, &w[5], t, VW).unwrap();
             let res1 = aops::add_fp16(ctx, stream, &proj, &h, &[t, VW]).unwrap();
             mx(&format!("l{li} res1"), &res1);
-            let norm2 = host_ln(ctx, &res1, n2w_h, n2b_h, t, VW);
+            let norm2 = host_ln(ctx, stream, &res1, n2w_h, n2b_h, t, VW);
+            mx(&format!("l{li} ln2"), &norm2);
             let act = aops::matmul_b_t_fp16(ctx, stream, &norm2, [t, VW], &w[8], VW, V_INTER).unwrap();
             let act = aops::bias_add_fp16(ctx, stream, &act, &w[9], t, V_INTER).unwrap();
+            mx(&format!("l{li} fc1b"), &act);
             let act = aops::gelu_fp16(ctx, stream, &act, &[t, V_INTER], false).unwrap();
+            mx(&format!("l{li} act"), &act);
             let out = aops::matmul_b_t_fp16(ctx, stream, &act, [t, V_INTER], &w[10], V_INTER, VW).unwrap();
             let out = aops::bias_add_fp16(ctx, stream, &out, &w[11], t, VW).unwrap();
             h = aops::add_fp16(ctx, stream, &out, &res1, &[t, VW]).unwrap();
             mx(&format!("l{li} out"), &h);
         }
         let n = b.len();
-        let normed = host_ln(ctx, &h, &pnw_h, &pnb_h, t, VW);
+        let normed = host_ln(ctx, stream, &h, &pnw_h, &pnb_h, t, VW);
         let proj = aops::matmul_b_t_fp16(ctx, stream, &normed, [t, VW], &b[n - 2], VW, PW).unwrap();
-        vec![aops::bias_add_fp16(ctx, stream, &proj, &b[n - 1], t, PW).unwrap()]
+        let fin = aops::bias_add_fp16(ctx, stream, &proj, &b[n - 1], t, PW).unwrap();
+        mx("final", &fin);
+        // ⚠ 闭包内中间量 drop 时 kernel 可能未落（aclrtFree 非流序，内存
+        // 回池被后续 GE 输出 malloc 复用 → 反向踩烂在途 eager 数据——
+        // ref |max| 0.014/0.321 随机跳，非确定性 parity 崩的根因）。
+        // 返回前强制同步。
+        drop(stream.synchronize());
+        vec![fin]
     };
 
     parity_and_bench(ctx, stream, &mut s, "vision", &[(t * PW) as usize], &eager, bench);
@@ -975,10 +1226,10 @@ fn seg_prefix(be: &AscendBackend, bench: bool) {
     s.data(ctx, "qsin2", &[p, QD], &qs2);
     s.data(ctx, "kcos2", &[p, KVD], &kc2);
     s.data(ctx, "ksin2", &[p, KVD], &ks2);
-    // Reshape shape 张量（rank-3 桥）
-    s.data_i32(ctx, "shp_q3", &[3], &[1, p as i32, QD as i32]);
-    s.data_i32(ctx, "shp_k3", &[3], &[1, p as i32, KVD as i32]);
-    s.data_i32(ctx, "shp_v3", &[3], &[1, p as i32, KVD as i32]);
+    // Reshape shape 张量（rank-3 桥；Const——Data 会让 desc unknown）
+    s.const_i32("shp_q3", &[1, p as i32, QD as i32]);
+    s.const_i32("shp_k3", &[1, p as i32, KVD as i32]);
+    s.const_i32("shp_v3", &[1, p as i32, KVD as i32]);
 
     // ---- 层循环（eager qkv 独立投影，同 vision 段注记）----
     let mut eager_qkv: Vec<(DeviceBuffer, DeviceBuffer, DeviceBuffer, DeviceBuffer, DeviceBuffer, DeviceBuffer)> = Vec::new();
@@ -1115,6 +1366,8 @@ fn seg_prefix(be: &AscendBackend, bench: bool) {
             let downb = aops::bias_add_fp16(ctx, stream, &down, &w[9], p, PW).unwrap();
             h = Some(aops::add_fp16(ctx, stream, &downb, &res, &[p, PW]).unwrap());
         }
+        // 中间量 drop 前 kernel 必须落定（同 vision 段注记）
+        drop(stream.synchronize());
         outs
     };
 
@@ -1162,11 +1415,11 @@ fn seg_flow(be: &AscendBackend, bench: bool) {
     s.data(ctx, "qsin2", &[HOR, QD], &qs2);
     s.data(ctx, "kcos2", &[HOR, KVD], &kc2);
     s.data(ctx, "ksin2", &[HOR, KVD], &ks2);
-    // Reshape shape 张量（q/k/v/kall rank-3 桥；kall/vall 共用）
-    s.data_i32(ctx, "shp_q3", &[3], &[1, HOR as i32, QD as i32]);
-    s.data_i32(ctx, "shp_k3", &[3], &[1, HOR as i32, KVD as i32]);
-    s.data_i32(ctx, "shp_v3", &[3], &[1, HOR as i32, KVD as i32]);
-    s.data_i32(ctx, "shp_kall", &[3], &[1, (p + HOR) as i32, KVD as i32]);
+    // Reshape shape 张量（q/k/v/kall rank-3 桥；kall/vall 共用；Const）
+    s.const_i32("shp_q3", &[1, HOR as i32, QD as i32]);
+    s.const_i32("shp_k3", &[1, HOR as i32, KVD as i32]);
+    s.const_i32("shp_v3", &[1, HOR as i32, KVD as i32]);
+    s.const_i32("shp_kall", &[1, (p + HOR) as i32, KVD as i32]);
     {
         let host = rand_f16((ADIM * AW) as usize, &mut seed, 8000.0);
         let b = wbuf_t(ctx, &host, ADIM, AW);
@@ -1379,7 +1632,10 @@ fn seg_flow(be: &AscendBackend, bench: bool) {
         let vel = aops::bias_add_fp16(ctx, stream, &vel, &b[n - 3], HOR, ADIM).unwrap();
         let t1 = aops::mul_fp16(ctx, stream, &b[0], &b[n - 2], &[HOR, ADIM]).unwrap();
         let t2 = aops::mul_fp16(ctx, stream, &vel, &b[n - 1], &[HOR, ADIM]).unwrap();
-        vec![aops::add_fp16(ctx, stream, &t1, &t2, &[HOR, ADIM]).unwrap()]
+        let fin = aops::add_fp16(ctx, stream, &t1, &t2, &[HOR, ADIM]).unwrap();
+        // 中间量 drop 前 kernel 必须落定（同 vision 段注记）
+        drop(stream.synchronize());
+        vec![fin]
     };
 
     parity_and_bench(ctx, stream, &mut s, "flow", &[(HOR * ADIM) as usize], &eager, bench);
@@ -1387,7 +1643,7 @@ fn seg_flow(be: &AscendBackend, bench: bool) {
     println!("GE_FLOW_PROBE_OK");
 }
 
-/// 单算子最小图编译冒烟（GEB_OPTEST=btd|rsh|sld|gat|cat|aln|gln）——
+/// 单算子最小图编译冒烟（GEB_OPTEST=btd|rsh|sld|gat|cat|aln|gln|asc）——
 /// 新算子逐个定罪用（三段图共享的新算子集）
 fn optest(be: &AscendBackend, which: &str) {
     let ctx = be.ctx();
@@ -2100,7 +2356,7 @@ fn optest(be: &AscendBackend, which: &str) {
             s.g.run(&ins, &[&out, &aux1, &aux2], stream).unwrap();
             drop(stream.synchronize());
             let ge = download_f16(ctx, &out, 768 * 1152);
-            let href = host_ln(ctx, &s.binds[0], &gh, &bh, 768, 1152);
+            let href = host_ln(ctx, stream, &s.binds[0], &gh, &bh, 768, 1152);
             let hr = download_f16(ctx, &href, 768 * 1152);
             let mut md = 0f32;
             let mut gm = 0f32;
@@ -2144,7 +2400,7 @@ fn optest(be: &AscendBackend, which: &str) {
             let xh = download_f16(ctx, &s.binds[0], 768 * 1152);
             let xl: Vec<f16> = xh.clone();
             let xb = upload(ctx, &xl);
-            let href = host_ln(ctx, &xb, &gh, &bh, 768, 1152);
+            let href = host_ln(ctx, stream, &xb, &gh, &bh, 768, 1152);
             let hr = download_f16(ctx, &href, 768 * 1152);
             let mut md = 0f32;
             let mut gm = 0f32;
@@ -2293,7 +2549,7 @@ fn optest(be: &AscendBackend, which: &str) {
             drop(stream.synchronize());
             let ge = download_f16(ctx, &out, 768 * 1152);
             // eager 参照：host LN → matmul
-            let ln_ref = host_ln(ctx, &s.binds[0], &gh, &bh, 768, 1152);
+            let ln_ref = host_ln(ctx, stream, &s.binds[0], &gh, &bh, 768, 1152);
             let mm_ref = aops::matmul_b_t_fp16(ctx, stream, &ln_ref, [768, 1152], &s.binds[5], 1152, 1152).unwrap();
             drop(stream.synchronize());
             let er = download_f16(ctx, &mm_ref, 768 * 1152);
@@ -2305,7 +2561,281 @@ fn optest(be: &AscendBackend, which: &str) {
             }
             println!("lnv4c numeric: ge |max|={gm:.3} max_diff={md:.5}");
         }
-        other => panic!("GEB_OPTEST: ...|v3n|tldn|lnv4c, got {other}"),
+        // asc: AttentionScore（bert 时代融合静态 attention：bmm+softmax+bmm
+        // 一体，无 dynamic 标记）——PFA 在静态 OM 里走 host 回调（InnerPFA
+        // 每次执行 host tiling，~20ms/次停顿）的替代候选。数值对 host
+        // softmax 参考。asc/asc2/asc3 = padding_mask 形状变体。
+        "asc" | "asc2" | "asc3" => {
+            let (b, sq, d) = (48i64, 256i64, 72i64);
+            let mut seed = 7u32;
+            let qh = rand_f16((b * sq * d) as usize, &mut seed, 3.0);
+            let kh = rand_f16((b * sq * d) as usize, &mut seed, 3.0);
+            let vh = rand_f16((b * sq * d) as usize, &mut seed, 3.0);
+            s.data(ctx, "q", &[b, sq, d], &qh);
+            s.data(ctx, "k", &[b, sq, d], &kh);
+            s.data(ctx, "v", &[b, sq, d], &vh);
+            let mask_dims: &[i64] = match which {
+                "asc" => &[b, sq, sq],
+                "asc2" => &[b, 1, sq],
+                _ => &[1, sq],
+            };
+            s.data(ctx, "pmask", mask_dims, &vec![f16::from_f32(1.0); (mask_dims.iter().product::<i64>()) as usize]);
+            let scale = 1.0f32 / (d as f32).sqrt();
+            s.data(ctx, "scale", &[1], &vec![f16::from_f32(scale)]);
+            s.g.add_op("op", "AttentionScore").unwrap();
+            s.g.set_input_desc("op", "query", &[b, sq, d], Dtype::Fp16).unwrap();
+            s.g.set_input_desc("op", "key", &[b, sq, d], Dtype::Fp16).unwrap();
+            s.g.set_input_desc("op", "value", &[b, sq, d], Dtype::Fp16).unwrap();
+            s.g.set_input_desc("op", "padding_mask", mask_dims, Dtype::Fp16).unwrap();
+            s.g.set_input_desc("op", "scale", &[1], Dtype::Fp16).unwrap();
+            s.g.set_output_desc("op", "attention_score", &[b, sq, d], Dtype::Fp16).unwrap();
+            s.g.set_attr_float("op", "keep_prob", 1.0).unwrap();
+            s.g.set_attr_bool("op", "query_transpose", false).unwrap();
+            s.g.set_attr_bool("op", "key_transpose", false).unwrap();
+            s.g.set_attr_bool("op", "bmm_score_transpose_a", false).unwrap();
+            s.g.set_attr_bool("op", "bmm_score_transpose_b", true).unwrap();
+            s.g.set_attr_int_list("op", "softmax_axes", &[-1]).unwrap();
+            for (port, src) in [("query", "q"), ("key", "k"), ("value", "v"), ("padding_mask", "pmask"), ("scale", "scale")] {
+                s.g.link("op", port, src).unwrap();
+            }
+            s.reg_out("op", "attention_score");
+            s.finish(&["op"]);
+            let stream = be.stream();
+            let ins: Vec<&DeviceBuffer> = s.binds.iter().collect();
+            let out = ctx.malloc((b * sq * d * 2) as usize).unwrap();
+            s.g.run(&ins, &[&out], stream).unwrap();
+            drop(stream.synchronize());
+            let ge = download_f16(ctx, &out, (b * sq * d) as usize);
+            // host 参考：softmax(scale · q·kᵀ) · v（f32）
+            let to_m = |h: &Vec<f16>| -> Vec<Vec<Vec<f32>>> {
+                (0..b as usize)
+                    .map(|bi| {
+                        (0..sq as usize)
+                            .map(|i| (0..d as usize).map(|j| h[bi * (sq * d) as usize + i * d as usize + j].to_f32()).collect())
+                            .collect()
+                    })
+                    .collect()
+            };
+            let (qm, km, vm) = (to_m(&qh), to_m(&kh), to_m(&vh));
+            let mut md = 0f32;
+            let mut gm = 0f32;
+            for bi in 0..b as usize {
+                for i in 0..sq as usize {
+                    let mut scores = vec![0f32; sq as usize];
+                    for j in 0..sq as usize {
+                        let mut dot = 0f32;
+                        for t in 0..d as usize {
+                            dot += qm[bi][i][t] * km[bi][j][t];
+                        }
+                        scores[j] = dot * scale;
+                    }
+                    let mx = scores.iter().cloned().fold(f32::MIN, f32::max);
+                    let exps: Vec<f32> = scores.iter().map(|s2| (s2 - mx).exp()).collect();
+                    let denom: f32 = exps.iter().sum();
+                    let mut ref_row = vec![0f32; d as usize];
+                    for j in 0..sq as usize {
+                        let w = exps[j] / denom;
+                        for t in 0..d as usize {
+                            ref_row[t] += w * vm[bi][j][t];
+                        }
+                    }
+                    for t in 0..d as usize {
+                        let got = ge[bi * (sq * d) as usize + i * d as usize + t].to_f32();
+                        md = md.max((got - ref_row[t]).abs());
+                        gm = gm.max(got.abs());
+                    }
+                }
+            }
+            println!("asc numeric ({which}): ge |max|={gm:.3} max_diff={md:.5}");
+        }
+        // ma: 手工 attention（BatchMatMulV2 + SoftmaxV2 + BatchMatMulV2，
+        // 全静态 kernel）——AttentionScore 在 310P 无 kernel（asc 三变体
+        // TBE 编译崩）后的 PFA host-回调替代。scale 由调用方折进权重，
+        // 图内不做缩放。数值对 host f32 softmax 参考。
+        // ma2: GQA 变体（k/v [1,s,d] TileD 广播到 q 头数）
+        "ma" | "ma2" => {
+            let (bh, sq, d) = if which == "ma" { (48i64, 256i64, 72i64) } else { (8i64, 832i64, 256i64) };
+            let scale = 1.0f32 / (d as f32).sqrt();
+            let mut seed = 7u32;
+            // 幅度 div=60（±1.7，LN·W 后的真实量级；div=1 时 q·k 点积
+            // 溢出 fp16 → 部分 softmax 行 NaN——非算子问题）
+            let qh = rand_f16((bh * sq * d) as usize, &mut seed, 60.0);
+            let (kh, vh) = if which == "ma" {
+                (rand_f16((bh * sq * d) as usize, &mut seed, 60.0), rand_f16((bh * sq * d) as usize, &mut seed, 60.0))
+            } else {
+                (rand_f16((sq * d) as usize, &mut seed, 60.0), rand_f16((sq * d) as usize, &mut seed, 60.0))
+            };
+            // q 预乘 scale（模拟折进 qkv 权重后的输入）
+            let qh: Vec<f16> = qh.iter().map(|v| f16::from_f32(v.to_f32() * scale)).collect();
+            s.data(ctx, "q3", &[bh, sq, d], &qh);
+            let (k3, v3) = if which == "ma" {
+                let k = s.data(ctx, "k3", &[bh, sq, d], &kh);
+                let v = s.data(ctx, "v3", &[bh, sq, d], &vh);
+                (k, v)
+            } else {
+                let k1 = s.data(ctx, "k1", &[1, sq, d], &kh);
+                let v1 = s.data(ctx, "v1", &[1, sq, d], &vh);
+                let mut tile = |name: &str, src: &str| -> String {
+                    s.g.add_op(name, "TileD").unwrap();
+                    s.g.set_input_desc(name, "x", &[1, sq, d], Dtype::Fp16).unwrap();
+                    s.g.set_output_desc(name, "y", &[bh, sq, d], Dtype::Fp16).unwrap();
+                    s.g.set_attr_int_list(name, "multiples", &[bh, 1, 1]).unwrap();
+                    s.g.link(name, "x", src).unwrap();
+                    s.reg_out(name, "y")
+                };
+                (tile("kt", &k1), tile("vt", &v1))
+            };
+            // scores = bmm(q3, k3ᵀ)
+            s.g.add_op("sc", "BatchMatMulV2").unwrap();
+            s.g.set_input_desc("sc", "x1", &[bh, sq, d], Dtype::Fp16).unwrap();
+            s.g.set_input_desc("sc", "x2", &[bh, sq, d], Dtype::Fp16).unwrap();
+            s.g.set_output_desc("sc", "y", &[bh, sq, sq], Dtype::Fp16).unwrap();
+            s.g.set_attr_bool("sc", "adj_x1", false).unwrap();
+            s.g.set_attr_bool("sc", "adj_x2", true).unwrap();
+            s.wire("sc", "x1", "q3");
+            s.wire("sc", "x2", &k3);
+            let sc = s.reg_out("sc", "y");
+            // probs = softmax(scores)
+            s.g.add_op("sm", "SoftmaxV2").unwrap();
+            s.g.set_input_desc("sm", "x", &[bh, sq, sq], Dtype::Fp16).unwrap();
+            s.g.set_output_desc("sm", "y", &[bh, sq, sq], Dtype::Fp16).unwrap();
+            s.g.set_attr_int_list("sm", "axes", &[-1]).unwrap();
+            // half_to_float=true 实测输出侧异常（全 0）——false 走 fp16 内算
+            s.g.set_attr_bool("sm", "half_to_float", false).unwrap();
+            s.wire("sm", "x", &sc);
+            let sm = s.reg_out("sm", "y");
+            // out = bmm(probs, v3)
+            s.g.add_op("bm", "BatchMatMulV2").unwrap();
+            s.g.set_input_desc("bm", "x1", &[bh, sq, sq], Dtype::Fp16).unwrap();
+            s.g.set_input_desc("bm", "x2", &[bh, sq, d], Dtype::Fp16).unwrap();
+            s.g.set_output_desc("bm", "y", &[bh, sq, d], Dtype::Fp16).unwrap();
+            s.g.set_attr_bool("bm", "adj_x1", false).unwrap();
+            s.g.set_attr_bool("bm", "adj_x2", false).unwrap();
+            s.wire("bm", "x1", &sm);
+            s.wire("bm", "x2", &v3);
+            s.reg_out("bm", "y");
+            // 诊断：三级输出全绑（sc/sm/bm）逐级对拍
+            s.finish(&["sc", "sm", "bm"]);
+            let stream = be.stream();
+            let ins: Vec<&DeviceBuffer> = s.binds.iter().collect();
+            let o_sc = ctx.malloc((bh * sq * sq * 2) as usize).unwrap();
+            let o_sm = ctx.malloc((bh * sq * sq * 2) as usize).unwrap();
+            let o_bm = ctx.malloc((bh * sq * d * 2) as usize).unwrap();
+            s.g.run(&ins, &[&o_sc, &o_sm, &o_bm], stream).unwrap();
+            drop(stream.synchronize());
+            let g_sc = download_f16(ctx, &o_sc, (bh * sq * sq) as usize);
+            let g_sm = download_f16(ctx, &o_sm, (bh * sq * sq) as usize);
+            let ge = download_f16(ctx, &o_bm, (bh * sq * d) as usize);
+            // 诊断打印：scores 前 8 个（GE vs 期望按 q·kᵀ 算）
+            {
+                let qb = 0usize;
+                let mut expect = vec![0f32; 8];
+                for (j, e) in expect.iter_mut().enumerate() {
+                    let mut dot = 0f32;
+                    for t in 0..d as usize {
+                        dot += qh[qb + t].to_f32() * kh[j * d as usize + t].to_f32();
+                    }
+                    *e = dot;
+                }
+                let got: Vec<f32> = g_sc[..8].iter().map(|v| v.to_f32()).collect();
+                println!("  sc head: got={got:?} expect={expect:?}");
+                let smx: Vec<f32> = g_sm[..8].iter().map(|v| v.to_f32()).collect();
+                println!("  sm head: {smx:?}");
+                let rowsum: f32 = g_sm[..sq as usize].iter().map(|v| v.to_f32()).sum();
+                let rowmax = g_sm[..sq as usize].iter().fold(f32::MIN, |m, v| m.max(v.to_f32()));
+                let nnz = g_sm[..sq as usize].iter().filter(|v| v.to_f32() != 0.0).count();
+                println!("  sm row0: sum={rowsum:.4} max={rowmax:.4} nonzero={nnz}");
+                // bm 首行 vs 期望（one-hot → v[argmax(sc row0)] 行）
+                let argmax = g_sc[..sq as usize]
+                    .iter()
+                    .enumerate()
+                    .max_by(|a, b| a.1.to_f32().partial_cmp(&b.1.to_f32()).unwrap())
+                    .map(|(i, _)| i)
+                    .unwrap_or(0);
+                let bmh: Vec<f32> = ge[..(d as usize).min(8)].iter().map(|v| v.to_f32()).collect();
+                let exp_row: Vec<f32> = vh[argmax * d as usize..argmax * d as usize + 8.min(d as usize)]
+                    .iter()
+                    .map(|v| v.to_f32())
+                    .collect();
+                println!("  bm row0 head: got={bmh:?} expect(v[{argmax}])={exp_row:?}");
+            }
+            // host 参考（f32；q 已含 scale；k/v 广播到 [bh,s,d] 后统一索引）
+            let flat = |h: &Vec<f16>, n: usize| -> Vec<f32> { h[..n].iter().map(|v| v.to_f32()).collect() };
+            let qf = flat(&qh, (bh * sq * d) as usize);
+            let expand = |h: &Vec<f16>| -> Vec<f32> {
+                if which == "ma" {
+                    flat(h, (bh * sq * d) as usize)
+                } else {
+                    let one = flat(h, (sq * d) as usize);
+                    let mut all = Vec::with_capacity((bh * sq * d) as usize);
+                    for _ in 0..bh { all.extend_from_slice(&one); }
+                    all
+                }
+            };
+            let kf = expand(&kh);
+            let vf = expand(&vh);
+            let mut md = 0f32;
+            let mut gm = 0f32;
+            let head_base = |bi: usize, i: usize| bi * (sq * d) as usize + i * d as usize;
+            for bi in 0..bh as usize {
+                for i in 0..sq as usize {
+                    let mut scores = vec![0f32; sq as usize];
+                    for (j, sc2) in scores.iter_mut().enumerate() {
+                        let mut dot = 0f32;
+                        for t in 0..d as usize {
+                            dot += qf[head_base(bi, i) + t] * kf[head_base(bi, j) + t];
+                        }
+                        *sc2 = dot;
+                    }
+                    let mx = scores.iter().cloned().fold(f32::MIN, f32::max);
+                    let exps: Vec<f32> = scores.iter().map(|x| (x - mx).exp()).collect();
+                    let denom: f32 = exps.iter().sum();
+                    let mut ref_row = vec![0f32; d as usize];
+                    for j in 0..sq as usize {
+                        let w = exps[j] / denom;
+                        for t in 0..d as usize {
+                            ref_row[t] += w * vf[head_base(bi, j) + t];
+                        }
+                    }
+                    for t in 0..d as usize {
+                        let got = ge[head_base(bi, i) + t].to_f32();
+                        md = md.max((got - ref_row[t]).abs());
+                        gm = gm.max(got.abs());
+                    }
+                }
+            }
+            println!("ma numeric ({which}): ge |max|={gm:.3} max_diff={md:.5}");
+        }
+        // bc4: bias 链（TileD 行复制 + Add）在大 shape 的数值验证——
+        // [768,4304]（fc1b）与 [768,3456]（qkvb）对 eager aclnnBiasAdd
+        "bc4" => {
+            let (rows, cols) = (768i64, 4304i64);
+            let mut seed = 9u32;
+            let xh = rand_f16((rows * cols) as usize, &mut seed, 30.0);
+            let bh = rand_f16(cols as usize, &mut seed, 12000.0);
+            s.data(ctx, "x", &[rows, cols], &xh);
+            s.data(ctx, "b", &[1, cols], &bh);
+            let y = s.bias("op", "x", &[rows, cols], "b");
+            s.finish(&[&y]);
+            let stream = be.stream();
+            let ins: Vec<&DeviceBuffer> = s.binds.iter().collect();
+            let out = ctx.malloc((rows * cols * 2) as usize).unwrap();
+            s.g.run(&ins, &[&out], stream).unwrap();
+            drop(stream.synchronize());
+            let ge = download_f16(ctx, &out, (rows * cols) as usize);
+            let refb = upload(ctx, &bh);
+            let er = aops::bias_add_fp16(ctx, stream, &s.binds[0], &refb, rows, cols).unwrap();
+            drop(stream.synchronize());
+            let ef = download_f16(ctx, &er, (rows * cols) as usize);
+            let mut md = 0f32;
+            let mut gm = 0f32;
+            for (a, b) in ge.iter().zip(&ef) {
+                md = md.max((a.to_f32() - b.to_f32()).abs());
+                gm = gm.max(a.to_f32().abs());
+            }
+            println!("bc4 numeric: ge |max|={gm:.3} max_diff={md:.5}");
+        }
+        other => panic!("GEB_OPTEST: ...|v3n|tldn|lnv4c|asc*|ma*|bc4, got {other}"),
     }
     println!("OPTEST_{which}_OK");
     ge_builder::fini().expect("fini");
