@@ -33,7 +33,8 @@
 //!   GEB_LOAD=...（缓存加载替代编译）
 //! 环境变量：GEB_SEG（默认 prefix）/ GEB_DEPTH（层深覆盖，冒烟用）/
 //!   GEB_TOKENS（prefix token 数，默认 64 → P=832，16 倍数纪律）/
-//!   GEB_BENCH / GEB_SAVE / GEB_LOAD
+//!   GEB_BENCH / GEB_SAVE / GEB_LOAD / GEB_ATTN=manual（手工 attention）/
+//!   GEB_QKV3=1（q/k/v 独立投影，消 SliceD 视图运行时物化）
 use half::f16;
 
 use apxinf_ascend::ge_builder::{self, Dtype, GeGraph};
@@ -573,6 +574,27 @@ impl Seg {
         (kr, kr3)
     }
 
+    /// flat 版 rope（无列切）：[t, wd] → Reshape[t*2, half] →
+    /// GatherV2D(相邻行 swap，idx 为 Const) → mul+mul+add → Reshape back。
+    /// 表 = 段级 flat cos/sin 输入（eager flat 版同款布局）。替代
+    /// rope2 的 slice2×2+ConcatD——列切视图触发运行时 MemcopyAsync 物化
+    /// （同 qkv 切分病；GatherV2D 310P 仅 axis=0，故换 flat 视图做行交换）
+    fn rope2_flat(
+        &mut self, tag: &str, x: &str, dims: &[i64; 2], fdims: &[i64; 2],
+        cos_f: &str, sin_f: &str, idx_c: &str, shp_flat: &str, shp_back: &str,
+        shp3: &str,
+    ) -> (String, String) {
+        let (t, wd) = (dims[0], dims[1]);
+        let xf = self.reshape(&format!("{tag}_xf"), x, dims, shp_flat, fdims);
+        let sw = self.gather_rows(&format!("{tag}_sw"), &xf, fdims, idx_c);
+        let m1 = self.mul2(&format!("{tag}_m1"), &xf, cos_f, fdims);
+        let m2 = self.mul2(&format!("{tag}_m2"), &sw, sin_f, fdims);
+        let ad = self.add2(&format!("{tag}_ad"), &m1, &m2, fdims);
+        let kr = self.reshape(&format!("{tag}_bk"), &ad, fdims, shp_back, dims);
+        let kr3 = self.reshape(&format!("{tag}_3"), &kr, dims, shp3, &[1, t, wd]);
+        (kr, kr3)
+    }
+
     /// ada-norm：y = rms(x)·scale + shift = AddRmsNorm(x, zeros, gamma=scale)
     /// + TileD(shift_row) + Add（BroadcastToD 310P 编译崩，换 TileD）
     fn ada(&mut self, name: &str, x: &str, zeros: &str, scale: &str, shift: &str, dims: &[i64]) -> String {
@@ -923,12 +945,17 @@ fn seg_vision(be: &AscendBackend, bench: bool) {
     // ~20ms/层停顿，见 C2 性能攻坚 profile 取证）
     let attn_manual = std::env::var("GEB_ATTN").map(|v| v == "manual").unwrap_or(false);
     let vscale = if attn_manual { 1.0f32 / (V_HD as f32).sqrt() } else { 1.0 };
+    // GEB_QKV3：q/k/v 独立投影（3×mm + 独立权重输入），替代融合 qkv mm +
+    // SliceD×3。msprof 取证（C2 攻坚第二轮）：切片视图下游（TransposeD/
+    // PFA）每层触发 3 次运行时 MemcopyAsync 物化（~1.77MB/次）+ 每次前
+    // ~4.5-12ms host 停顿 = vision ~450ms 空隙的主源（81 次/执行）
+    let qkv3 = std::env::var("GEB_QKV3").is_ok();
     let mut seed = 0xC0DEu32;
     let mut s = Seg::new("ge_vision");
 
     // ---- 段级输入（注册序 = eager 的 index 约定）----
     // 0 patches / 1 patch_wt / 2 patch_b / 3 pos_rep / 4 zeros /
-    // 5 shp_qkv3 / 6 shp_flat2 / 每层 12 项 / 尾 4 项(pnw,pnb,projwt,projb)
+    // 5 shp_qkv3 / 6 shp_flat2 / 每层 12 项（GEB_QKV3: 16 项）/ 尾 4 项(pnw,pnb,projwt,projb)
     s.data(ctx, "patches", &[t, V_PATCH_W], &rand_f16((t * V_PATCH_W) as usize, &mut seed, 300.0));
     {
         let host = rand_f16((V_PATCH_W * VW) as usize, &mut seed, 30000.0);
@@ -994,15 +1021,6 @@ fn seg_vision(be: &AscendBackend, bench: bool) {
             } else {
                 wq.clone()
             };
-            let mut fused = Vec::with_capacity((VW * qkvw) as usize);
-            for r in 0..VW as usize {
-                let base = r * vqd as usize;
-                fused.extend_from_slice(&wq_s[base..base + vqd as usize]);
-                fused.extend_from_slice(&wk[base..base + vqd as usize]);
-                fused.extend_from_slice(&wv[base..base + vqd as usize]);
-            }
-            let b = wbuf_t(ctx, &fused, VW, qkvw);
-            s.data_buf(&format!("{}qkvwt", p), &[qkvw, VW], b);
             let bias = rand_f16(qkvw as usize, &mut seed, 12000.0);
             let bias_s: Vec<f16> = if attn_manual {
                 bias.iter()
@@ -1012,7 +1030,30 @@ fn seg_vision(be: &AscendBackend, bench: bool) {
             } else {
                 bias.clone()
             };
-            s.data(ctx, &format!("{}qkvb", p), &[1, qkvw], &bias_s);
+            if qkv3 {
+                // 独立权重/bias 输入（host 切一次，免运行时物化）；
+                // wq_s/bias_s 已含 manual attention 的 vscale 折叠。
+                // qkv3 下不注册融合 qkvwt/qkvb（图无消费者，GE 可能将其
+                // 从模型输入中消除 → dataset 错位）——层内输入位次
+                // 2..8，eager 闭包按 qkv3 偏移读
+                s.data_buf(&format!("{}qw", p), &[vqd, VW], wbuf_t(ctx, &wq_s, VW, vqd));
+                s.data_buf(&format!("{}kw", p), &[vqd, VW], wbuf_t(ctx, &wk, VW, vqd));
+                s.data_buf(&format!("{}vw", p), &[vqd, VW], wbuf_t(ctx, &wv, VW, vqd));
+                s.data(ctx, &format!("{}qb", p), &[1, vqd], &bias_s[..vqd as usize]);
+                s.data(ctx, &format!("{}kb", p), &[1, vqd], &bias_s[vqd as usize..2 * vqd as usize]);
+                s.data(ctx, &format!("{}vb", p), &[1, vqd], &bias_s[2 * vqd as usize..]);
+            } else {
+                let mut fused = Vec::with_capacity((VW * qkvw) as usize);
+                for r in 0..VW as usize {
+                    let base = r * vqd as usize;
+                    fused.extend_from_slice(&wq_s[base..base + vqd as usize]);
+                    fused.extend_from_slice(&wk[base..base + vqd as usize]);
+                    fused.extend_from_slice(&wv[base..base + vqd as usize]);
+                }
+                let b = wbuf_t(ctx, &fused, VW, qkvw);
+                s.data_buf(&format!("{}qkvwt", p), &[qkvw, VW], b);
+                s.data(ctx, &format!("{}qkvb", p), &[1, qkvw], &bias_s);
+            }
             let bq = upload(ctx, &bias[0..vqd as usize]);
             let bk = upload(ctx, &bias[vqd as usize..2 * vqd as usize]);
             let bv = upload(ctx, &bias[2 * vqd as usize..]);
@@ -1048,11 +1089,24 @@ fn seg_vision(be: &AscendBackend, bench: bool) {
         // attention（v3 方案：rank-2 列切 → Reshape rank-3 桥）。
         // manual：[b*h,s,d] 桥 + bmm/softmax/bmm（全静态）；pfa：batch PFA
         let ln1 = s.addln(&format!("{}ln1", p), &cur, &format!("{}n1w", p), &format!("{}n1b", p), "nsh", &[t, VW]);
-        let qkv = s.mm(&format!("{}qkv", p), &ln1, &[t, VW], &format!("{}qkvwt", p), &[qkvw, VW], &[t, qkvw]);
-        let qkvb = s.bias(&format!("{}qkvb", p), &qkv, &[t, qkvw], &format!("{}qkvb", p));
-        let q2 = s.slice2(&format!("{}q2", p), &qkvb, &[t, qkvw], 0, vqd);
-        let k2 = s.slice2(&format!("{}k2", p), &qkvb, &[t, qkvw], vqd, vqd);
-        let v2 = s.slice2(&format!("{}v2", p), &qkvb, &[t, qkvw], vqd * 2, vqd);
+        let (q2, k2, v2, _qdbg) = if qkv3 {
+            let qm = s.mm(&format!("{}qm", p), &ln1, &[t, VW], &format!("{}qw", p), &[vqd, VW], &[t, vqd]);
+            let km = s.mm(&format!("{}km", p), &ln1, &[t, VW], &format!("{}kw", p), &[vqd, VW], &[t, vqd]);
+            let vm = s.mm(&format!("{}vm", p), &ln1, &[t, VW], &format!("{}vw", p), &[vqd, VW], &[t, vqd]);
+            let qb = s.bias(&format!("{}qb_", p), &qm, &[t, vqd], &format!("{}qb", p));
+            let kb = s.bias(&format!("{}kb_", p), &km, &[t, vqd], &format!("{}kb", p));
+            let vb = s.bias(&format!("{}vb_", p), &vm, &[t, vqd], &format!("{}vb", p));
+            let qdbg = qb.clone();
+            (qb, kb, vb, qdbg)
+        } else {
+            let qkv = s.mm(&format!("{}qkv", p), &ln1, &[t, VW], &format!("{}qkvwt", p), &[qkvw, VW], &[t, qkvw]);
+            let qkvb = s.bias(&format!("{}qkvb", p), &qkv, &[t, qkvw], &format!("{}qkvb", p));
+            let q2 = s.slice2(&format!("{}q2", p), &qkvb, &[t, qkvw], 0, vqd);
+            let k2 = s.slice2(&format!("{}k2", p), &qkvb, &[t, qkvw], vqd, vqd);
+            let v2 = s.slice2(&format!("{}v2", p), &qkvb, &[t, qkvw], vqd * 2, vqd);
+            let qdbg = qkvb.clone();
+            (q2, k2, v2, qdbg)
+        };
         let attn = if attn_manual {
             // 头主序桥（headsplit：Reshape[3,256,16,72]→TransposeD(0,2,1,3)
             // →Reshape[48,256,72]）——直接 Reshape 是错排
@@ -1088,7 +1142,7 @@ fn seg_vision(be: &AscendBackend, bench: bool) {
             // ⚠ attn（bmm/PFA 输出）及其直接下游（proj mm）绑图输出时 desc
             // 动态（[-1,-1,-1] / [-1,1152]，size ~1e18 → malloc 崩）——
             // 动态 desc 只传一层；res1 起恢复静态
-            for st in [&ln1, &qkvb, &res1, &ln2, &fc1b, &act, &fc2b, &cur] {
+            for st in [&ln1, &_qdbg, &res1, &ln2, &fc1b, &act, &fc2b, &cur] {
                 dbg_outs.push(st.clone());
             }
         }
@@ -1142,7 +1196,10 @@ fn seg_vision(be: &AscendBackend, bench: bool) {
         mx("emb", &h);
         let zeros = &b[4];
         for li in 0..depth {
-            let w = &b[layer_bases[li]..layer_bases[li] + 12];
+            // qkv3 层内输入布局：n1w,n1b,qw,kw,vw,qb,kb,vb,outwt,outb,
+            // n2w,n2b,fc1wt,fc1b,fc2wt,fc2b（16 项）；默认 12 项
+            let w = &b[layer_bases[li]..layer_bases[li] + if qkv3 { 16 } else { 12 }];
+            let (ow, ob, f1w, f1b, f2w, f2b) = if qkv3 { (8, 9, 12, 13, 14, 15) } else { (4, 5, 8, 9, 10, 11) };
             let (wq, wk, wv, bq, bk, bv) = &eager_qkv[li];
             let (n1w_h, n1b_h, n2w_h, n2b_h) = &eager_norms[li];
             let normed = host_ln(ctx, stream, &h, n1w_h, n1b_h, t, VW);
@@ -1156,19 +1213,19 @@ fn seg_vision(be: &AscendBackend, bench: bool) {
             let attn = aops::prompt_flash_attention_bsh_batch_fp16(
                 ctx, stream, &q, &k, &v, VIEWS, VPV, V_HEADS, V_HEADS, V_HD, None).unwrap();
             mx(&format!("l{li} attn"), &attn);
-            let proj = aops::matmul_b_t_fp16(ctx, stream, &attn, [t, vqd], &w[4], vqd, VW).unwrap();
-            let proj = aops::bias_add_fp16(ctx, stream, &proj, &w[5], t, VW).unwrap();
+            let proj = aops::matmul_b_t_fp16(ctx, stream, &attn, [t, vqd], &w[ow], vqd, VW).unwrap();
+            let proj = aops::bias_add_fp16(ctx, stream, &proj, &w[ob], t, VW).unwrap();
             let res1 = aops::add_fp16(ctx, stream, &proj, &h, &[t, VW]).unwrap();
             mx(&format!("l{li} res1"), &res1);
             let norm2 = host_ln(ctx, stream, &res1, n2w_h, n2b_h, t, VW);
             mx(&format!("l{li} ln2"), &norm2);
-            let act = aops::matmul_b_t_fp16(ctx, stream, &norm2, [t, VW], &w[8], VW, V_INTER).unwrap();
-            let act = aops::bias_add_fp16(ctx, stream, &act, &w[9], t, V_INTER).unwrap();
+            let act = aops::matmul_b_t_fp16(ctx, stream, &norm2, [t, VW], &w[f1w], VW, V_INTER).unwrap();
+            let act = aops::bias_add_fp16(ctx, stream, &act, &w[f1b], t, V_INTER).unwrap();
             mx(&format!("l{li} fc1b"), &act);
             let act = aops::gelu_fp16(ctx, stream, &act, &[t, V_INTER], false).unwrap();
             mx(&format!("l{li} act"), &act);
-            let out = aops::matmul_b_t_fp16(ctx, stream, &act, [t, V_INTER], &w[10], V_INTER, VW).unwrap();
-            let out = aops::bias_add_fp16(ctx, stream, &out, &w[11], t, VW).unwrap();
+            let out = aops::matmul_b_t_fp16(ctx, stream, &act, [t, V_INTER], &w[f2w], V_INTER, VW).unwrap();
+            let out = aops::bias_add_fp16(ctx, stream, &out, &w[f2b], t, VW).unwrap();
             h = aops::add_fp16(ctx, stream, &out, &res1, &[t, VW]).unwrap();
             mx(&format!("l{li} out"), &h);
         }
@@ -1202,6 +1259,14 @@ fn seg_prefix(be: &AscendBackend, bench: bool) {
     let tokens = envi("GEB_TOKENS", 64);
     let p = VT + tokens; // prefix 长度（16 倍数纪律）
     let mut seed = 0xBEEFu32;
+    // GEB_QKV3：q/k/v 独立投影（同 vision 段——SliceD 列切视图的运行时
+    // MemcopyAsync 物化是 prefix 750ms 的主源，取证见 vision 段注记）
+    let qkv3 = std::env::var("GEB_QKV3").is_ok();
+    // GEB_ATTN=manual：手工 GQA attention（bmm+softmax+bmm + k/v TileD 广播）
+    // 替代 PFA——PFA 是 transformer-API 型算子，静态 OM 内走 host launcher
+    // （每次执行 host tiling + staging）。scale 由 pscale 折进 q 权重/bias
+    let attn_manual = std::env::var("GEB_ATTN").map(|v| v == "manual").unwrap_or(false);
+    let pscale = if attn_manual { 1.0f32 / (HD as f32).sqrt() } else { 1.0 };
     let mut s = Seg::new("ge_prefix");
 
     // ---- 段级输入 ----
@@ -1230,6 +1295,19 @@ fn seg_prefix(be: &AscendBackend, bench: bool) {
     s.const_i32("shp_q3", &[1, p as i32, QD as i32]);
     s.const_i32("shp_k3", &[1, p as i32, KVD as i32]);
     s.const_i32("shp_v3", &[1, p as i32, KVD as i32]);
+    // 手工 GQA attention 的头主序桥 shape（headsplit/headmerge 用，views=1）
+    s.const_i32("shp_mq4", &[1, p as i32, HEADS as i32, HD as i32]);
+    s.const_i32("shp_mq3", &[HEADS as i32, p as i32, HD as i32]);
+    s.const_i32("shp_ma4", &[1, HEADS as i32, p as i32, HD as i32]);
+    s.const_i32("shp_mflat", &[p as i32, QD as i32]);
+    // GEB_ROPEFLAT：flat 版 rope（换视图行交换，免列切视图物化）。
+    // swap 索引做 Const（编译期折叠；Data indices 会让输出 desc unknown）
+    let ropeflat = std::env::var("GEB_ROPEFLAT").is_ok();
+    s.const_i32("qswap_c", &qi);
+    s.const_i32("kswap_c", &ki);
+    s.const_i32("shp_qflat", &[qf.0 as i32, qf.1 as i32]);
+    s.const_i32("shp_kflat", &[kf.0 as i32, kf.1 as i32]);
+    s.const_i32("shp_kb2", &[p as i32, KVD as i32]);
 
     // ---- 层循环（eager qkv 独立投影，同 vision 段注记）----
     let mut eager_qkv: Vec<(DeviceBuffer, DeviceBuffer, DeviceBuffer, DeviceBuffer, DeviceBuffer, DeviceBuffer)> = Vec::new();
@@ -1246,18 +1324,41 @@ fn seg_prefix(be: &AscendBackend, bench: bool) {
             let wq = rand_f16((PW * QD) as usize, &mut seed, 8000.0);
             let wk = rand_f16((PW * KVD) as usize, &mut seed, 8000.0);
             let wv = rand_f16((PW * KVD) as usize, &mut seed, 8000.0);
-            let mut fused = Vec::with_capacity((PW * QKVW) as usize);
-            for r in 0..PW as usize {
-                let rb = r * QD as usize;
-                fused.extend_from_slice(&wq[rb..rb + QD as usize]);
-                let rb = r * KVD as usize;
-                fused.extend_from_slice(&wk[rb..rb + KVD as usize]);
-                fused.extend_from_slice(&wv[rb..rb + KVD as usize]);
-            }
-            let b = wbuf_t(ctx, &fused, PW, QKVW);
-            s.data_buf(&format!("{}qkvwt", tag), &[QKVW, PW], b);
             let bias = rand_f16(QKVW as usize, &mut seed, 4000.0);
-            s.data(ctx, &format!("{}qkvb", tag), &[1, QKVW], &bias);
+            // manual attention：q 块（权重+bias）预乘 1/√hd（图内无 scale
+            // 算子）；eager 侧保持原值（PFA scale_value 承担）
+            let wq_s: Vec<f16> = if attn_manual {
+                wq.iter().map(|v| f16::from_f32(v.to_f32() * pscale)).collect()
+            } else {
+                wq.clone()
+            };
+            let mut bias_s = bias.clone();
+            if attn_manual {
+                for v in bias_s[..QD as usize].iter_mut() {
+                    *v = f16::from_f32(v.to_f32() * pscale);
+                }
+            }
+            if qkv3 {
+                // qkv3 层内输入位次 1..7（g1 之后）；eager 按 qkv3 偏移读
+                s.data_buf(&format!("{}qw", tag), &[QD, PW], wbuf_t(ctx, &wq_s, PW, QD));
+                s.data_buf(&format!("{}kw", tag), &[KVD, PW], wbuf_t(ctx, &wk, PW, KVD));
+                s.data_buf(&format!("{}vw", tag), &[KVD, PW], wbuf_t(ctx, &wv, PW, KVD));
+                s.data(ctx, &format!("{}qb", tag), &[1, QD], &bias_s[..QD as usize]);
+                s.data(ctx, &format!("{}kb", tag), &[1, KVD], &bias_s[QD as usize..(QD + KVD) as usize]);
+                s.data(ctx, &format!("{}vb", tag), &[1, KVD], &bias_s[(QD + KVD) as usize..]);
+            } else {
+                let mut fused = Vec::with_capacity((PW * QKVW) as usize);
+                for r in 0..PW as usize {
+                    let rb = r * QD as usize;
+                    fused.extend_from_slice(&wq_s[rb..rb + QD as usize]);
+                    let rb = r * KVD as usize;
+                    fused.extend_from_slice(&wk[rb..rb + KVD as usize]);
+                    fused.extend_from_slice(&wv[rb..rb + KVD as usize]);
+                }
+                let b = wbuf_t(ctx, &fused, PW, QKVW);
+                s.data_buf(&format!("{}qkvwt", tag), &[QKVW, PW], b);
+                s.data(ctx, &format!("{}qkvb", tag), &[1, QKVW], &bias_s);
+            }
             let bq = upload(ctx, &bias[0..QD as usize]);
             let bk = upload(ctx, &bias[QD as usize..(QD + KVD) as usize]);
             let bv = upload(ctx, &bias[(QD + KVD) as usize..]);
@@ -1291,24 +1392,52 @@ fn seg_prefix(be: &AscendBackend, bench: bool) {
         s.data(ctx, &format!("{}downb", tag), &[1, PW], &rand_f16(PW as usize, &mut seed, 4000.0));
 
         let norm1 = s.addrms(&format!("{}n1", tag), &cur, "zeros", &format!("{}g1", tag), &[p, PW]);
-        let qkv = s.mm(&format!("{}qkv", tag), &norm1, &[p, PW], &format!("{}qkvwt", tag), &[QKVW, PW], &[p, QKVW]);
-        let qkvb = s.bias(&format!("{}qkvb", tag), &qkv, &[p, QKVW], &format!("{}qkvb", tag));
-        // rank-2 列切 + rope（rank-2 版）+ Reshape rank-3 桥。
+        // rank-2 切分 + rope（rank-2 版）+ Reshape rank-3 桥。
         // ⚠ 图输出绑 rank-2（rope 的 ad / slice 的 v）——Reshape 输出绑图
         // 输出时 desc 是动态 [-1,-1,-1]（shape 张量驱动），size 无效
-        let q2 = s.slice2(&format!("{}q", tag), &qkvb, &[p, QKVW], 0, QD);
-        let k2 = s.slice2(&format!("{}k", tag), &qkvb, &[p, QKVW], QD, KVD);
-        let v2 = s.slice2(&format!("{}v", tag), &qkvb, &[p, QKVW], QD + KVD, KVD);
-        let (kr2, kr3) = s.rope2(&format!("{}kr", tag), &k2, &[p, KVD], "kcos2", "ksin2", "shp_k3");
+        let (q2, k2, v2) = if qkv3 {
+            let qm = s.mm(&format!("{}qm", tag), &norm1, &[p, PW], &format!("{}qw", tag), &[QD, PW], &[p, QD]);
+            let km = s.mm(&format!("{}km", tag), &norm1, &[p, PW], &format!("{}kw", tag), &[KVD, PW], &[p, KVD]);
+            let vm = s.mm(&format!("{}vm", tag), &norm1, &[p, PW], &format!("{}vw", tag), &[KVD, PW], &[p, KVD]);
+            let qb = s.bias(&format!("{}qb_", tag), &qm, &[p, QD], &format!("{}qb", tag));
+            let kb = s.bias(&format!("{}kb_", tag), &km, &[p, KVD], &format!("{}kb", tag));
+            let vb = s.bias(&format!("{}vb_", tag), &vm, &[p, KVD], &format!("{}vb", tag));
+            (qb, kb, vb)
+        } else {
+            let qkv = s.mm(&format!("{}qkv", tag), &norm1, &[p, PW], &format!("{}qkvwt", tag), &[QKVW, PW], &[p, QKVW]);
+            let qkvb = s.bias(&format!("{}qkvb", tag), &qkv, &[p, QKVW], &format!("{}qkvb", tag));
+            let q2 = s.slice2(&format!("{}q", tag), &qkvb, &[p, QKVW], 0, QD);
+            let k2 = s.slice2(&format!("{}k", tag), &qkvb, &[p, QKVW], QD, KVD);
+            let v2 = s.slice2(&format!("{}v", tag), &qkvb, &[p, QKVW], QD + KVD, KVD);
+            (q2, k2, v2)
+        };
+        let (kr2, kr3) = if ropeflat {
+            let kf2 = [kf.0, kf.1];
+            s.rope2_flat(&format!("{}kr", tag), &k2, &[p, KVD], &kf2, "kcos", "ksin", "kswap_c", "shp_kflat", "shp_kb2", "shp_k3")
+        } else {
+            s.rope2(&format!("{}kr", tag), &k2, &[p, KVD], "kcos2", "ksin2", "shp_k3")
+        };
         let v3 = s.reshape(&format!("{}v3", tag), &v2, &[p, KVD], "shp_v3", &[1, p, KVD]);
         kv_outs.push(kr2.clone());
         kv_outs.push(v2.clone());
         if last {
             break; // 末层无 PFA/tail（compute_tail=false）
         }
-        let (_, qr3) = s.rope2(&format!("{}qr", tag), &q2, &[p, QD], "qcos2", "qsin2", "shp_q3");
-        let pfa = s.pfa(&format!("{}pfa", tag), &qr3, &kr3, &v3, &[1, p, QD], &[1, p, KVD], HEADS, KV_HEADS, HD);
-        let sq = s.squeeze(&format!("{}sq", tag), &pfa, &[1, p, QD], &[p, QD]);
+        let (qr2, qr3) = if ropeflat {
+            let qf2 = [qf.0, qf.1];
+            s.rope2_flat(&format!("{}qr", tag), &q2, &[p, QD], &qf2, "qcos", "qsin", "qswap_c", "shp_qflat", "shp_mflat", "shp_q3")
+        } else {
+            s.rope2(&format!("{}qr", tag), &q2, &[p, QD], "qcos2", "qsin2", "shp_q3")
+        };
+        let sq = if attn_manual {
+            // 头主序桥 + GQA 手工链（k/v 单头 TileD 广播；kr3/v3 rank-3 直用）
+            let q3 = s.headsplit(&format!("{}qh", tag), &qr2, p, 1, p, HEADS, HD, "shp_mq4", "shp_mq3");
+            let attn = s.attn_manual_gqa(&format!("{}attn", tag), &q3, &kr3, &v3, HEADS, p, p, HD);
+            s.headmerge(&format!("{}am", tag), &attn, 1, p, HEADS, HD, "shp_ma4", "shp_mflat")
+        } else {
+            let pfa = s.pfa(&format!("{}pfa", tag), &qr3, &kr3, &v3, &[1, p, QD], &[1, p, KVD], HEADS, KV_HEADS, HD);
+            s.squeeze(&format!("{}sq", tag), &pfa, &[1, p, QD], &[p, QD])
+        };
         let proj = s.mm(&format!("{}proj", tag), &sq, &[p, QD], &format!("{}outwt", tag), &[PW, QD], &[p, PW]);
         let projb = s.bias(&format!("{}projb", tag), &proj, &[p, PW], &format!("{}outb", tag));
         let res = s.add2(&format!("{}res", tag), &projb, &cur, &[p, PW]);
@@ -1333,7 +1462,10 @@ fn seg_prefix(be: &AscendBackend, bench: bool) {
         let mut h: Option<DeviceBuffer> = None;
         let mut outs = Vec::with_capacity(kv_count);
         for li in 0..depth {
-            let w = &b[layer_bases2[li]..layer_bases2[li] + 10];
+            // qkv3 层内输入布局：g1,qw,kw,vw,qb,kb,vb,outwt,outb,g2,
+            // gatewt,upwt,downwt,downb（14 项）；默认 10 项
+            let w = &b[layer_bases2[li]..layer_bases2[li] + if qkv3 { 14 } else { 10 }];
+            let (ow, ob, g2, gw, uw, dw, db) = if qkv3 { (7, 8, 9, 10, 11, 12, 13) } else { (3, 4, 5, 6, 7, 8, 9) };
             let hb: &DeviceBuffer = h.as_ref().unwrap_or(&b[0]);
             let (wq, wk, wv, bq, bk, bv) = &eager_qkv[li];
             let normed = aops::add_rms_norm_fp16(ctx, stream, hb, zeros, &w[0], &[p, PW], RMS_EPS).unwrap().0;
@@ -1354,16 +1486,16 @@ fn seg_prefix(be: &AscendBackend, bench: bool) {
                 ctx, stream, &qr, &kr, &v, p, HEADS, KV_HEADS, HD, None).unwrap();
             outs.push(kr);
             outs.push(v);
-            let proj = aops::matmul_b_t_fp16(ctx, stream, &attn, [p, QD], &w[3], QD, PW).unwrap();
-            let biased = aops::bias_add_fp16(ctx, stream, &proj, &w[4], p, PW).unwrap();
+            let proj = aops::matmul_b_t_fp16(ctx, stream, &attn, [p, QD], &w[ow], QD, PW).unwrap();
+            let biased = aops::bias_add_fp16(ctx, stream, &proj, &w[ob], p, PW).unwrap();
             let res = aops::add_fp16(ctx, stream, &biased, hb, &[p, PW]).unwrap();
-            let norm2 = aops::add_rms_norm_fp16(ctx, stream, &res, zeros, &w[5], &[p, PW], RMS_EPS).unwrap().0;
-            let gate = aops::matmul_b_t_fp16(ctx, stream, &norm2, [p, PW], &w[6], PW, INTER).unwrap();
-            let up = aops::matmul_b_t_fp16(ctx, stream, &norm2, [p, PW], &w[7], PW, INTER).unwrap();
+            let norm2 = aops::add_rms_norm_fp16(ctx, stream, &res, zeros, &w[g2], &[p, PW], RMS_EPS).unwrap().0;
+            let gate = aops::matmul_b_t_fp16(ctx, stream, &norm2, [p, PW], &w[gw], PW, INTER).unwrap();
+            let up = aops::matmul_b_t_fp16(ctx, stream, &norm2, [p, PW], &w[uw], PW, INTER).unwrap();
             let g = aops::gelu_fp16(ctx, stream, &gate, &[p, INTER], true).unwrap();
             let act = aops::mul_fp16(ctx, stream, &g, &up, &[p, INTER]).unwrap();
-            let down = aops::matmul_b_t_fp16(ctx, stream, &act, [p, INTER], &w[8], INTER, PW).unwrap();
-            let downb = aops::bias_add_fp16(ctx, stream, &down, &w[9], p, PW).unwrap();
+            let down = aops::matmul_b_t_fp16(ctx, stream, &act, [p, INTER], &w[dw], INTER, PW).unwrap();
+            let downb = aops::bias_add_fp16(ctx, stream, &down, &w[db], p, PW).unwrap();
             h = Some(aops::add_fp16(ctx, stream, &downb, &res, &[p, PW]).unwrap());
         }
         // 中间量 drop 前 kernel 必须落定（同 vision 段注记）
@@ -1390,6 +1522,13 @@ fn seg_flow(be: &AscendBackend, bench: bool) {
     let tokens = envi("GEB_TOKENS", 64);
     let p = VT + tokens;
     let mut seed = 0xF00Du32;
+    // 同 vision/prefix 段三件套（取证见各段注记）：q/k/v 独立投影 /
+    // flat rope（免列切物化）/ 手工 cross-GQA attention（免 PFA host
+    // launcher）。scale 折进 q 权重/bias
+    let qkv3 = std::env::var("GEB_QKV3").is_ok();
+    let ropeflat = std::env::var("GEB_ROPEFLAT").is_ok();
+    let attn_manual = std::env::var("GEB_ATTN").map(|v| v == "manual").unwrap_or(false);
+    let fscale = if attn_manual { 1.0f32 / (HD as f32).sqrt() } else { 1.0 };
     let mut s = Seg::new("ge_flow");
 
     // ---- 段级输入（注册序，两遍式：先全部注册再建图——层 i 的 next
@@ -1420,6 +1559,16 @@ fn seg_flow(be: &AscendBackend, bench: bool) {
     s.const_i32("shp_k3", &[1, HOR as i32, KVD as i32]);
     s.const_i32("shp_v3", &[1, HOR as i32, KVD as i32]);
     s.const_i32("shp_kall", &[1, (p + HOR) as i32, KVD as i32]);
+    // ropeflat / manual cross-attention 常量（swap 索引 Const 折叠）
+    s.const_i32("qswap_c", &qi);
+    s.const_i32("kswap_c", &ki);
+    s.const_i32("shp_qflat", &[qf.0 as i32, qf.1 as i32]);
+    s.const_i32("shp_kflat", &[kf.0 as i32, kf.1 as i32]);
+    s.const_i32("shp_fbq", &[HOR as i32, QD as i32]);
+    s.const_i32("shp_fbk", &[HOR as i32, KVD as i32]);
+    s.const_i32("shp_fq4", &[1, HOR as i32, HEADS as i32, HD as i32]);
+    s.const_i32("shp_fq3", &[HEADS as i32, HOR as i32, HD as i32]);
+    s.const_i32("shp_fa4", &[1, HEADS as i32, HOR as i32, HD as i32]);
     {
         let host = rand_f16((ADIM * AW) as usize, &mut seed, 8000.0);
         let b = wbuf_t(ctx, &host, ADIM, AW);
@@ -1431,8 +1580,8 @@ fn seg_flow(be: &AscendBackend, bench: bool) {
         s.data(ctx, &format!("pk{i}"), &[p, KVD], &rand_f16((p * KVD) as usize, &mut seed, 100.0));
         s.data(ctx, &format!("pv{i}"), &[p, KVD], &rand_f16((p * KVD) as usize, &mut seed, 100.0));
     }
-    // 层权重 12 项：ascl ash qkvwt qkvb outwt outb mscl msh gatewt upwt downwt downb
-    //（eager qkv 独立投影，同 vision 段注记）
+    // 层权重 12 项（GEB_QKV3: 16 项）：ascl ash [qkvwt qkvb | qw kw vw qb
+    // kb vb] outwt outb mscl msh gatewt upwt downwt downb（eager qkv 独立投影）
     let mut eager_qkv: Vec<(DeviceBuffer, DeviceBuffer, DeviceBuffer, DeviceBuffer, DeviceBuffer, DeviceBuffer)> = Vec::new();
     let mut layer_bases = Vec::with_capacity(depth);
     for i in 0..depth {
@@ -1444,18 +1593,40 @@ fn seg_flow(be: &AscendBackend, bench: bool) {
             let wq = rand_f16((AW * QD) as usize, &mut seed, 8000.0);
             let wk = rand_f16((AW * KVD) as usize, &mut seed, 8000.0);
             let wv = rand_f16((AW * KVD) as usize, &mut seed, 8000.0);
-            let mut fused = Vec::with_capacity((AW * QKVW) as usize);
-            for r in 0..AW as usize {
-                let rb = r * QD as usize;
-                fused.extend_from_slice(&wq[rb..rb + QD as usize]);
-                let rb = r * KVD as usize;
-                fused.extend_from_slice(&wk[rb..rb + KVD as usize]);
-                fused.extend_from_slice(&wv[rb..rb + KVD as usize]);
-            }
-            let b = wbuf_t(ctx, &fused, AW, QKVW);
-            s.data_buf(&format!("{}qkvwt", tag), &[QKVW, AW], b);
             let bias = rand_f16(QKVW as usize, &mut seed, 4000.0);
-            s.data(ctx, &format!("{}qkvb", tag), &[1, QKVW], &bias);
+            // manual attention：q 块（权重+bias）预乘 1/√hd；eager 保持原值
+            let wq_s: Vec<f16> = if attn_manual {
+                wq.iter().map(|v| f16::from_f32(v.to_f32() * fscale)).collect()
+            } else {
+                wq.clone()
+            };
+            let mut bias_s = bias.clone();
+            if attn_manual {
+                for v in bias_s[..QD as usize].iter_mut() {
+                    *v = f16::from_f32(v.to_f32() * fscale);
+                }
+            }
+            if qkv3 {
+                // qkv3 层内输入位次 2..8（ascl/ash 之后）；eager 按 qkv3 偏移读
+                s.data_buf(&format!("{}qw", tag), &[QD, AW], wbuf_t(ctx, &wq_s, AW, QD));
+                s.data_buf(&format!("{}kw", tag), &[KVD, AW], wbuf_t(ctx, &wk, AW, KVD));
+                s.data_buf(&format!("{}vw", tag), &[KVD, AW], wbuf_t(ctx, &wv, AW, KVD));
+                s.data(ctx, &format!("{}qb", tag), &[1, QD], &bias_s[..QD as usize]);
+                s.data(ctx, &format!("{}kb", tag), &[1, KVD], &bias_s[QD as usize..(QD + KVD) as usize]);
+                s.data(ctx, &format!("{}vb", tag), &[1, KVD], &bias_s[(QD + KVD) as usize..]);
+            } else {
+                let mut fused = Vec::with_capacity((AW * QKVW) as usize);
+                for r in 0..AW as usize {
+                    let rb = r * QD as usize;
+                    fused.extend_from_slice(&wq_s[rb..rb + QD as usize]);
+                    let rb = r * KVD as usize;
+                    fused.extend_from_slice(&wk[rb..rb + KVD as usize]);
+                    fused.extend_from_slice(&wv[rb..rb + KVD as usize]);
+                }
+                let b = wbuf_t(ctx, &fused, AW, QKVW);
+                s.data_buf(&format!("{}qkvwt", tag), &[QKVW, AW], b);
+                s.data(ctx, &format!("{}qkvb", tag), &[1, QKVW], &bias_s);
+            }
             let bq = upload(ctx, &bias[0..QD as usize]);
             let bk = upload(ctx, &bias[QD as usize..(QD + KVD) as usize]);
             let bv = upload(ctx, &bias[(QD + KVD) as usize..]);
@@ -1514,13 +1685,34 @@ fn seg_flow(be: &AscendBackend, bench: bool) {
     for i in 0..depth {
         let tag = format!("l{i}_");
         // attention（normed 已是本层 ada-norm 输出；q1/r1 验证链）
-        let qkv = s.mm(&format!("{}qkv", tag), &normed, &[HOR, AW], &format!("{}qkvwt", tag), &[QKVW, AW], &[HOR, QKVW]);
-        let qkvb = s.bias(&format!("{}qkvb", tag), &qkv, &[HOR, QKVW], &format!("{}qkvb", tag));
-        let q2 = s.slice2(&format!("{}q", tag), &qkvb, &[HOR, QKVW], 0, QD);
-        let k2 = s.slice2(&format!("{}k", tag), &qkvb, &[HOR, QKVW], QD, KVD);
-        let v2 = s.slice2(&format!("{}v", tag), &qkvb, &[HOR, QKVW], QD + KVD, KVD);
-        let (kr2, _) = s.rope2(&format!("{}kr", tag), &k2, &[HOR, KVD], "kcos2", "ksin2", "shp_k3");
-        let (_, qr3) = s.rope2(&format!("{}qr", tag), &q2, &[HOR, QD], "qcos2", "qsin2", "shp_q3");
+        let (q2, k2, v2) = if qkv3 {
+            let qm = s.mm(&format!("{}qm", tag), &normed, &[HOR, AW], &format!("{}qw", tag), &[QD, AW], &[HOR, QD]);
+            let km = s.mm(&format!("{}km", tag), &normed, &[HOR, AW], &format!("{}kw", tag), &[KVD, AW], &[HOR, KVD]);
+            let vm = s.mm(&format!("{}vm", tag), &normed, &[HOR, AW], &format!("{}vw", tag), &[KVD, AW], &[HOR, KVD]);
+            let qb = s.bias(&format!("{}qb_", tag), &qm, &[HOR, QD], &format!("{}qb", tag));
+            let kb = s.bias(&format!("{}kb_", tag), &km, &[HOR, KVD], &format!("{}kb", tag));
+            let vb = s.bias(&format!("{}vb_", tag), &vm, &[HOR, KVD], &format!("{}vb", tag));
+            (qb, kb, vb)
+        } else {
+            let qkv = s.mm(&format!("{}qkv", tag), &normed, &[HOR, AW], &format!("{}qkvwt", tag), &[QKVW, AW], &[HOR, QKVW]);
+            let qkvb = s.bias(&format!("{}qkvb", tag), &qkv, &[HOR, QKVW], &format!("{}qkvb", tag));
+            let q2 = s.slice2(&format!("{}q", tag), &qkvb, &[HOR, QKVW], 0, QD);
+            let k2 = s.slice2(&format!("{}k", tag), &qkvb, &[HOR, QKVW], QD, KVD);
+            let v2 = s.slice2(&format!("{}v", tag), &qkvb, &[HOR, QKVW], QD + KVD, KVD);
+            (q2, k2, v2)
+        };
+        let kf2 = [kf.0, kf.1];
+        let (kr2, _) = if ropeflat {
+            s.rope2_flat(&format!("{}kr", tag), &k2, &[HOR, KVD], &kf2, "kcos", "ksin", "kswap_c", "shp_kflat", "shp_fbk", "shp_k3")
+        } else {
+            s.rope2(&format!("{}kr", tag), &k2, &[HOR, KVD], "kcos2", "ksin2", "shp_k3")
+        };
+        let qf2 = [qf.0, qf.1];
+        let (qr2, qr3) = if ropeflat {
+            s.rope2_flat(&format!("{}qr", tag), &q2, &[HOR, QD], &qf2, "qcos", "qsin", "qswap_c", "shp_qflat", "shp_fbq", "shp_q3")
+        } else {
+            s.rope2(&format!("{}qr", tag), &q2, &[HOR, QD], "qcos2", "qsin2", "shp_q3")
+        };
         // prefix cat（rank-2 ConcatD axis=0）+ Reshape rank-3 桥
         let kcat = format!("{}kcat", tag);
         s.g.add_op(&kcat, "ConcatD").unwrap();
@@ -1546,8 +1738,15 @@ fn seg_flow(be: &AscendBackend, bench: bool) {
         s.wire(&vcat, "x1", &v2);
         let vall = s.reg_out(&vcat, "y");
         let vall3 = s.reshape(&format!("{}vall3", tag), &vall, &[total, KVD], "shp_kall", &[1, total, KVD]);
-        let pfa = s.pfa(&format!("{}pfa", tag), &qr3, &kall3, &vall3, &[1, HOR, QD], &[1, total, KVD], HEADS, KV_HEADS, HD);
-        let sq = s.squeeze(&format!("{}sq", tag), &pfa, &[1, HOR, QD], &[HOR, QD]);
+        let sq = if attn_manual {
+            // 手工 cross-GQA：q 头主序化（headsplit），k/v 已是 rank-3 单头
+            let q3 = s.headsplit(&format!("{}qh", tag), &qr2, HOR, 1, HOR, HEADS, HD, "shp_fq4", "shp_fq3");
+            let attn = s.attn_manual_gqa(&format!("{}attn", tag), &q3, &kall3, &vall3, HEADS, HOR, total, HD);
+            s.headmerge(&format!("{}am", tag), &attn, 1, HOR, HEADS, HD, "shp_fa4", "shp_fbq")
+        } else {
+            let pfa = s.pfa(&format!("{}pfa", tag), &qr3, &kall3, &vall3, &[1, HOR, QD], &[1, total, KVD], HEADS, KV_HEADS, HD);
+            s.squeeze(&format!("{}sq", tag), &pfa, &[1, HOR, QD], &[HOR, QD])
+        };
         let proj = s.mm(&format!("{}proj", tag), &sq, &[HOR, QD], &format!("{}outwt", tag), &[AW, QD], &[HOR, AW]);
         let projb = s.bias(&format!("{}projb", tag), &proj, &[HOR, AW], &format!("{}outb", tag));
         let res = s.add2(&format!("{}res", tag), &projb, &normed, &[HOR, AW]);
@@ -1589,12 +1788,19 @@ fn seg_flow(be: &AscendBackend, bench: bool) {
             let n = aops::add_rms_norm_fp16(ctx, stream, x, zeros, scl, &[HOR, AW], RMS_EPS).unwrap().0;
             aops::bias_add_fp16(ctx, stream, &n, sh, HOR, AW).unwrap()
         };
-        let ain = aops::matmul_b_t_fp16(ctx, stream, &b[0], [HOR, ADIM], &b[16], ADIM, AW).unwrap();
-        let mut normed = aops::bias_add_fp16(ctx, stream, &ain, &b[17], HOR, AW).unwrap();
+        // ⚠ 段级索引按当前注册序：0 state / 1 zeros / 2..7 flat rope /
+        // 8..11 rank-2 表 / 12 ainwt / 13 ainb / 14.. pk_i,pv_i 交替 /
+        // 16.. 层权重（const_i32 改造前 shape 占 4 槽，旧索引 16/17/18
+        // 已失效——[832,256] 读到 qkvwt 的 size 断言 panic 取证）
+        let ain = aops::matmul_b_t_fp16(ctx, stream, &b[0], [HOR, ADIM], &b[12], ADIM, AW).unwrap();
+        let mut normed = aops::bias_add_fp16(ctx, stream, &ain, &b[13], HOR, AW).unwrap();
         normed = ada(&normed, &b[layer_bases2[0]], &b[layer_bases2[0] + 1]);
         for li in 0..depth {
-            let w = &b[layer_bases2[li]..layer_bases2[li] + 12];
-            let (pk, pv) = (&b[18 + 2 * li], &b[19 + 2 * li]);
+            // qkv3 层内输入布局：ascl,ash,qw,kw,vw,qb,kb,vb,outwt,outb,
+            // mscl,msh,gatewt,upwt,downwt,downb（16 项）；默认 12 项
+            let w = &b[layer_bases2[li]..layer_bases2[li] + if qkv3 { 16 } else { 12 }];
+            let (ow, ob, msc, msh, gw, uw, dw, db) = if qkv3 { (8, 9, 10, 11, 12, 13, 14, 15) } else { (4, 5, 6, 7, 8, 9, 10, 11) };
+            let (pk, pv) = (&b[14 + 2 * li], &b[15 + 2 * li]);
             let (wq, wk, wv, bq, bk, bv) = &eager_qkv[li];
             let q = aops::bias_add_fp16(ctx, stream,
                 &aops::matmul_b_t_fp16(ctx, stream, &normed, [HOR, AW], wq, AW, QD).unwrap(), bq, HOR, QD).unwrap();
@@ -1608,16 +1814,16 @@ fn seg_flow(be: &AscendBackend, bench: bool) {
             let vall = aops::cat_fp16(ctx, stream, &[pv, &v], &[vec![p, KVD], vec![HOR, KVD]], 0, &[total, KVD]).unwrap();
             let attn = aops::prompt_flash_attention_cross_bsh_fp16(
                 ctx, stream, &qr, &kall, &vall, HOR, total, HEADS, KV_HEADS, HD, None).unwrap();
-            let proj = aops::matmul_b_t_fp16(ctx, stream, &attn, [HOR, QD], &w[4], QD, AW).unwrap();
-            let proj = aops::bias_add_fp16(ctx, stream, &proj, &w[5], HOR, AW).unwrap();
+            let proj = aops::matmul_b_t_fp16(ctx, stream, &attn, [HOR, QD], &w[ow], QD, AW).unwrap();
+            let proj = aops::bias_add_fp16(ctx, stream, &proj, &w[ob], HOR, AW).unwrap();
             let res = aops::add_fp16(ctx, stream, &proj, &normed, &[HOR, AW]).unwrap();
-            let mnorm = ada(&res, &w[6], &w[7]);
-            let gate = aops::matmul_b_t_fp16(ctx, stream, &mnorm, [HOR, AW], &w[8], AW, AINTER).unwrap();
-            let up = aops::matmul_b_t_fp16(ctx, stream, &mnorm, [HOR, AW], &w[9], AW, AINTER).unwrap();
+            let mnorm = ada(&res, &w[msc], &w[msh]);
+            let gate = aops::matmul_b_t_fp16(ctx, stream, &mnorm, [HOR, AW], &w[gw], AW, AINTER).unwrap();
+            let up = aops::matmul_b_t_fp16(ctx, stream, &mnorm, [HOR, AW], &w[uw], AW, AINTER).unwrap();
             let g = aops::gelu_fp16(ctx, stream, &gate, &[HOR, AINTER], true).unwrap();
             let act = aops::mul_fp16(ctx, stream, &g, &up, &[HOR, AINTER]).unwrap();
-            let down = aops::matmul_b_t_fp16(ctx, stream, &act, [HOR, AINTER], &w[10], AINTER, AW).unwrap();
-            let down = aops::bias_add_fp16(ctx, stream, &down, &w[11], HOR, AW).unwrap();
+            let down = aops::matmul_b_t_fp16(ctx, stream, &act, [HOR, AINTER], &w[dw], AINTER, AW).unwrap();
+            let down = aops::bias_add_fp16(ctx, stream, &down, &w[db], HOR, AW).unwrap();
             let hidden = aops::add_fp16(ctx, stream, &down, &res, &[HOR, AW]).unwrap();
             let n = b.len();
             let (ns, nh) = if li + 1 < depth {
