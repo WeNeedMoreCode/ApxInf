@@ -2326,13 +2326,22 @@ fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e: Op
         println!("[e2e] flow 10 步 {:?}（含每步 styles host 计算 + h2d 换绑）", t0.elapsed());
         st.actions = x;
         if let Some(g) = &st.golden_actions {
+            // golden actions = predict_action_chunk 的 deployable 切片
+            // (50, gd)——取 e2e 输出 [50, ADIM] 每行前 gd 列比（pad_vector
+            // 真值在前）
+            let gd = g.len() / 50;
+            assert!(gd > 0 && gd <= ADIM as usize, "golden actions 形状异常");
             let mut md = 0f32;
-            for (a, b) in st.actions.iter().zip(g.iter()) {
-                md = md.max((a.to_f32() - b.to_f32()).abs());
+            for r in 0..50usize {
+                for c in 0..gd {
+                    let a = st.actions[r * ADIM as usize + c].to_f32();
+                    let b = g[r * gd + c].to_f32();
+                    md = md.max((a - b).abs());
+                }
             }
             let rm = g.iter().fold(0f32, |m, v| m.max(v.to_f32().abs()));
             println!(
-                "[e2e] GOLDEN PARITY: max_diff={md:.5} (golden |max|={rm:.3}, rel={:.1}%)",
+                "[e2e] GOLDEN PARITY (first {gd} cols): max_diff={md:.5} (golden |max|={rm:.3}, rel={:.1}%)",
                 if rm > 0.0 { md / rm * 100.0 } else { md }
             );
         } else {
