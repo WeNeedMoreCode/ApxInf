@@ -233,8 +233,7 @@ fn rope_flat_const(tokens: i64, heads: i64, pos_offset: i64) -> (Vec<f16>, Vec<f
     let mut sin = vec![f16::from_f32(0.0); rows * half];
     for t in 0..tokens as usize {
         for i in 0..half {
-            let freq = ((pos_offset + t as i64) as f64)
-                * ROPE_THETA.powf(-(2.0 * i as f64) / HD as f64);
+            let freq = rope_angle(pos_offset + t as i64, i);
             let (c, s) = (freq.cos() as f32, freq.sin() as f32);
             for h in 0..heads as usize {
                 for hf in 0..2usize {
@@ -249,6 +248,15 @@ fn rope_flat_const(tokens: i64, heads: i64, pos_offset: i64) -> (Vec<f16>, Vec<f
     (cos, sin, swap)
 }
 
+/// rope 角度（golden 数值同源）：inv_freq = θ^(-2i/HD) 先量化 f16——torch
+/// 模型 .to(f16) 连 rotary inv_freq buffer 一起转，HF rotary 用 f16 频率回
+/// f32 算角。全精度频率在高位置（~968）处与 golden 相位差 O(0.1 rad)——
+/// prefix kv l0 即偏 12.6%、逐层放大至 l17 85%（f16-inv 复刻实测 0.08%）
+fn rope_angle(pos: i64, i: usize) -> f64 {
+    let inv = f16::from_f32((ROPE_THETA as f32).powf(-(2.0 * i as f32) / HD as f32));
+    pos as f64 * inv.to_f32() as f64
+}
+
 /// cos/sin rank-2 表 [t*heads, HD]（eager build_rope_tables 同款：cos 半维
 /// 重复、sin 符号折叠），配合通道半互换 swap（SliceD×2+ConcatD）的
 /// rank-2 rope 组合。
@@ -260,8 +268,7 @@ fn rope_rank2_const(tokens: i64, heads: i64, pos_offset: i64) -> (Vec<f16>, Vec<
     let mut sin = vec![f16::from_f32(0.0); rows * d];
     for t in 0..tokens as usize {
         for i in 0..half {
-            let freq = ((pos_offset + t as i64) as f64)
-                * ROPE_THETA.powf(-(2.0 * i as f64) / HD as f64);
+            let freq = rope_angle(pos_offset + t as i64, i);
             let (c, s) = (freq.cos() as f32, freq.sin() as f32);
             for h in 0..heads as usize {
                 let r = t * heads as usize + h;
@@ -1044,10 +1051,38 @@ struct E2eStage {
     token_ids: Vec<u32>,        // lang tokens（真 tokenizer 随 golden 落地）
     noise: Vec<f16>,            // [HOR, ADIM]
     golden_actions: Option<Vec<f16>>, // [HOR, ADIM]
+    /// golden 中间量（f32 原值；键存在才比——段边界 bisect）：
+    /// vision_out[x0 之前] / x0[prefix 输入] / kv0[prefix 首层 k] / step0_x1
+    golden_mid: Vec<(String, Vec<f32>)>,
     /// 阶段产物（host 中转）
     vision_out: Vec<f16>,       // [VT, PW] post-projector
     kv: Vec<Vec<f16>>,          // prefix 36 输出（k0,v0,k1,v1,... 各 [p,KVD]）
     actions: Vec<f16>,          // flow 终态 [HOR, ADIM]
+}
+
+impl E2eStage {
+    /// 段边界 bisect 对拍：golden 有该键才比（BISECT 前缀），无则静默跳过。
+    /// 带 argmax 索引——x0 上可直接分辨分岔落在视觉段/语言段行区间
+    fn cmp_mid(&self, tag: &str, got: &[f16]) {
+        let Some(want) = self.golden_mid.iter().find(|(k, _)| k == tag).map(|(_, v)| v) else {
+            return;
+        };
+        assert_eq!(got.len(), want.len(), "golden {tag} 长度不符（got {} want {}）", got.len(), want.len());
+        let mut md = 0f32;
+        let mut i_at = 0usize;
+        for (i, (&g, &w)) in got.iter().zip(want.iter()).enumerate() {
+            let d = (g.to_f32() - w).abs();
+            if d > md {
+                md = d;
+                i_at = i;
+            }
+        }
+        let rm = want.iter().fold(0f32, |m, v| m.max(v.abs()));
+        println!(
+            "[e2e] BISECT {tag}: max_diff={md:.5} @idx{i_at} (golden |max|={rm:.3}, rel={:.1}%)",
+            if rm > 0.0 { md / rm * 100.0 } else { md }
+        );
+    }
 }
 
 fn silu_f32(x: f32) -> f32 {
@@ -1096,9 +1131,21 @@ fn e2e_run(ctx: &AscendContext, stream: &AscendStream, s: &mut Seg, seg: &str) -
     s.g = ge_builder::load(&path).expect("load om");
     let ins = s.ins();
     let n_out = s.g.num_outputs().unwrap();
+    // GEB_OUT_PAD=<bytes>：输出 buffer 之间插 dummy 占位（不改变输出自身
+    // 大小——d2h 长度断言不受影响）。若 k/v 读回变干净 ⇒ 相邻算子越界写
+    // 踩用户输出 buffer 实锤（OOB 取证用）
+    let pad = envi("GEB_OUT_PAD", 0) as usize;
+    let mut pads: Vec<DeviceBuffer> = Vec::new();
     let outs: Vec<DeviceBuffer> = (0..n_out)
-        .map(|i| ctx.malloc(s.g.output_size(i).unwrap().max(16)).expect("out malloc"))
+        .map(|i| {
+            let b = ctx.malloc(s.g.output_size(i).unwrap().max(16)).expect("out malloc");
+            if pad > 0 {
+                pads.push(ctx.malloc(pad).expect("pad malloc"));
+            }
+            b
+        })
         .collect();
+    let _ = &pads; // 占位 buffer 活到 download 之后
     let refs: Vec<&DeviceBuffer> = outs.iter().collect();
     s.g.run(&ins, &refs, stream).expect("ge run");
     drop(stream.synchronize());
@@ -1112,10 +1159,10 @@ fn seg_e2e(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>) {
     // e2e 读 *_real.om（四件套构建），Seg 重建必须同配置（输入序一致）
     let need = |k: &str| std::env::var(k).is_ok();
     assert!(
-        std::env::var("GEB_ATTN").ok().as_deref() == Some("manual")
+        std::env::var("GEB_ATTN").is_ok()
             && need("GEB_QKV3") && need("GEB_ROPEFLAT") && need("GEB_WCONST"),
-        "GEB_SEG=e2e 须配 GEB_ATTN=manual GEB_QKV3=1 GEB_ROPEFLAT=1 GEB_WCONST=1 \
-         （与 om_cache/*_real.om 构建配置一致）"
+        "GEB_SEG=e2e 须配 GEB_ATTN(=manual|pfa) GEB_QKV3=1 GEB_ROPEFLAT=1 GEB_WCONST=1 \
+         （须与 GEB_OM_DIR 下 *_real.om 的构建配置一致——pfa 仅隔离实验用）"
     );
     let real = real.expect("GEB_SEG=e2e 需要 GEB_CKPT（token_embedding/time_mlp/style 投影 host 消费）");
     let tokens = envi("GEB_TOKENS", 64) as usize;
@@ -1132,6 +1179,30 @@ fn seg_e2e(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>) {
             let f16v = |k: &str| -> Vec<f16> { f32v(k).into_iter().map(f16::from_f32).collect() };
             let ids: Vec<u32> = f32v("token_ids").iter().map(|&v| v as u32).collect();
             assert_eq!(ids.len(), tokens, "golden token 数与 GEB_TOKENS 不符");
+            // 中间量（可选键，名对齐 golden_gen.py 落盘键）：vision_out / x0 /
+            // kvk_l{i} 全 18 层（prefix k cache）/ step0_x1——段边界 bisect
+            let mut keys: Vec<String> = Vec::new();
+            for k in ["vision_out", "x0", "step0_x1", "m0", "h1"] {
+                if t.contains_key(k) {
+                    keys.push(k.to_string());
+                }
+            }
+            keys.extend(
+                t.keys()
+                    .filter(|k| k.starts_with("kvk_l"))
+                    .cloned()
+                    .collect::<Vec<_>>(),
+            );
+            let golden_mid: Vec<(String, Vec<f32>)> = keys
+                .iter()
+                .filter_map(|k| {
+                    t.get(k.as_str()).map(|a| (k.clone(), a.to_f32_vec().unwrap()))
+                })
+                .collect();
+            println!(
+                "[e2e] golden 中间量: {:?}",
+                golden_mid.iter().map(|(k, v)| format!("{k}[{}]", v.len())).collect::<Vec<_>>()
+            );
             E2eStage {
                 patches: f16v("patches"),
                 token_ids: ids,
@@ -1139,6 +1210,7 @@ fn seg_e2e(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>) {
                 golden_actions: t
                     .get("actions")
                     .map(|a| a.to_f32_vec().unwrap().into_iter().map(f16::from_f32).collect()),
+                golden_mid,
                 vision_out: Vec::new(),
                 kv: Vec::new(),
                 actions: Vec::new(),
@@ -1153,6 +1225,7 @@ fn seg_e2e(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>) {
                 token_ids: ids,
                 noise: rand_f16((HOR * ADIM) as usize, &mut seed, 1.0),
                 golden_actions: None,
+                golden_mid: Vec::new(),
                 vision_out: Vec::new(),
                 kv: Vec::new(),
                 actions: Vec::new(),
@@ -1166,6 +1239,12 @@ fn seg_e2e(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>) {
     seg_prefix(be, false, Some(real), Some(&mut st));
     let t2 = std::time::Instant::now();
     println!("[e2e] prefix 段 {:?}（含 OM 加载 + 2.1GB 嵌入查表）", t2.duration_since(t1));
+    if std::env::var("GEB_E2E_STOP").ok().as_deref() == Some("prefix") {
+        // bisect 用：只跑 vision+prefix（如 GEB_DEPTH=2 小图验输出槽复用）
+        ge_builder::fini().expect("fini");
+        println!("GE_E2E_PROBE_OK");
+        return;
+    }
     seg_flow(be, false, Some(real), Some(&mut st));
     let t3 = std::time::Instant::now();
     println!("[e2e] flow 段 {:?}（含 OM 加载 + 10 步）", t3.duration_since(t2));
@@ -1183,7 +1262,7 @@ fn seg_e2e(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>) {
 fn seg_vision(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e: Option<&mut E2eStage>) {
     let ctx = be.ctx();
     let stream = be.stream();
-    let depth = envi("GEB_DEPTH", 27) as usize;
+    let depth = envi("GEB_DEPTH_VISION", envi("GEB_DEPTH", 27)) as usize;
     let t = VT;
     let vqd = V_HEADS * V_HD; // 1152
     let qkvw = vqd * 3;
@@ -1554,6 +1633,7 @@ fn seg_vision(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e: 
         st.vision_out = outs[0].clone();
         let m = st.vision_out.iter().fold(0f32, |m, v| m.max(v.to_f32().abs()));
         println!("[e2e] vision_out |max|={m:.4}");
+        st.cmp_mid("vision_out", &st.vision_out);
         return;
     }
     parity_and_bench(ctx, stream, &mut s, "vision", &[(t * PW) as usize], &eager, bench);
@@ -1569,7 +1649,7 @@ fn seg_vision(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e: 
 fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e: Option<&mut E2eStage>) {
     let ctx = be.ctx();
     let stream = be.stream();
-    let depth = envi("GEB_DEPTH", 18) as usize;
+    let depth = envi("GEB_DEPTH_PREFIX", envi("GEB_DEPTH", 18)) as usize;
     let tokens = envi("GEB_TOKENS", 64);
     let p = VT + tokens; // prefix 长度（16 倍数纪律）
     let mut seed = 0xBEEFu32;
@@ -1578,8 +1658,10 @@ fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e: 
     let qkv3 = std::env::var("GEB_QKV3").is_ok();
     // GEB_ATTN=manual：手工 GQA attention（bmm+softmax+bmm + k/v TileD 广播）
     // 替代 PFA——PFA 是 transformer-API 型算子，静态 OM 内走 host launcher
-    // （每次执行 host tiling + staging）。scale 由 pscale 折进 q 权重/bias
-    let attn_manual = std::env::var("GEB_ATTN").map(|v| v == "manual").unwrap_or(false);
+    // （每次执行 host tiling + staging）。scale 由 pscale 折进 q 权重/bias。
+    // GEB_ATTN_PREFIX：分段覆盖（manual-OM + pfa-prefix 隔离实验用）
+    let attn_manual = std::env::var("GEB_ATTN_PREFIX").or_else(|_| std::env::var("GEB_ATTN"))
+        .map(|v| v == "manual").unwrap_or(false);
     let pscale = if attn_manual { 1.0f32 / (HD as f32).sqrt() } else { 1.0 };
     let mut s = Seg::new("ge_prefix");
 
@@ -1587,9 +1669,27 @@ fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e: 
     // 0 x0 / 1 zeros / 2..7 flat rope 六件（eager flat 版用）/
     // 8..11 rank-2 rope 表四件（GE rank-2 组合用）/ 层 10 项
     // e2e x0 = vision_out ‖ token_embedding[token_ids]（embed_prefix 同序：
-    // 视觉前、语言后；state 不进 prefix——π0.5 走离散化进 prompt 文本）
-    let x0_h = match (&e2e, real) {
-        (Some(st), Some(w)) => {
+    // 视觉前、语言后；state 不进 prefix——π0.5 走离散化进 prompt 文本）。
+    // GEB_E2E_X0_KEY：x0 直接取 golden 中间量键（隔离实验——如 h1 作层 1
+    // 输入，配 GEB_LAYER_OFFSET=1 直接对拍 kvk_l1 公式）
+    let x0_override = match (&e2e, std::env::var("GEB_E2E_X0_KEY")) {
+        (Some(st), Ok(key)) => {
+            let v = &st
+                .golden_mid
+                .iter()
+                .find(|(k, _)| *k == key)
+                .unwrap_or_else(|| panic!("golden 缺键 {key}"))
+                .1;
+            Some(v.iter().map(|&x| f16::from_f32(x)).collect::<Vec<f16>>())
+        }
+        _ => None,
+    };
+    let x0_h = match (x0_override, &e2e, real) {
+        (Some(v), _, _) => {
+            assert_eq!(v.len(), (p * PW) as usize, "GEB_E2E_X0_KEY 张量长度 ≠ p×PW");
+            v
+        }
+        (None, Some(st), Some(w)) => {
             assert!(!st.vision_out.is_empty(), "e2e: 须先跑 vision 段");
             assert_eq!(st.vision_out.len(), (VT * PW) as usize);
             assert_eq!(st.token_ids.len(), tokens as usize, "golden token 数与 GEB_TOKENS 不符");
@@ -1608,10 +1708,15 @@ fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e: 
             }
             x0
         }
-        (Some(_), None) => panic!("e2e 需要 GEB_CKPT（token_embedding 查表）"),
+        (None, Some(_), None) => panic!("e2e 需要 GEB_CKPT（token_embedding 查表）"),
         _ => rand_f16((p * PW) as usize, &mut seed, 100.0),
     };
     s.data(ctx, "x0", &[p, PW], &x0_h);
+    // bisect：x0 = cat(vision_out, 查表×√PW) 组装后即比（idx 域 [0,VT*PW)
+    // = 视觉行 / 其后 = 语言行——分岔落哪个段一眼可辨）
+    if let Some(st) = e2e.as_ref() {
+        st.cmp_mid("x0", &x0_h);
+    }
     s.data_zeros(ctx, "zeros", p, PW);
     let (qc, qs, qi) = rope_flat_const(p, HEADS, 0);
     let (kc, ks, ki) = rope_flat_const(p, KV_HEADS, 0);
@@ -1653,14 +1758,22 @@ fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e: 
     let mut layer_bases = Vec::with_capacity(depth);
     let mut cur = "x0".to_string();
     let mut kv_outs: Vec<String> = Vec::new();
+    // GEB_DBG_MID：层 0 attention 合并输出（o_proj 前）与 h1 作为图输出尾部
+    // 追加——golden m0/h1 对拍，钉 GE 图内第一坏级（attention vs MLP vs 残差）
+    let dbg_mid = std::env::var("GEB_DBG_MID").is_ok();
+    let mut dbg_outs: Vec<String> = Vec::new();
     for i in 0..depth {
         let base = s.binds.len();
         layer_bases.push(base);
         let tag = format!("l{i}_");
         let last = i + 1 == depth;
         // 真权重：语言层 host 解析时已把 Gemma 1+w scale 折进 q/k/v/gate/up
-        //（g1/g2 = ones）——probe 图直接消费该约定，无需再乘 norm scale
-        let lay = real.and_then(|w| w.language_layers.get(i));
+        //（g1/g2 = ones）——probe 图直接消费该约定，无需再乘 norm scale。
+        // GEB_LAYER_OFFSET：权重取层偏移（隔离实验——如 d2 图层 0 用 L1
+        // 权重 + x0 喂 golden h1，直接对拍 kvk_l1 公式，裁决 WCONST 烤入）
+        let lay = real.and_then(|w| {
+            w.language_layers.get(i + envi("GEB_LAYER_OFFSET", 0) as usize)
+        });
         let g1_h = lay
             .map(|l| t_f16(&l.input_norm_scale))
             .unwrap_or_else(|| norm_f16(PW as usize, &mut seed, 1.0));
@@ -1807,6 +1920,10 @@ fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e: 
         let proj = s.mm(&format!("{}proj", tag), &sq, &[p, QD], &format!("{}outwt", tag), &[PW, QD], &[p, PW]);
         let projb = s.bias(&format!("{}projb", tag), &proj, &[p, PW], &format!("{}outb", tag));
         let res = s.add2(&format!("{}res", tag), &projb, &cur, &[p, PW]);
+        if dbg_mid && i == 0 {
+            dbg_outs.push(sq.clone());
+            dbg_outs.push(res.clone());
+        }
         let norm2 = s.addrms(&format!("{}n2", tag), &res, "zeros", &format!("{}g2", tag), &[p, PW]);
         let gate = s.mm(&format!("{}gate", tag), &norm2, &[p, PW], &format!("{}gatewt", tag), &[INTER, PW], &[p, INTER]);
         let up = s.mm(&format!("{}up", tag), &norm2, &[p, PW], &format!("{}upwt", tag), &[INTER, PW], &[p, INTER]);
@@ -1815,7 +1932,18 @@ fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e: 
         let down = s.mm(&format!("{}down", tag), &act, &[p, INTER], &format!("{}downwt", tag), &[PW, INTER], &[p, PW]);
         let downb = s.bias(&format!("{}downb", tag), &down, &[p, PW], &format!("{}downb", tag));
         cur = s.add2(&format!("{}out", tag), &downb, &res, &[p, PW]);
+        if dbg_mid && i == 0 && std::env::var("GEB_DBG_FULL").is_ok() {
+            // 全级导出（GEB_DBG_FULL）：逐级与教科书对拍钉 GE 图坏点。
+            // ⚠ 输出槽可能被内存复用覆写（res 槽实测被 n2 覆写）——逐级
+            // 对拍时用「值匹配教科书哪一级」判读，勿信槽序
+            for n in [proj.clone(), projb.clone(), res.clone(), norm2.clone(),
+                      gate.clone(), up.clone(), gact.clone(), act.clone(),
+                      down.clone(), downb.clone(), cur.clone()] {
+                dbg_outs.push(n);
+            }
+        }
     }
+    kv_outs.extend(dbg_outs);
     let out_names: Vec<&str> = kv_outs.iter().map(|x| x.as_str()).collect();
     s.finish(&out_names);
     println!("prefix OM built: depth={depth} P={p} n_in={} n_out={}", s.ins().len(), kv_outs.len());
@@ -1870,12 +1998,35 @@ fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e: 
     };
 
     if let Some(st) = e2e {
-        // e2e：加载 prefix_real.om 跑一次，抓 36×k/v（k0,v0,k1,v1,...）
+        // e2e：加载 prefix_real.om 跑一次，抓 36×k/v（k0,v0,k1,v1,...）；
+        // GEB_DBG_MID 烤的 OM 尾部多 2 输出（层 0 attention 合并/h1）
         let outs = e2e_run(ctx, stream, &mut s, "prefix");
-        assert_eq!(outs.len(), depth * 2);
-        st.kv = outs;
+        let nkv = depth * 2;
+        assert!(outs.len() >= nkv, "prefix OM 输出 {} < kv {}", outs.len(), nkv);
+        if outs.len() > nkv {
+            st.cmp_mid("m0", &outs[nkv]);
+            st.cmp_mid("h1", &outs[nkv + 1]);
+            // GEB_E2E_DUMP_MID=<dir>：全部调试槽位原始 f16 落盘
+            //（ge_slot{i}.f16，i 与图输出序一致——槽值可能被复用覆写，
+            // 判读用「值匹配教科书哪级」而非槽序）
+            if let Ok(dir) = std::env::var("GEB_E2E_DUMP_MID") {
+                for (i, vals) in outs.iter().enumerate().skip(nkv) {
+                    let bytes: Vec<u8> =
+                        vals.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect();
+                    std::fs::write(format!("{dir}/ge_slot{i}.f16"), &bytes).expect("dump mid");
+                }
+                println!("[e2e] 调试槽位已落盘 {dir}/ge_slot{{nkv+}}.f16 ×{}", outs.len() - nkv);
+            }
+        }
+        st.kv = outs[..nkv].to_vec();
         let m = st.kv.iter().flat_map(|v| v.iter()).fold(0f32, |m, v| m.max(v.to_f32().abs()));
         println!("[e2e] prefix kv ×{} |max|={m:.4}", st.kv.len());
+        // 逐层 k 对拍（golden 键 kvk_l{i+GEB_LAYER_OFFSET}——偏移实验时键随
+        // 权重层同步偏移）
+        let key_off = envi("GEB_LAYER_OFFSET", 0) as usize;
+        for li in 0..depth {
+            st.cmp_mid(&format!("kvk_l{}", li + key_off), &st.kv[2 * li]);
+        }
         return;
     }
     let elems = [(p * KVD) as usize];
@@ -2323,6 +2474,9 @@ fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e: Op
             x = download_f16(ctx, &ob, (HOR * ADIM) as usize);
             let m = x.iter().fold(0f32, |m, v| m.max(v.to_f32().abs()));
             println!("[e2e] step {step} |x|max={m:.4}");
+            if step == 0 {
+                st.cmp_mid("step0_x1", &x);
+            }
         }
         println!("[e2e] flow 10 步 {:?}（含每步 styles host 计算 + h2d 换绑）", t0.elapsed());
         st.actions = x;
