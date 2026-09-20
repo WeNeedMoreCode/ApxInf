@@ -1182,7 +1182,7 @@ fn seg_e2e(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>) {
             // 中间量（可选键，名对齐 golden_gen.py 落盘键）：vision_out / x0 /
             // kvk_l{i} 全 18 层（prefix k cache）/ step0_x1——段边界 bisect
             let mut keys: Vec<String> = Vec::new();
-            for k in ["vision_out", "x0", "step0_x1", "m0", "h1"] {
+            for k in ["vision_out", "x0", "x0_vis", "step0_x1", "m0", "h1"] {
                 if t.contains_key(k) {
                     keys.push(k.to_string());
                 }
@@ -1651,7 +1651,16 @@ fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e: 
     let stream = be.stream();
     let depth = envi("GEB_DEPTH_PREFIX", envi("GEB_DEPTH", 18)) as usize;
     let tokens = envi("GEB_TOKENS", 64);
-    let p = VT + tokens; // prefix 长度（16 倍数纪律）
+    // GEB_PREFIX_DROP_EMPTY：尾部空视图行数（9/10 语义根因修复，2026-09-21）。
+    // golden_gen 按 LIBERO 语义只喂 2 真实视图，empty_camera 走 missing 路径
+    // （-1 pad 图进 SigLIP 但 pad_mask=0）：make_att_2d_masks 的 pad_2d 把该
+    // 256 个 key 对所有人遮蔽，position_ids=cumsum(pad)-1 使文本位置塌缩到
+    // 512..711。pad 列 softmax 贡献恰为 0、可见 token 位置恰为 arange ⇒
+    // 数学上等价于直接剔除该视图行（968→712，全开+arange 语义不变）——
+    // theory_check.py 实证 h1 对应行 0.128%。引擎此前把 pad 视图当一等
+    // 公民（可见 key + 占位 512..767）＝ e2e 314% 漂移的真根因
+    let drop_v = envi("GEB_PREFIX_DROP_EMPTY", 0);
+    let p = VT + tokens - drop_v; // prefix 长度（16 倍数纪律）
     let mut seed = 0xBEEFu32;
     // GEB_QKV3：q/k/v 独立投影（同 vision 段——SliceD 列切视图的运行时
     // MemcopyAsync 物化是 prefix 750ms 的主源，取证见 vision 段注记）
@@ -1697,9 +1706,12 @@ fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e: 
             let emb = w.vision.token_embedding.to_f32_vec().unwrap();
             let vocab_w = PW as usize;
             // LeRobot embed_language_tokens 语义：查表行 × √width（gemma
-            // embed scale，modeling_pi05 L695；vision 段无此缩放）
+            // embed scale，modeling_pi05 L695；vision 段无此缩放）。
+            // 空视图剔除：vision_out 只取前 (VT-drop_v) 行（视图主序，empty
+            // 在尾），golden 对拍键 x0_vis 同序
             let lang_scale = (PW as f32).sqrt();
-            let mut x0 = st.vision_out.clone();
+            let vis_rows = ((VT - drop_v) * PW) as usize;
+            let mut x0 = st.vision_out[..vis_rows].to_vec();
             x0.reserve(st.token_ids.len() * vocab_w);
             for &id in &st.token_ids {
                 let r = id as usize * vocab_w;
@@ -1713,9 +1725,14 @@ fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e: 
     };
     s.data(ctx, "x0", &[p, PW], &x0_h);
     // bisect：x0 = cat(vision_out, 查表×√PW) 组装后即比（idx 域 [0,VT*PW)
-    // = 视觉行 / 其后 = 语言行——分岔落哪个段一眼可辨）
+    // = 视觉行 / 其后 = 语言行——分岔落哪个段一眼可辨）。剔除空视图时
+    // golden 参考键为 x0_vis（712 行同序）
     if let Some(st) = e2e.as_ref() {
-        st.cmp_mid("x0", &x0_h);
+        if drop_v > 0 {
+            st.cmp_mid("x0_vis", &x0_h);
+        } else {
+            st.cmp_mid("x0", &x0_h);
+        }
     }
     s.data_zeros(ctx, "zeros", p, PW);
     let (qc, qs, qi) = rope_flat_const(p, HEADS, 0);
@@ -1935,8 +1952,11 @@ fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e: 
         if dbg_mid && i == 0 && std::env::var("GEB_DBG_FULL").is_ok() {
             // 全级导出（GEB_DBG_FULL）：逐级与教科书对拍钉 GE 图坏点。
             // ⚠ 输出槽可能被内存复用覆写（res 槽实测被 n2 覆写）——逐级
-            // 对拍时用「值匹配教科书哪一级」判读，勿信槽序
-            for n in [proj.clone(), projb.clone(), res.clone(), norm2.clone(),
+            // 对拍时用「值匹配教科书哪一级」判读，勿信槽序。
+            // n1/k2：norm1 输出与 rope 前 k——kvk 漂移链（输入→norm→k_proj→
+            // rope）的中间级，18.7% 分岔定位用（norm 后幅度与输入无关 ⇒
+            // 幅度依赖分岔只可能在 n1 之前产生）
+            for n in [norm1.clone(), k2.clone(), proj.clone(), projb.clone(), res.clone(), norm2.clone(),
                       gate.clone(), up.clone(), gact.clone(), act.clone(),
                       down.clone(), downb.clone(), cur.clone()] {
                 dbg_outs.push(n);
@@ -2004,8 +2024,14 @@ fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e: 
         let nkv = depth * 2;
         assert!(outs.len() >= nkv, "prefix OM 输出 {} < kv {}", outs.len(), nkv);
         if outs.len() > nkv {
-            st.cmp_mid("m0", &outs[nkv]);
-            st.cmp_mid("h1", &outs[nkv + 1]);
+            // 剔除空视图时 golden 参考键为 _vis（712 行，与图槽同形）
+            if drop_v > 0 {
+                st.cmp_mid("m0_vis", &outs[nkv]);
+                st.cmp_mid("h1_vis", &outs[nkv + 1]);
+            } else {
+                st.cmp_mid("m0", &outs[nkv]);
+                st.cmp_mid("h1", &outs[nkv + 1]);
+            }
             // GEB_E2E_DUMP_MID=<dir>：全部调试槽位原始 f16 落盘
             //（ge_slot{i}.f16，i 与图输出序一致——槽值可能被复用覆写，
             // 判读用「值匹配教科书哪级」而非槽序）
@@ -2046,7 +2072,9 @@ fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e: Op
     let stream = be.stream();
     let depth = envi("GEB_DEPTH", 18) as usize;
     let tokens = envi("GEB_TOKENS", 64);
-    let p = VT + tokens;
+    // prefix 可见长度（空视图剔除须与 prefix 段一致——suffix rope 偏移与
+    // pk/pv 形状都取此值；infer 侧 pos_s = sum(prefix_pad)+cumsum-1 = 712 起）
+    let p = VT + tokens - envi("GEB_PREFIX_DROP_EMPTY", 0);
     let mut seed = 0xF00Du32;
     // 同 vision/prefix 段三件套（取证见各段注记）：q/k/v 独立投影 /
     // flat rope（免列切物化）/ 手工 cross-GQA attention（免 PFA host
