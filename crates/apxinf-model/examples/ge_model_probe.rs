@@ -1595,12 +1595,15 @@ fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e: 
             // 一次性 f32 物化 [vocab,PW]（~2.1GB 峰值，查完即弃）
             let emb = w.vision.token_embedding.to_f32_vec().unwrap();
             let vocab_w = PW as usize;
+            // LeRobot embed_language_tokens 语义：查表行 × √width（gemma
+            // embed scale，modeling_pi05 L695；vision 段无此缩放）
+            let lang_scale = (PW as f32).sqrt();
             let mut x0 = st.vision_out.clone();
             x0.reserve(st.token_ids.len() * vocab_w);
             for &id in &st.token_ids {
                 let r = id as usize * vocab_w;
                 assert!(r + vocab_w <= emb.len(), "token id {id} 超 vocab");
-                x0.extend(emb[r..r + vocab_w].iter().map(|&v| f16::from_f32(v)));
+                x0.extend(emb[r..r + vocab_w].iter().map(|&v| f16::from_f32(v * lang_scale)));
             }
             x0
         }
@@ -2279,6 +2282,14 @@ fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e: Op
             ctx.copy_h2d(buf, &bytes).expect("h2d style/state");
         };
         let mut x = st.noise.clone();
+        // euler 常数换绑为 LeRobot 语义 x' = x + dt·v（c1=1.0，sample_actions
+        // L894；OM 缺省 0.9/-0.1 = openpi x1-预测式）。c1/c2 是 Data 输入，
+        // 绑定位次 = binds 尾两位（eager b[n-2]/b[n-1] 同源）
+        let c1_h = vec![f16::from_f32(1.0); (HOR * ADIM) as usize];
+        let c2_h = vec![f16::from_f32(-0.1); (HOR * ADIM) as usize];
+        let nb = s.binds.len();
+        h2d_f16(&s.binds[nb - 2], &c1_h);
+        h2d_f16(&s.binds[nb - 1], &c2_h);
         let t0 = std::time::Instant::now();
         for step in 0..cfg.num_flow_steps {
             // t = flow_start·(1-step/N)（ascend_vla 同式）→ te → cond → styles
