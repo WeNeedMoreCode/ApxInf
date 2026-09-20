@@ -41,11 +41,18 @@
 //!   向量等运行时输入保持合成（两路同值对拍不受影响）。
 //!   ⚠ GEB_LOAD 真 OM（*_real.om）必须配 GEB_CKPT——权重烤在 OM 里，但
 //!   eager 参考仍从 binds 取权重，缺 GEB_CKPT 时对拍错权重无意义
+//!   GEB_SEG=e2e：M3 三段链式 e2e（vision→prefix→flow 10 步换绑）——x0 真
+//!   嵌入组装（vision_out ‖ token_embedding 查表，embed_prefix 同序）、
+//!   styles 真值（time_mlp(sinusoidal(t))→style→ascl=1+s0/ash=s1）、pk/pv =
+//!   prefix OM 36 输出直连（host 中转）。GEB_E2E_GOLDEN=<safetensors> 对拍
+//!   torch golden（键 patches[768,588]/token_ids[N]/noise[50,32]/actions
+//!   [50,32]，值 f32 存储；缺省合成 bring-up 模式）。OM 从 GEB_OM_DIR（默认
+//!   /data/apxinf/om_cache）读 {seg}_real.om；须配 GEB_CKPT + 四件套 env。
 use half::f16;
 
 use apxinf_ascend::ge_builder::{self, Dtype, GeGraph};
 use apxinf_ascend::{ops as aops, AscendBackend, AscendContext, AscendStream, DeviceBuffer};
-use apxinf_model::pi05::{LinearWeights, Pi05Weights};
+use apxinf_model::pi05::{sinusoidal_time_embedding, LinearWeights, Pi05Config, Pi05Weights};
 
 // π0.5 3 视图档维度（Pi05Config::default）
 const VT: i64 = 768; // vision tokens = 3 views × 256 patches
@@ -842,6 +849,10 @@ impl Seg {
             // 缓存加载模式：跳过编译，parity_and_bench 里替换为磁盘 OM
             return;
         }
+        if std::env::var("GEB_SEG").ok().as_deref() == Some("e2e") {
+            // e2e 模式：同样跳过编译（e2e_run 里按 {seg}_real.om 加载）
+            return;
+        }
         let names: Vec<&str> = self.names.iter().map(|s| s.as_str()).collect();
         let shape_refs: Vec<(&str, &[i64])> = self
             .names
@@ -1019,11 +1030,156 @@ fn parity_and_bench(
 }
 
 // ---------------------------------------------------------------------------
+// M3 e2e：三段 OM 接真实推理链（GEB_SEG=e2e，进程内链式、host 中转）
+//   组装口径全对齐 ascend_runtime（M2 eager 全链，CUDA 镜像同源）：
+//   x0 = vision_out ‖ token_embedding[token_ids]（视觉前语言后）
+//   state 不进 prefix——π0.5 走 state 离散化进 prompt（pi05_prompt）
+//   cond = silu(W_out·silu(W_in·te+b_in)+b_out)；style 切分 [0:w]/[w:2w]
+//   （executor L714-719：ascl=1+s0 / ash=s1）
+// ---------------------------------------------------------------------------
+
+struct E2eStage {
+    /// 输入（golden 或合成 bring-up）
+    patches: Vec<f16>,          // [VT, V_PATCH_W]
+    token_ids: Vec<u32>,        // lang tokens（真 tokenizer 随 golden 落地）
+    noise: Vec<f16>,            // [HOR, ADIM]
+    golden_actions: Option<Vec<f16>>, // [HOR, ADIM]
+    /// 阶段产物（host 中转）
+    vision_out: Vec<f16>,       // [VT, PW] post-projector
+    kv: Vec<Vec<f16>>,          // prefix 36 输出（k0,v0,k1,v1,... 各 [p,KVD]）
+    actions: Vec<f16>,          // flow 终态 [HOR, ADIM]
+}
+
+fn silu_f32(x: f32) -> f32 {
+    x / (1.0 + (-x).exp())
+}
+
+/// host 线性层（f32 全精度；维度 1×32×3072 量级，开销可忽略）
+fn host_lin_f32(w: &LinearWeights, x: &[f32], in_d: usize) -> Vec<f32> {
+    let wt = w.weight.to_f32_vec().unwrap();
+    let out_d = wt.len() / in_d;
+    assert_eq!(x.len(), in_d);
+    let mut y = match &w.bias {
+        Some(b) => b.to_f32_vec().unwrap(),
+        None => vec![0f32; out_d],
+    };
+    for (i, &xi) in x.iter().enumerate() {
+        for j in 0..out_d {
+            y[j] += xi * wt[i * out_d + j];
+        }
+    }
+    y
+}
+
+/// te [AW] → conditioning [ADIM]（time_mlp 两层，每层 matmul→bias→silu）
+fn e2e_conditioning(real: &Pi05Weights, te: &[f32]) -> Vec<f32> {
+    let h = host_lin_f32(&real.time_mlp_in, te, te.len());
+    let h: Vec<f32> = h.iter().map(|&v| silu_f32(v)).collect();
+    let c = host_lin_f32(&real.time_mlp_out, &h, h.len());
+    c.iter().map(|&v| silu_f32(v)).collect()
+}
+
+/// style 投影 [ADIM,3W] → (scale=1+s0, shift=s1)；第三段 [2w:3w] 引擎未消费
+fn e2e_style_pair(w: &LinearWeights, cond: &[f32], width: usize) -> (Vec<f16>, Vec<f16>) {
+    let raw = host_lin_f32(w, cond, cond.len());
+    let scl = raw[..width].iter().map(|&v| f16::from_f32(1.0 + v)).collect();
+    let sh = raw[width..2 * width].iter().map(|&v| f16::from_f32(v)).collect();
+    (scl, sh)
+}
+
+/// e2e 收尾共通：GEB_OM_DIR（默认 /data/apxinf/om_cache）加载 {seg}_real.om
+/// 跑一次，全部图输出下载回 host。Seg 构造须与 OM 构建同 env（四件套）
+fn e2e_run(ctx: &AscendContext, stream: &AscendStream, s: &mut Seg, seg: &str) -> Vec<Vec<f16>> {
+    let dir = std::env::var("GEB_OM_DIR").unwrap_or_else(|_| "/data/apxinf/om_cache".into());
+    let path = format!("{dir}/{seg}_real.om");
+    println!("[e2e] loading {path}");
+    s.g = ge_builder::load(&path).expect("load om");
+    let ins = s.ins();
+    let n_out = s.g.num_outputs().unwrap();
+    let outs: Vec<DeviceBuffer> = (0..n_out)
+        .map(|i| ctx.malloc(s.g.output_size(i).unwrap().max(16)).expect("out malloc"))
+        .collect();
+    let refs: Vec<&DeviceBuffer> = outs.iter().collect();
+    s.g.run(&ins, &refs, stream).expect("ge run");
+    drop(stream.synchronize());
+    (0..n_out)
+        .map(|i| download_f16(ctx, &outs[i], s.g.output_size(i).unwrap() / 2))
+        .collect()
+}
+
+fn seg_e2e(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>) {
+    let _ = bench;
+    // e2e 读 *_real.om（四件套构建），Seg 重建必须同配置（输入序一致）
+    let need = |k: &str| std::env::var(k).is_ok();
+    assert!(
+        std::env::var("GEB_ATTN").ok().as_deref() == Some("manual")
+            && need("GEB_QKV3") && need("GEB_ROPEFLAT") && need("GEB_WCONST"),
+        "GEB_SEG=e2e 须配 GEB_ATTN=manual GEB_QKV3=1 GEB_ROPEFLAT=1 GEB_WCONST=1 \
+         （与 om_cache/*_real.om 构建配置一致）"
+    );
+    let real = real.expect("GEB_SEG=e2e 需要 GEB_CKPT（token_embedding/time_mlp/style 投影 host 消费）");
+    let tokens = envi("GEB_TOKENS", 64) as usize;
+    assert!((VT + tokens as i64) % 16 == 0, "prefix P 须 16 倍数（16 倍 M 纪律）");
+    let mut st = match std::env::var("GEB_E2E_GOLDEN") {
+        Ok(path) => {
+            println!("[e2e] golden: {path}");
+            let (t, _) = apxinf_loader::safetensors::load_native_path(std::path::Path::new(&path))
+                .expect("golden load");
+            let f32v = |k: &str| -> Vec<f32> {
+                t.get(k).unwrap_or_else(|| panic!("golden 缺键 {k}")).to_f32_vec().unwrap()
+            };
+            let f16v = |k: &str| -> Vec<f16> { f32v(k).into_iter().map(f16::from_f32).collect() };
+            let ids: Vec<u32> = f32v("token_ids").iter().map(|&v| v as u32).collect();
+            assert_eq!(ids.len(), tokens, "golden token 数与 GEB_TOKENS 不符");
+            E2eStage {
+                patches: f16v("patches"),
+                token_ids: ids,
+                noise: f16v("noise"),
+                golden_actions: t
+                    .get("actions")
+                    .map(|a| a.to_f32_vec().unwrap().into_iter().map(f16::from_f32).collect()),
+                vision_out: Vec::new(),
+                kv: Vec::new(),
+                actions: Vec::new(),
+            }
+        }
+        Err(_) => {
+            println!("[e2e] 无 GEB_E2E_GOLDEN：合成 patches/noise + 占位 token ids（bring-up 模式，golden 对拍下一步）");
+            let mut seed = 0xE2E2u32;
+            let ids = (0..tokens).map(|i| 1000 + i as u32 * 7).collect();
+            E2eStage {
+                patches: rand_f16((VT * V_PATCH_W) as usize, &mut seed, 300.0),
+                token_ids: ids,
+                noise: rand_f16((HOR * ADIM) as usize, &mut seed, 1.0),
+                golden_actions: None,
+                vision_out: Vec::new(),
+                kv: Vec::new(),
+                actions: Vec::new(),
+            }
+        }
+    };
+    let t0 = std::time::Instant::now();
+    seg_vision(be, false, Some(real), Some(&mut st));
+    let t1 = std::time::Instant::now();
+    println!("[e2e] vision 段 {:?}（含 OM 加载）", t1.duration_since(t0));
+    seg_prefix(be, false, Some(real), Some(&mut st));
+    let t2 = std::time::Instant::now();
+    println!("[e2e] prefix 段 {:?}（含 OM 加载 + 2.1GB 嵌入查表）", t2.duration_since(t1));
+    seg_flow(be, false, Some(real), Some(&mut st));
+    let t3 = std::time::Instant::now();
+    println!("[e2e] flow 段 {:?}（含 OM 加载 + 10 步）", t3.duration_since(t2));
+    let head: Vec<f32> = st.actions[..8.min(st.actions.len())].iter().map(|v| v.to_f32()).collect();
+    println!("[e2e] actions head={head:?}");
+    ge_builder::fini().expect("fini");
+    println!("GE_E2E_PROBE_OK");
+}
+
+// ---------------------------------------------------------------------------
 // vision 段：patch embed → depth×SigLIP 层 → post LN → projector
 // eager = ascend_executor::vision_layer_ascend 序列镜像
 // ---------------------------------------------------------------------------
 
-fn seg_vision(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>) {
+fn seg_vision(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e: Option<&mut E2eStage>) {
     let ctx = be.ctx();
     let stream = be.stream();
     let depth = envi("GEB_DEPTH", 27) as usize;
@@ -1046,7 +1202,12 @@ fn seg_vision(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>) {
     // ---- 段级输入（注册序 = eager 的 index 约定）----
     // 0 patches / 1 patch_wt / 2 patch_b / 3 pos_rep / 4 zeros /
     // 5 shp_qkv3 / 6 shp_flat2 / 每层 12 项（GEB_QKV3: 16 项）/ 尾 4 项(pnw,pnb,projwt,projb)
-    s.data(ctx, "patches", &[t, V_PATCH_W], &rand_f16((t * V_PATCH_W) as usize, &mut seed, 300.0));
+    // e2e：真 patches（golden 或合成 bring-up）；缺省随机（对拍两路同值）
+    let patches_h = e2e
+        .as_ref()
+        .map(|st| st.patches.clone())
+        .unwrap_or_else(|| rand_f16((t * V_PATCH_W) as usize, &mut seed, 300.0));
+    s.data(ctx, "patches", &[t, V_PATCH_W], &patches_h);
     {
         let host = real
             .map(|w| lw_f16(&w.vision.patch_embedding))
@@ -1383,6 +1544,17 @@ fn seg_vision(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>) {
         vec![fin]
     };
 
+    if let Some(st) = e2e {
+        // e2e：加载 vision_real.om 跑一次，抓 post-projector 输出 [VT, PW]
+        let outs = e2e_run(ctx, stream, &mut s, "vision");
+        // vision OM 绑 108 个 LN aux 输出（trap #17：mean/rstd 死端会让 y 爆）
+        // ——主输出（post-projector）在 idx0
+        assert!(outs.len() >= 1);
+        st.vision_out = outs[0].clone();
+        let m = st.vision_out.iter().fold(0f32, |m, v| m.max(v.to_f32().abs()));
+        println!("[e2e] vision_out |max|={m:.4}");
+        return;
+    }
     parity_and_bench(ctx, stream, &mut s, "vision", &[(t * PW) as usize], &eager, bench);
     ge_builder::fini().expect("fini");
     println!("GE_VISION_PROBE_OK");
@@ -1393,7 +1565,7 @@ fn seg_vision(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>) {
 // compute_tail=false 语义）
 // ---------------------------------------------------------------------------
 
-fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>) {
+fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e: Option<&mut E2eStage>) {
     let ctx = be.ctx();
     let stream = be.stream();
     let depth = envi("GEB_DEPTH", 18) as usize;
@@ -1413,7 +1585,29 @@ fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>) {
     // ---- 段级输入 ----
     // 0 x0 / 1 zeros / 2..7 flat rope 六件（eager flat 版用）/
     // 8..11 rank-2 rope 表四件（GE rank-2 组合用）/ 层 10 项
-    s.data(ctx, "x0", &[p, PW], &rand_f16((p * PW) as usize, &mut seed, 100.0));
+    // e2e x0 = vision_out ‖ token_embedding[token_ids]（embed_prefix 同序：
+    // 视觉前、语言后；state 不进 prefix——π0.5 走离散化进 prompt 文本）
+    let x0_h = match (&e2e, real) {
+        (Some(st), Some(w)) => {
+            assert!(!st.vision_out.is_empty(), "e2e: 须先跑 vision 段");
+            assert_eq!(st.vision_out.len(), (VT * PW) as usize);
+            assert_eq!(st.token_ids.len(), tokens as usize, "golden token 数与 GEB_TOKENS 不符");
+            // 一次性 f32 物化 [vocab,PW]（~2.1GB 峰值，查完即弃）
+            let emb = w.vision.token_embedding.to_f32_vec().unwrap();
+            let vocab_w = PW as usize;
+            let mut x0 = st.vision_out.clone();
+            x0.reserve(st.token_ids.len() * vocab_w);
+            for &id in &st.token_ids {
+                let r = id as usize * vocab_w;
+                assert!(r + vocab_w <= emb.len(), "token id {id} 超 vocab");
+                x0.extend(emb[r..r + vocab_w].iter().map(|&v| f16::from_f32(v)));
+            }
+            x0
+        }
+        (Some(_), None) => panic!("e2e 需要 GEB_CKPT（token_embedding 查表）"),
+        _ => rand_f16((p * PW) as usize, &mut seed, 100.0),
+    };
+    s.data(ctx, "x0", &[p, PW], &x0_h);
     s.data_zeros(ctx, "zeros", p, PW);
     let (qc, qs, qi) = rope_flat_const(p, HEADS, 0);
     let (kc, ks, ki) = rope_flat_const(p, KV_HEADS, 0);
@@ -1671,6 +1865,15 @@ fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>) {
         outs
     };
 
+    if let Some(st) = e2e {
+        // e2e：加载 prefix_real.om 跑一次，抓 36×k/v（k0,v0,k1,v1,...）
+        let outs = e2e_run(ctx, stream, &mut s, "prefix");
+        assert_eq!(outs.len(), depth * 2);
+        st.kv = outs;
+        let m = st.kv.iter().flat_map(|v| v.iter()).fold(0f32, |m, v| m.max(v.to_f32().abs()));
+        println!("[e2e] prefix kv ×{} |max|={m:.4}", st.kv.len());
+        return;
+    }
     let elems = [(p * KVD) as usize];
     let out_elems: Vec<usize> = kv_outs.iter().map(|_| elems[0]).collect();
     parity_and_bench(ctx, stream, &mut s, "prefix", &out_elems, &eager, bench);
@@ -1683,7 +1886,7 @@ fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>) {
 // geglu) → action_out → euler）。styles/prefix-kv/euler 常数全为外部输入。
 // ---------------------------------------------------------------------------
 
-fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>) {
+fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e: Option<&mut E2eStage>) {
     let ctx = be.ctx();
     let stream = be.stream();
     let depth = envi("GEB_DEPTH", 18) as usize;
@@ -1704,7 +1907,15 @@ fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>) {
     // 0 state / 1 zeros / 2..7 flat rope（eager）/ 8..11 rank-2 表（GE）/
     // 12 ainwt / 13 ainb / 14.. 每层 (pk_i, pv_i)（rank-2）/
     // 每层 12 项 / 尾 fsc,fsh,aoutwt,aoutb,c1,c2
-    s.data(ctx, "state", &[HOR, ADIM], &rand_f16((HOR * ADIM) as usize, &mut seed, 100.0));
+    // e2e：state 起步 = noise（golden 或合成）；缺省随机（对拍两路同值）
+    let state_h = e2e
+        .as_ref()
+        .map(|st| st.noise.clone())
+        .unwrap_or_else(|| rand_f16((HOR * ADIM) as usize, &mut seed, 100.0));
+    s.data(ctx, "state", &[HOR, ADIM], &state_h);
+    if let Some(st) = e2e.as_ref() {
+        assert_eq!(st.kv.len(), depth * 2, "e2e: prefix 段 k/v 数与 flow 深度不符（GEB_DEPTH 须全 18）");
+    }
     s.data_zeros(ctx, "zeros", HOR, AW);
     let (qc, qs, qi) = rope_flat_const(HOR, HEADS, p);
     let (kc, ks, ki) = rope_flat_const(HOR, KV_HEADS, p);
@@ -1747,10 +1958,19 @@ fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>) {
         .map(|w| lb_f16(&w.action_in, AW as usize))
         .unwrap_or_else(|| rand_f16(AW as usize, &mut seed, 4000.0));
     s.data(ctx, "ainb", &[1, AW], &ainb_h);
-    // prefix k/v（rank-2——ConcatD axis=0 拼接后统一 Unsqueeze）
+    // prefix k/v（rank-2——ConcatD axis=0 拼接后统一 Unsqueeze）；
+    // e2e：prefix OM 36 输出直连（k0,v0,k1,v1,... → pk{i}=kv[2i]/pv{i}=kv[2i+1]）
     for i in 0..depth {
-        s.data(ctx, &format!("pk{i}"), &[p, KVD], &rand_f16((p * KVD) as usize, &mut seed, 100.0));
-        s.data(ctx, &format!("pv{i}"), &[p, KVD], &rand_f16((p * KVD) as usize, &mut seed, 100.0));
+        let pk_h = e2e
+            .as_ref()
+            .map(|st| st.kv[2 * i].clone())
+            .unwrap_or_else(|| rand_f16((p * KVD) as usize, &mut seed, 100.0));
+        let pv_h = e2e
+            .as_ref()
+            .map(|st| st.kv[2 * i + 1].clone())
+            .unwrap_or_else(|| rand_f16((p * KVD) as usize, &mut seed, 100.0));
+        s.data(ctx, &format!("pk{i}"), &[p, KVD], &pk_h);
+        s.data(ctx, &format!("pv{i}"), &[p, KVD], &pv_h);
     }
     // 层权重 12 项（GEB_QKV3: 16 项）：ascl ash [qkvwt qkvb | qw kw vw qb
     // kb vb] outwt outb mscl msh gatewt upwt downwt downb（eager qkv 独立投影）
@@ -1854,6 +2074,8 @@ fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>) {
             .unwrap_or_else(|| norm_f16(AW as usize, &mut seed, 0.0));
         s.data(ctx, &format!("{}downb", tag), &[1, AW], &downb_h);
     }
+    // e2e 每步覆写 final norm 条件用（fsc/fsh 的 bind 位）
+    let fs_idx = s.binds.len();
     s.data(ctx, "fsc", &[AW], &norm_f16(AW as usize, &mut seed, 1.0));
     s.data(ctx, "fsh", &[AW], &norm_f16(AW as usize, &mut seed, 0.0));
     {
@@ -2042,6 +2264,72 @@ fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>) {
         vec![fin]
     };
 
+    if let Some(st) = e2e {
+        // e2e 10 步：每步覆写 styles（qkv3 布局：ascl/ash=base+0/+1，
+        // mscl/msh=base+10/+11）+ state（x），pk/pv 不变；euler 已在图内
+        let rw = real.expect("e2e 需要 GEB_CKPT（time_mlp/style 投影）");
+        let cfg = Pi05Config::default();
+        let dir = std::env::var("GEB_OM_DIR").unwrap_or_else(|_| "/data/apxinf/om_cache".into());
+        println!("[e2e] loading {dir}/flow_real.om");
+        s.g = ge_builder::load(&format!("{dir}/flow_real.om")).expect("load om");
+        assert_eq!(s.g.num_outputs().unwrap(), 1);
+        let ob = ctx.malloc(s.g.output_size(0).unwrap().max(16)).expect("out malloc");
+        let h2d_f16 = |buf: &DeviceBuffer, vals: &[f16]| {
+            let bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect();
+            ctx.copy_h2d(buf, &bytes).expect("h2d style/state");
+        };
+        let mut x = st.noise.clone();
+        let t0 = std::time::Instant::now();
+        for step in 0..cfg.num_flow_steps {
+            // t = flow_start·(1-step/N)（ascend_vla 同式）→ te → cond → styles
+            let time = cfg.flow_start_time * (1.0 - step as f32 / cfg.num_flow_steps as f32);
+            let te = sinusoidal_time_embedding(
+                time,
+                cfg.action_expert.width,
+                cfg.time_min_period,
+                cfg.time_max_period,
+            );
+            let cond = e2e_conditioning(rw, &te);
+            for i in 0..depth {
+                let lay = &rw.action_layers[i];
+                let (a_scl, a_sh) = e2e_style_pair(&lay.input_norm.style, &cond, AW as usize);
+                let (m_scl, m_sh) = e2e_style_pair(&lay.post_attention_norm.style, &cond, AW as usize);
+                let b = layer_bases[i];
+                h2d_f16(&s.binds[b], &a_scl);
+                h2d_f16(&s.binds[b + 1], &a_sh);
+                h2d_f16(&s.binds[b + 10], &m_scl);
+                h2d_f16(&s.binds[b + 11], &m_sh);
+            }
+            let (f_scl, f_sh) = e2e_style_pair(&rw.action_final_norm.style, &cond, AW as usize);
+            h2d_f16(&s.binds[fs_idx], &f_scl);
+            h2d_f16(&s.binds[fs_idx + 1], &f_sh);
+            h2d_f16(&s.binds[0], &x); // state = 当前 x
+            let ins = s.ins();
+            let oref: Vec<&DeviceBuffer> = vec![&ob];
+            s.g.run(&ins, &oref, stream).expect("ge run");
+            drop(stream.synchronize());
+            x = download_f16(ctx, &ob, (HOR * ADIM) as usize);
+            let m = x.iter().fold(0f32, |m, v| m.max(v.to_f32().abs()));
+            println!("[e2e] step {step} |x|max={m:.4}");
+        }
+        println!("[e2e] flow 10 步 {:?}（含每步 styles host 计算 + h2d 换绑）", t0.elapsed());
+        st.actions = x;
+        if let Some(g) = &st.golden_actions {
+            let mut md = 0f32;
+            for (a, b) in st.actions.iter().zip(g.iter()) {
+                md = md.max((a.to_f32() - b.to_f32()).abs());
+            }
+            let rm = g.iter().fold(0f32, |m, v| m.max(v.to_f32().abs()));
+            println!(
+                "[e2e] GOLDEN PARITY: max_diff={md:.5} (golden |max|={rm:.3}, rel={:.1}%)",
+                if rm > 0.0 { md / rm * 100.0 } else { md }
+            );
+        } else {
+            println!("[e2e] 无 golden actions——只验有限性（golden 对拍/LIBERO 归下一步）");
+        }
+        assert!(st.actions.iter().all(|v| v.to_f32().is_finite()), "actions 含非有限值");
+        return;
+    }
     parity_and_bench(ctx, stream, &mut s, "flow", &[(HOR * ADIM) as usize], &eager, bench);
     ge_builder::fini().expect("fini");
     println!("GE_FLOW_PROBE_OK");
@@ -3347,9 +3635,10 @@ fn main() {
         return;
     }
     match seg.as_str() {
-        "vision" => seg_vision(&be, bench, real.as_ref()),
-        "prefix" => seg_prefix(&be, bench, real.as_ref()),
-        "flow" => seg_flow(&be, bench, real.as_ref()),
-        other => panic!("GEB_SEG: vision|prefix|flow, got {other}"),
+        "vision" => seg_vision(&be, bench, real.as_ref(), None),
+        "prefix" => seg_prefix(&be, bench, real.as_ref(), None),
+        "flow" => seg_flow(&be, bench, real.as_ref(), None),
+        "e2e" => seg_e2e(&be, bench, real.as_ref()),
+        other => panic!("GEB_SEG: vision|prefix|flow|e2e, got {other}"),
     }
 }
