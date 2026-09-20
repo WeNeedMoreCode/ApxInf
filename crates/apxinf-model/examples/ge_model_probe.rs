@@ -1119,7 +1119,8 @@ fn seg_e2e(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>) {
     );
     let real = real.expect("GEB_SEG=e2e 需要 GEB_CKPT（token_embedding/time_mlp/style 投影 host 消费）");
     let tokens = envi("GEB_TOKENS", 64) as usize;
-    assert!((VT + tokens as i64) % 16 == 0, "prefix P 须 16 倍数（16 倍 M 纪律）");
+    // 注：GE 静态 OM 接受非 16 倍 M（GEB_TOKENS=200 → P=968 实证编译/运行/
+    // parity 正常——eager aclnn 的 16 倍 M 崩坑不适用于 GE 路径）
     let mut st = match std::env::var("GEB_E2E_GOLDEN") {
         Ok(path) => {
             println!("[e2e] golden: {path}");
