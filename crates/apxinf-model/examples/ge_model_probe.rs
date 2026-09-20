@@ -35,10 +35,17 @@
 //!   GEB_TOKENS（prefix token 数，默认 64 → P=832，16 倍数纪律）/
 //!   GEB_BENCH / GEB_SAVE / GEB_LOAD / GEB_ATTN=manual（手工 attention）/
 //!   GEB_QKV3=1（q/k/v 独立投影，消 SliceD 视图运行时物化）
+//!   GEB_CKPT=<dir>（真 checkpoint：权重经 Pi05Weights::from_safetensors
+//!   host 解析（含 Gemma 1+w scale 折叠）→ bf16→f16 → wt() Const 路径烤入
+//!   OM（per-checkpoint，ADR-002）；缺省合成权重。x0/state/pk/pv/ada 条件
+//!   向量等运行时输入保持合成（两路同值对拍不受影响）。
+//!   ⚠ GEB_LOAD 真 OM（*_real.om）必须配 GEB_CKPT——权重烤在 OM 里，但
+//!   eager 参考仍从 binds 取权重，缺 GEB_CKPT 时对拍错权重无意义
 use half::f16;
 
 use apxinf_ascend::ge_builder::{self, Dtype, GeGraph};
 use apxinf_ascend::{ops as aops, AscendBackend, AscendContext, AscendStream, DeviceBuffer};
+use apxinf_model::pi05::{LinearWeights, Pi05Weights};
 
 // π0.5 3 视图档维度（Pi05Config::default）
 const VT: i64 = 768; // vision tokens = 3 views × 256 patches
@@ -115,6 +122,24 @@ fn norm_f16(n: usize, seed: &mut u32, center: f32) -> Vec<f16> {
     }
     *seed = (z >> 32) as u32;
     v
+}
+
+/// 真 checkpoint Tensor（bf16/f32）→ host f16（310P 无 bf16，精度策略 fp16）
+fn t_f16(t: &apxinf_core::Tensor) -> Vec<f16> {
+    t.to_f32_vec().unwrap().into_iter().map(f16::from_f32).collect()
+}
+
+/// LinearWeights.weight [in,out] → host f16（wt()/wbuf_t 的 host 布局同构）
+fn lw_f16(l: &LinearWeights) -> Vec<f16> {
+    t_f16(&l.weight)
+}
+
+/// LinearWeights.bias → f16；None（Gemma 投影无 bias）→ zeros
+fn lb_f16(l: &LinearWeights, n: usize) -> Vec<f16> {
+    match &l.bias {
+        Some(b) => t_f16(b),
+        None => vec![f16::from_f32(0.0); n],
+    }
 }
 
 fn upload(ctx: &AscendContext, vals: &[f16]) -> DeviceBuffer {
@@ -998,7 +1023,7 @@ fn parity_and_bench(
 // eager = ascend_executor::vision_layer_ascend 序列镜像
 // ---------------------------------------------------------------------------
 
-fn seg_vision(be: &AscendBackend, bench: bool) {
+fn seg_vision(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>) {
     let ctx = be.ctx();
     let stream = be.stream();
     let depth = envi("GEB_DEPTH", 27) as usize;
@@ -1023,13 +1048,20 @@ fn seg_vision(be: &AscendBackend, bench: bool) {
     // 5 shp_qkv3 / 6 shp_flat2 / 每层 12 项（GEB_QKV3: 16 项）/ 尾 4 项(pnw,pnb,projwt,projb)
     s.data(ctx, "patches", &[t, V_PATCH_W], &rand_f16((t * V_PATCH_W) as usize, &mut seed, 300.0));
     {
-        let host = rand_f16((V_PATCH_W * VW) as usize, &mut seed, 30000.0);
+        let host = real
+            .map(|w| lw_f16(&w.vision.patch_embedding))
+            .unwrap_or_else(|| rand_f16((V_PATCH_W * VW) as usize, &mut seed, 30000.0));
         s.wt(ctx, "patch_wt", &[VW, V_PATCH_W], &host, V_PATCH_W, VW);
     }
-    s.data(ctx, "patch_b", &[1, VW], &rand_f16(VW as usize, &mut seed, 12000.0));
+    let patch_b_h = real
+        .map(|w| lb_f16(&w.vision.patch_embedding, VW as usize))
+        .unwrap_or_else(|| rand_f16(VW as usize, &mut seed, 12000.0));
+    s.data(ctx, "patch_b", &[1, VW], &patch_b_h);
     {
         // position 表循环重复（cuda kernel 语义：行 r 读 table[r % tpv]）
-        let table = rand_f16((VPV * VW) as usize, &mut seed, 300.0);
+        let table = real
+            .map(|w| t_f16(&w.vision.position_embedding))
+            .unwrap_or_else(|| rand_f16((VPV * VW) as usize, &mut seed, 300.0));
         let mut rep = Vec::with_capacity((t * VW) as usize);
         for r in 0..t as usize {
             let src = (r % VPV as usize) * VW as usize;
@@ -1068,8 +1100,14 @@ fn seg_vision(be: &AscendBackend, bench: bool) {
         let base = s.binds.len();
         layer_bases.push(base);
         let p = format!("l{i}_");
-        let n1w_h = norm_f16(VW as usize, &mut seed, 1.0);
-        let n1b_h = norm_f16(VW as usize, &mut seed, 0.0);
+        // 真权重：SigLIP 块按层索引（GEB_DEPTH 冒烟 <= 27）
+        let blk = real.and_then(|w| w.vision.blocks.get(i));
+        let n1w_h = blk
+            .map(|b| t_f16(&b.norm1.weight))
+            .unwrap_or_else(|| norm_f16(VW as usize, &mut seed, 1.0));
+        let n1b_h = blk
+            .map(|b| t_f16(&b.norm1.bias))
+            .unwrap_or_else(|| norm_f16(VW as usize, &mut seed, 0.0));
         s.data(ctx, &format!("{}n1w", p), &[VW], &n1w_h);
         s.data(ctx, &format!("{}n1b", p), &[VW], &n1b_h);
         {
@@ -1077,15 +1115,31 @@ fn seg_vision(be: &AscendBackend, bench: bool) {
             // eager 三块各自转置上传；bias 整条（GE）/host 切三段（eager）。
             // manual attention 时 GE 侧 q 块（权重+bias）预乘 1/√hd（图内
             // 无 scale 算子）；eager 侧保持原值（PFA 的 scale_value attr 承担）
-            let wq = rand_f16((VW * vqd) as usize, &mut seed, 30000.0);
-            let wk = rand_f16((VW * vqd) as usize, &mut seed, 30000.0);
-            let wv = rand_f16((VW * vqd) as usize, &mut seed, 30000.0);
+            let wq = blk
+                .map(|b| lw_f16(&b.q))
+                .unwrap_or_else(|| rand_f16((VW * vqd) as usize, &mut seed, 30000.0));
+            let wk = blk
+                .map(|b| lw_f16(&b.k))
+                .unwrap_or_else(|| rand_f16((VW * vqd) as usize, &mut seed, 30000.0));
+            let wv = blk
+                .map(|b| lw_f16(&b.v))
+                .unwrap_or_else(|| rand_f16((VW * vqd) as usize, &mut seed, 30000.0));
             let wq_s: Vec<f16> = if attn_manual {
                 wq.iter().map(|v| f16::from_f32(v.to_f32() * vscale)).collect()
             } else {
                 wq.clone()
             };
-            let bias = rand_f16(qkvw as usize, &mut seed, 12000.0);
+            // 真权重 qkv bias = q.bias ‖ k.bias ‖ v.bias（SigLIP 三投影各有 bias）
+            let bias = blk
+                .map(|b| {
+                    [
+                        lb_f16(&b.q, vqd as usize),
+                        lb_f16(&b.k, vqd as usize),
+                        lb_f16(&b.v, vqd as usize),
+                    ]
+                    .concat()
+                })
+                .unwrap_or_else(|| rand_f16(qkvw as usize, &mut seed, 12000.0));
             let bias_s: Vec<f16> = if attn_manual {
                 bias.iter()
                     .enumerate()
@@ -1126,25 +1180,44 @@ fn seg_vision(be: &AscendBackend, bench: bool) {
             eager_qkv.push((ebq, ebk, ebv, bq, bk, bv));
         }
         {
-            let host = rand_f16((vqd * VW) as usize, &mut seed, 30000.0);
+            let host = blk
+                .map(|b| lw_f16(&b.output))
+                .unwrap_or_else(|| rand_f16((vqd * VW) as usize, &mut seed, 30000.0));
             s.wt(ctx, &format!("{}outwt", p), &[VW, vqd], &host, vqd, VW);
         }
-        s.data(ctx, &format!("{}outb", p), &[1, VW], &rand_f16(VW as usize, &mut seed, 12000.0));
-        let n2w_h = norm_f16(VW as usize, &mut seed, 1.0);
-        let n2b_h = norm_f16(VW as usize, &mut seed, 0.0);
+        let outb_h = blk
+            .map(|b| lb_f16(&b.output, VW as usize))
+            .unwrap_or_else(|| rand_f16(VW as usize, &mut seed, 12000.0));
+        s.data(ctx, &format!("{}outb", p), &[1, VW], &outb_h);
+        let n2w_h = blk
+            .map(|b| t_f16(&b.norm2.weight))
+            .unwrap_or_else(|| norm_f16(VW as usize, &mut seed, 1.0));
+        let n2b_h = blk
+            .map(|b| t_f16(&b.norm2.bias))
+            .unwrap_or_else(|| norm_f16(VW as usize, &mut seed, 0.0));
         s.data(ctx, &format!("{}n2w", p), &[VW], &n2w_h);
         s.data(ctx, &format!("{}n2b", p), &[VW], &n2b_h);
         eager_norms.push((n1w_h, n1b_h, n2w_h, n2b_h));
         {
-            let host = rand_f16((VW * V_INTER) as usize, &mut seed, 30000.0);
+            let host = blk
+                .map(|b| lw_f16(&b.fc1))
+                .unwrap_or_else(|| rand_f16((VW * V_INTER) as usize, &mut seed, 30000.0));
             s.wt(ctx, &format!("{}fc1wt", p), &[V_INTER, VW], &host, VW, V_INTER);
         }
-        s.data(ctx, &format!("{}fc1b", p), &[1, V_INTER], &rand_f16(V_INTER as usize, &mut seed, 12000.0));
+        let fc1b_h = blk
+            .map(|b| lb_f16(&b.fc1, V_INTER as usize))
+            .unwrap_or_else(|| rand_f16(V_INTER as usize, &mut seed, 12000.0));
+        s.data(ctx, &format!("{}fc1b", p), &[1, V_INTER], &fc1b_h);
         {
-            let host = rand_f16((V_INTER * VW) as usize, &mut seed, 30000.0);
+            let host = blk
+                .map(|b| lw_f16(&b.fc2))
+                .unwrap_or_else(|| rand_f16((V_INTER * VW) as usize, &mut seed, 30000.0));
             s.wt(ctx, &format!("{}fc2wt", p), &[VW, V_INTER], &host, V_INTER, VW);
         }
-        s.data(ctx, &format!("{}fc2b", p), &[1, VW], &rand_f16(VW as usize, &mut seed, 12000.0));
+        let fc2b_h = blk
+            .map(|b| lb_f16(&b.fc2, VW as usize))
+            .unwrap_or_else(|| rand_f16(VW as usize, &mut seed, 12000.0));
+        s.data(ctx, &format!("{}fc2b", p), &[1, VW], &fc2b_h);
 
         // attention（v3 方案：rank-2 列切 → Reshape rank-3 桥）。
         // manual：[b*h,s,d] 桥 + bmm/softmax/bmm（全静态）；pfa：batch PFA
@@ -1209,15 +1282,24 @@ fn seg_vision(be: &AscendBackend, bench: bool) {
     }
 
     // ---- post norm + projector ----
-    let pnw_h = norm_f16(VW as usize, &mut seed, 1.0);
-    let pnb_h = norm_f16(VW as usize, &mut seed, 0.0);
+    let pnw_h = real
+        .map(|w| t_f16(&w.vision.post_layer_norm.weight))
+        .unwrap_or_else(|| norm_f16(VW as usize, &mut seed, 1.0));
+    let pnb_h = real
+        .map(|w| t_f16(&w.vision.post_layer_norm.bias))
+        .unwrap_or_else(|| norm_f16(VW as usize, &mut seed, 0.0));
     s.data(ctx, "pnw", &[VW], &pnw_h);
     s.data(ctx, "pnb", &[VW], &pnb_h);
     {
-        let host = rand_f16((VW * PW) as usize, &mut seed, 30000.0);
+        let host = real
+            .map(|w| lw_f16(&w.vision.multimodal_projector))
+            .unwrap_or_else(|| rand_f16((VW * PW) as usize, &mut seed, 30000.0));
         s.wt(ctx, "projwt", &[PW, VW], &host, VW, PW);
     }
-    s.data(ctx, "projb", &[1, PW], &rand_f16(PW as usize, &mut seed, 12000.0));
+    let projb_h = real
+        .map(|w| lb_f16(&w.vision.multimodal_projector, PW as usize))
+        .unwrap_or_else(|| rand_f16(PW as usize, &mut seed, 12000.0));
+    s.data(ctx, "projb", &[1, PW], &projb_h);
     let pln = s.addln("pln", &cur, "pnw", "pnb", "nsh", &[t, VW]);
     let proj = s.mm("proj", &pln, &[t, VW], "projwt", &[PW, VW], &[t, PW]);
     let out = s.bias("out", &proj, &[t, PW], "projb");
@@ -1311,7 +1393,7 @@ fn seg_vision(be: &AscendBackend, bench: bool) {
 // compute_tail=false 语义）
 // ---------------------------------------------------------------------------
 
-fn seg_prefix(be: &AscendBackend, bench: bool) {
+fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>) {
     let ctx = be.ctx();
     let stream = be.stream();
     let depth = envi("GEB_DEPTH", 18) as usize;
@@ -1378,12 +1460,27 @@ fn seg_prefix(be: &AscendBackend, bench: bool) {
         layer_bases.push(base);
         let tag = format!("l{i}_");
         let last = i + 1 == depth;
-        s.data(ctx, &format!("{}g1", tag), &[PW], &norm_f16(PW as usize, &mut seed, 1.0));
+        // 真权重：语言层 host 解析时已把 Gemma 1+w scale 折进 q/k/v/gate/up
+        //（g1/g2 = ones）——probe 图直接消费该约定，无需再乘 norm scale
+        let lay = real.and_then(|w| w.language_layers.get(i));
+        let g1_h = lay
+            .map(|l| t_f16(&l.input_norm_scale))
+            .unwrap_or_else(|| norm_f16(PW as usize, &mut seed, 1.0));
+        s.data(ctx, &format!("{}g1", tag), &[PW], &g1_h);
         {
-            let wq = rand_f16((PW * QD) as usize, &mut seed, 8000.0);
-            let wk = rand_f16((PW * KVD) as usize, &mut seed, 8000.0);
-            let wv = rand_f16((PW * KVD) as usize, &mut seed, 8000.0);
-            let bias = rand_f16(QKVW as usize, &mut seed, 4000.0);
+            let wq = lay
+                .map(|l| lw_f16(&l.attention.q))
+                .unwrap_or_else(|| rand_f16((PW * QD) as usize, &mut seed, 8000.0));
+            let wk = lay
+                .map(|l| lw_f16(&l.attention.k))
+                .unwrap_or_else(|| rand_f16((PW * KVD) as usize, &mut seed, 8000.0));
+            let wv = lay
+                .map(|l| lw_f16(&l.attention.v))
+                .unwrap_or_else(|| rand_f16((PW * KVD) as usize, &mut seed, 8000.0));
+            // Gemma 投影无 bias（真权重 = zeros）
+            let bias = lay
+                .map(|_| vec![f16::from_f32(0.0); QKVW as usize])
+                .unwrap_or_else(|| rand_f16(QKVW as usize, &mut seed, 4000.0));
             // manual attention：q 块（权重+bias）预乘 1/√hd（图内无 scale
             // 算子）；eager 侧保持原值（PFA scale_value 承担）
             let wq_s: Vec<f16> = if attn_manual {
@@ -1426,24 +1523,41 @@ fn seg_prefix(be: &AscendBackend, bench: bool) {
             eager_qkv.push((ebq, ebk, ebv, bq, bk, bv));
         }
         {
-            let host = rand_f16((QD * PW) as usize, &mut seed, 8000.0);
+            let host = lay
+                .map(|l| lw_f16(&l.attention.output))
+                .unwrap_or_else(|| rand_f16((QD * PW) as usize, &mut seed, 8000.0));
             s.wt(ctx, &format!("{}outwt", tag), &[PW, QD], &host, QD, PW);
         }
-        s.data(ctx, &format!("{}outb", tag), &[1, PW], &rand_f16(PW as usize, &mut seed, 4000.0));
-        s.data(ctx, &format!("{}g2", tag), &[PW], &norm_f16(PW as usize, &mut seed, 1.0));
+        let outb_h = lay
+            .map(|_| vec![f16::from_f32(0.0); PW as usize])
+            .unwrap_or_else(|| rand_f16(PW as usize, &mut seed, 4000.0));
+        s.data(ctx, &format!("{}outb", tag), &[1, PW], &outb_h);
+        let g2_h = lay
+            .map(|l| t_f16(&l.post_attention_norm_scale))
+            .unwrap_or_else(|| norm_f16(PW as usize, &mut seed, 1.0));
+        s.data(ctx, &format!("{}g2", tag), &[PW], &g2_h);
         {
-            let host = rand_f16((PW * INTER) as usize, &mut seed, 8000.0);
+            let host = lay
+                .map(|l| lw_f16(&l.mlp.gate))
+                .unwrap_or_else(|| rand_f16((PW * INTER) as usize, &mut seed, 8000.0));
             s.wt(ctx, &format!("{}gatewt", tag), &[INTER, PW], &host, PW, INTER);
         }
         {
-            let host = rand_f16((PW * INTER) as usize, &mut seed, 8000.0);
+            let host = lay
+                .map(|l| lw_f16(&l.mlp.up))
+                .unwrap_or_else(|| rand_f16((PW * INTER) as usize, &mut seed, 8000.0));
             s.wt(ctx, &format!("{}upwt", tag), &[INTER, PW], &host, PW, INTER);
         }
         {
-            let host = rand_f16((INTER * PW) as usize, &mut seed, 8000.0);
+            let host = lay
+                .map(|l| lw_f16(&l.mlp.down))
+                .unwrap_or_else(|| rand_f16((INTER * PW) as usize, &mut seed, 8000.0));
             s.wt(ctx, &format!("{}downwt", tag), &[PW, INTER], &host, INTER, PW);
         }
-        s.data(ctx, &format!("{}downb", tag), &[1, PW], &rand_f16(PW as usize, &mut seed, 4000.0));
+        let downb_h = lay
+            .map(|_| vec![f16::from_f32(0.0); PW as usize])
+            .unwrap_or_else(|| rand_f16(PW as usize, &mut seed, 4000.0));
+        s.data(ctx, &format!("{}downb", tag), &[1, PW], &downb_h);
 
         let norm1 = s.addrms(&format!("{}n1", tag), &cur, "zeros", &format!("{}g1", tag), &[p, PW]);
         // rank-2 切分 + rope（rank-2 版）+ Reshape rank-3 桥。
@@ -1569,7 +1683,7 @@ fn seg_prefix(be: &AscendBackend, bench: bool) {
 // geglu) → action_out → euler）。styles/prefix-kv/euler 常数全为外部输入。
 // ---------------------------------------------------------------------------
 
-fn seg_flow(be: &AscendBackend, bench: bool) {
+fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>) {
     let ctx = be.ctx();
     let stream = be.stream();
     let depth = envi("GEB_DEPTH", 18) as usize;
@@ -1624,10 +1738,15 @@ fn seg_flow(be: &AscendBackend, bench: bool) {
     s.const_i32("shp_fq3", &[HEADS as i32, HOR as i32, HD as i32]);
     s.const_i32("shp_fa4", &[1, HEADS as i32, HOR as i32, HD as i32]);
     {
-        let host = rand_f16((ADIM * AW) as usize, &mut seed, 8000.0);
+        let host = real
+            .map(|w| lw_f16(&w.action_in))
+            .unwrap_or_else(|| rand_f16((ADIM * AW) as usize, &mut seed, 8000.0));
         s.wt(ctx, "ainwt", &[AW, ADIM], &host, ADIM, AW);
     }
-    s.data(ctx, "ainb", &[1, AW], &rand_f16(AW as usize, &mut seed, 4000.0));
+    let ainb_h = real
+        .map(|w| lb_f16(&w.action_in, AW as usize))
+        .unwrap_or_else(|| rand_f16(AW as usize, &mut seed, 4000.0));
+    s.data(ctx, "ainb", &[1, AW], &ainb_h);
     // prefix k/v（rank-2——ConcatD axis=0 拼接后统一 Unsqueeze）
     for i in 0..depth {
         s.data(ctx, &format!("pk{i}"), &[p, KVD], &rand_f16((p * KVD) as usize, &mut seed, 100.0));
@@ -1640,13 +1759,26 @@ fn seg_flow(be: &AscendBackend, bench: bool) {
     for i in 0..depth {
         layer_bases.push(s.binds.len());
         let tag = format!("l{i}_");
+        // 真权重：ascl/ash/mscl/msh 是 ada-norm 条件向量（style 投影 ×
+        // conditioning 的运行时产物，随 time step 变化）——保持合成输入，
+        // 真权重接入只换投影/LN 类权重
+        let lay = real.and_then(|w| w.action_layers.get(i));
         s.data(ctx, &format!("{}ascl", tag), &[AW], &norm_f16(AW as usize, &mut seed, 1.0));
         s.data(ctx, &format!("{}ash", tag), &[AW], &norm_f16(AW as usize, &mut seed, 0.0));
         {
-            let wq = rand_f16((AW * QD) as usize, &mut seed, 8000.0);
-            let wk = rand_f16((AW * KVD) as usize, &mut seed, 8000.0);
-            let wv = rand_f16((AW * KVD) as usize, &mut seed, 8000.0);
-            let bias = rand_f16(QKVW as usize, &mut seed, 4000.0);
+            let wq = lay
+                .map(|l| lw_f16(&l.attention.q))
+                .unwrap_or_else(|| rand_f16((AW * QD) as usize, &mut seed, 8000.0));
+            let wk = lay
+                .map(|l| lw_f16(&l.attention.k))
+                .unwrap_or_else(|| rand_f16((AW * KVD) as usize, &mut seed, 8000.0));
+            let wv = lay
+                .map(|l| lw_f16(&l.attention.v))
+                .unwrap_or_else(|| rand_f16((AW * KVD) as usize, &mut seed, 8000.0));
+            // Gemma 投影无 bias（真权重 = zeros）
+            let bias = lay
+                .map(|_| vec![f16::from_f32(0.0); QKVW as usize])
+                .unwrap_or_else(|| rand_f16(QKVW as usize, &mut seed, 4000.0));
             // manual attention：q 块（权重+bias）预乘 1/√hd；eager 保持原值
             let wq_s: Vec<f16> = if attn_manual {
                 wq.iter().map(|v| f16::from_f32(v.to_f32() * fscale)).collect()
@@ -1688,33 +1820,52 @@ fn seg_flow(be: &AscendBackend, bench: bool) {
             eager_qkv.push((ebq, ebk, ebv, bq, bk, bv));
         }
         {
-            let host = rand_f16((QD * AW) as usize, &mut seed, 8000.0);
+            let host = lay
+                .map(|l| lw_f16(&l.attention.output))
+                .unwrap_or_else(|| rand_f16((QD * AW) as usize, &mut seed, 8000.0));
             s.wt(ctx, &format!("{}outwt", tag), &[AW, QD], &host, QD, AW);
         }
-        s.data(ctx, &format!("{}outb", tag), &[1, AW], &rand_f16(AW as usize, &mut seed, 4000.0));
+        let outb_h = lay
+            .map(|_| vec![f16::from_f32(0.0); AW as usize])
+            .unwrap_or_else(|| rand_f16(AW as usize, &mut seed, 4000.0));
+        s.data(ctx, &format!("{}outb", tag), &[1, AW], &outb_h);
         s.data(ctx, &format!("{}mscl", tag), &[AW], &norm_f16(AW as usize, &mut seed, 1.0));
         s.data(ctx, &format!("{}msh", tag), &[AW], &norm_f16(AW as usize, &mut seed, 0.0));
         {
-            let host = rand_f16((AW * AINTER) as usize, &mut seed, 8000.0);
+            let host = lay
+                .map(|l| lw_f16(&l.mlp.gate))
+                .unwrap_or_else(|| rand_f16((AW * AINTER) as usize, &mut seed, 8000.0));
             s.wt(ctx, &format!("{}gatewt", tag), &[AINTER, AW], &host, AW, AINTER);
         }
         {
-            let host = rand_f16((AW * AINTER) as usize, &mut seed, 8000.0);
+            let host = lay
+                .map(|l| lw_f16(&l.mlp.up))
+                .unwrap_or_else(|| rand_f16((AW * AINTER) as usize, &mut seed, 8000.0));
             s.wt(ctx, &format!("{}upwt", tag), &[AINTER, AW], &host, AW, AINTER);
         }
         {
-            let host = rand_f16((AINTER * AW) as usize, &mut seed, 8000.0);
+            let host = lay
+                .map(|l| lw_f16(&l.mlp.down))
+                .unwrap_or_else(|| rand_f16((AINTER * AW) as usize, &mut seed, 8000.0));
             s.wt(ctx, &format!("{}downwt", tag), &[AW, AINTER], &host, AINTER, AW);
         }
-        s.data(ctx, &format!("{}downb", tag), &[1, AW], &norm_f16(AW as usize, &mut seed, 0.0));
+        let downb_h = lay
+            .map(|_| vec![f16::from_f32(0.0); AW as usize])
+            .unwrap_or_else(|| norm_f16(AW as usize, &mut seed, 0.0));
+        s.data(ctx, &format!("{}downb", tag), &[1, AW], &downb_h);
     }
     s.data(ctx, "fsc", &[AW], &norm_f16(AW as usize, &mut seed, 1.0));
     s.data(ctx, "fsh", &[AW], &norm_f16(AW as usize, &mut seed, 0.0));
     {
-        let host = rand_f16((AW * ADIM) as usize, &mut seed, 8000.0);
+        let host = real
+            .map(|w| lw_f16(&w.action_out))
+            .unwrap_or_else(|| rand_f16((AW * ADIM) as usize, &mut seed, 8000.0));
         s.wt(ctx, "aoutwt", &[ADIM, AW], &host, AW, ADIM);
     }
-    s.data(ctx, "aoutb", &[1, ADIM], &rand_f16(ADIM as usize, &mut seed, 4000.0));
+    let aoutb_h = real
+        .map(|w| lb_f16(&w.action_out, ADIM as usize))
+        .unwrap_or_else(|| rand_f16(ADIM as usize, &mut seed, 4000.0));
+    s.data(ctx, "aoutb", &[1, ADIM], &aoutb_h);
     // euler 常数（σ = dt = -0.1：x' = (1+σ)x + σ·v）
     let eul_c1 = vec![f16::from_f32(0.9); (HOR * ADIM) as usize];
     let eul_c2 = vec![f16::from_f32(-0.1); (HOR * ADIM) as usize];
@@ -3178,14 +3329,27 @@ fn main() {
     let bench = std::env::var("GEB_BENCH").is_ok();
     ge_builder::init("Ascend310P3").expect("geb init (before acl runtime)");
     let be = AscendBackend::new(0).expect("be");
+    // GEB_CKPT：真 checkpoint（LeRobot safetensors 目录/单文件）。host 解析
+    // 管线含 LeRobot 前缀归一、[in,out] 物理转置、Gemma 1+w scale 折叠
+    // （g1/g2 变 ones，折叠进 q/k/v/gate/up——probe 图直接消费该约定）
+    let real = std::env::var("GEB_CKPT").ok().map(|path| {
+        let t0 = std::time::Instant::now();
+        let w = Pi05Weights::from_safetensors(
+            &apxinf_model::Pi05Config::default(),
+            std::path::Path::new(&path),
+        )
+        .expect("GEB_CKPT load");
+        println!("GEB_CKPT: {path} loaded in {:?}", t0.elapsed());
+        w
+    });
     if let Ok(t) = std::env::var("GEB_OPTEST") {
         optest(&be, &t);
         return;
     }
     match seg.as_str() {
-        "vision" => seg_vision(&be, bench),
-        "prefix" => seg_prefix(&be, bench),
-        "flow" => seg_flow(&be, bench),
+        "vision" => seg_vision(&be, bench, real.as_ref()),
+        "prefix" => seg_prefix(&be, bench, real.as_ref()),
+        "flow" => seg_flow(&be, bench, real.as_ref()),
         other => panic!("GEB_SEG: vision|prefix|flow, got {other}"),
     }
 }
