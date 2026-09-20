@@ -2540,7 +2540,7 @@ fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e: Op
 
 /// 单算子最小图编译冒烟（GEB_OPTEST=btd|rsh|sld|gat|cat|aln|gln|asc）——
 /// 新算子逐个定罪用（三段图共享的新算子集）
-fn optest(be: &AscendBackend, which: &str) {
+fn optest(be: &AscendBackend, which: &str, real: Option<&Pi05Weights>) {
     let ctx = be.ctx();
     let mut s = Seg::new(&format!("op_{which}"));
     let zeros_host = vec![f16::from_f32(0.0); 768 * 1152];
@@ -3809,7 +3809,109 @@ fn optest(be: &AscendBackend, which: &str) {
                 );
             }
         }
-        other => panic!("GEB_OPTEST: ...|v3n|tldn|lnv4c|asc*|ma*|bc4|wgt, got {other}"),
+        // arm: AddRmsNorm 真数据单算（2026-09-21 跨度收口）——x = golden res0
+        // （层 0 o_proj+残差真值，712×2048），x2=zeros、gamma=ones（fold 约定），
+        // GE 图 AddRmsNorm vs aclnn eager add_rms_norm_fp16；落盘供 f64 对拍
+        "arm" => {
+            let gpath = std::env::var("GEB_E2E_GOLDEN").expect("arm 需要 GEB_E2E_GOLDEN（golden v3）");
+            let (t, _) = apxinf_loader::safetensors::load_native_path(std::path::Path::new(&gpath))
+                .expect("golden load");
+            let rv = t.get("res0").expect("golden 缺 res0").to_f32_vec().unwrap();
+            let resh: Vec<f16> = rv.iter().map(|&v| f16::from_f32(v)).collect();
+            let (m, w) = (712i64, 2048i64);
+            assert_eq!(resh.len(), (m * w) as usize, "res0 长度 ≠ 712×2048");
+            let zeros = vec![f16::from_f32(0.0); (m * w) as usize];
+            let gamma = vec![f16::from_f32(1.0); w as usize];
+            let stream = be.stream();
+            let xb = upload(ctx, &resh);
+            let zb = upload(ctx, &zeros);
+            let gb = upload(ctx, &gamma);
+            let er = aops::add_rms_norm_fp16(ctx, &stream, &xb, &zb, &gb, &[m, w], RMS_EPS)
+                .unwrap()
+                .0;
+            drop(stream.synchronize());
+            let ef = download_f16(ctx, &er, (m * w) as usize);
+            let bytes: Vec<u8> = ef.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect();
+            std::fs::write("/tmp/arm_eager.f16", &bytes).expect("dump eager");
+            let mut s = Seg::new("arm_ge");
+            let x = s.data(ctx, "x", &[m, w], &resh);
+            let _ = x;
+            s.data_zeros(ctx, "zeros", m, w);
+            s.data(ctx, "gamma", &[w], &gamma);
+            let y = s.addrms("y", "x", "zeros", "gamma", &[m, w]);
+            s.finish(&[&y]);
+            let ins: Vec<&DeviceBuffer> = s.binds.iter().collect();
+            let out = ctx.malloc((m * w * 2) as usize).unwrap();
+            s.g.run(&ins, &[&out], stream).unwrap();
+            drop(stream.synchronize());
+            let ge = download_f16(ctx, &out, (m * w) as usize);
+            let (mut md, mut gm) = (0f32, 0f32);
+            for (a, b) in ge.iter().zip(&ef) {
+                md = md.max((a.to_f32() - b.to_f32()).abs());
+                gm = gm.max(b.to_f32().abs());
+            }
+            println!("arm[ge]: vs_eager max_diff={md:.5} rel={:.3}%", md / gm * 100.0);
+            let bytes: Vec<u8> = ge.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect();
+            std::fs::write("/tmp/arm_ge.f16", &bytes).expect("dump ge");
+        }
+        // oproj: 真数据单算裁决（2026-09-21 定位收口）——norm2 级 2.82% 通道
+        // 结构误差产自 {o_proj mm + res + addrms} 跨度，err_struct 已洗 addrms
+        // （无行缩放分量）。本模式：golden m0_vis(712×2048) × L0 o_proj 真权重，
+        // GE 图 cst（Const 烤入 = 生产 WCONST 路径）/ nd（Data）两形态 vs
+        // aclnn eager b_t 三方对拍；结果落盘 /tmp/oproj_*.f16 供 f64 教科书比对
+        "oproj" => {
+            let real = real.expect("oproj 需要 GEB_CKPT");
+            let gpath = std::env::var("GEB_E2E_GOLDEN").expect("oproj 需要 GEB_E2E_GOLDEN（golden v3）");
+            let (t, _) = apxinf_loader::safetensors::load_native_path(std::path::Path::new(&gpath))
+                .expect("golden load");
+            let m0v = t.get("m0_vis").expect("golden 缺 m0_vis").to_f32_vec().unwrap();
+            let m0h: Vec<f16> = m0v.iter().map(|&v| f16::from_f32(v)).collect();
+            let lay = real.language_layers.get(0).expect("L0 权重");
+            let wh = lw_f16(&lay.attention.output);
+            let (m, k, n) = (712i64, 2048i64, 2048i64);
+            assert_eq!(m0h.len(), (m * k) as usize, "m0_vis 长度 ≠ 712×2048");
+            let stream = be.stream();
+            let xb = upload(ctx, &m0h);
+            let wb = upload(ctx, &wh);
+            let er = aops::matmul_b_t_fp16(ctx, &stream, &xb, [m, k], &wb, k, n).unwrap();
+            drop(stream.synchronize());
+            let ef = download_f16(ctx, &er, (m * n) as usize);
+            let bytes: Vec<u8> = ef.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect();
+            std::fs::write("/tmp/oproj_eager.f16", &bytes).expect("dump eager");
+            for variant in ["cst", "nd"] {
+                let mut s = Seg::new(&format!("oproj_{variant}"));
+                let x = s.data(ctx, "x", &[m, k], &m0h);
+                let wname = if variant == "cst" {
+                    s.const_f16("w", &[n, k], &wh)
+                } else {
+                    s.data(ctx, "w", &[n, k], &wh)
+                };
+                s.g.add_op("mm", "MatMulV2").unwrap();
+                s.g.set_input_desc("mm", "x1", &[m, k], Dtype::Fp16).unwrap();
+                s.g.set_input_desc("mm", "x2", &[n, k], Dtype::Fp16).unwrap();
+                s.g.set_output_desc("mm", "y", &[m, n], Dtype::Fp16).unwrap();
+                s.g.set_attr_bool("mm", "transpose_x1", false).unwrap();
+                s.g.set_attr_bool("mm", "transpose_x2", true).unwrap();
+                s.wire("mm", "x1", &x);
+                s.g.link("mm", "x2", &wname).unwrap();
+                let y = s.reg_out("mm", "y");
+                s.finish(&[&y]);
+                let ins: Vec<&DeviceBuffer> = s.binds.iter().collect();
+                let out = ctx.malloc((m * n * 2) as usize).unwrap();
+                s.g.run(&ins, &[&out], stream).unwrap();
+                drop(stream.synchronize());
+                let ge = download_f16(ctx, &out, (m * n) as usize);
+                let (mut md, mut gm) = (0f32, 0f32);
+                for (a, b) in ge.iter().zip(&ef) {
+                    md = md.max((a.to_f32() - b.to_f32()).abs());
+                    gm = gm.max(b.to_f32().abs());
+                }
+                println!("oproj[{variant}]: vs_eager max_diff={md:.5} rel={:.3}%", md / gm * 100.0);
+                let bytes: Vec<u8> = ge.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect();
+                std::fs::write(format!("/tmp/oproj_ge{variant}.f16"), &bytes).expect("dump ge");
+            }
+        }
+        other => panic!("GEB_OPTEST: ...|v3n|tldn|lnv4c|asc*|ma*|bc4|wgt|oproj|arm, got {other}"),
     }
     println!("OPTEST_{which}_OK");
     ge_builder::fini().expect("fini");
@@ -3834,7 +3936,7 @@ fn main() {
         w
     });
     if let Ok(t) = std::env::var("GEB_OPTEST") {
-        optest(&be, &t);
+        optest(&be, &t, real.as_ref());
         return;
     }
     match seg.as_str() {
