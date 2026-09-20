@@ -254,6 +254,13 @@ struct Seg {
     names: Vec<String>,
     shapes: Vec<Vec<i64>>,
     binds: Vec<DeviceBuffer>,
+    /// 图输入在 binds 里的下标（GEB_WCONST 时权重是 Const 不占图输入，
+    /// binds 仍全量持上传副本供 eager/层基址——索引两模式恒同）
+    data_inputs: Vec<usize>,
+    /// GEB_WCONST：mm 权重 Const 入图（编译期折叠 ND→NZ 转换，零运行
+    /// 时税；wgt 单算实证 0.3945→0.2945 ms/mm、OM 烤入权重 8.4MB）。
+    /// 代价：OM 变 per-权重集（checkpoint 版本进缓存 key）
+    wconst: bool,
     datas: std::collections::HashSet<String>,
     outports: std::collections::HashMap<String, &'static str>,
     /// LayerNormV4 实例名（finish 时 mean/rstd 绑 aux 图输出）
@@ -268,9 +275,20 @@ impl Seg {
             names: Vec::new(),
             shapes: Vec::new(),
             binds: Vec::new(),
+            data_inputs: Vec::new(),
+            wconst: std::env::var("GEB_WCONST").is_ok(),
             datas: std::collections::HashSet::new(),
             outports: std::collections::HashMap::new(),
             ln_aux: Vec::new(),
+        }
+    }
+
+    /// 图输入装配（GEB_WCONST 时排除 Const 化权重；其余模式 = binds 全量）
+    fn ins(&self) -> Vec<&DeviceBuffer> {
+        if self.wconst {
+            self.data_inputs.iter().map(|&i| &self.binds[i]).collect()
+        } else {
+            self.binds.iter().collect()
         }
     }
 
@@ -285,7 +303,29 @@ impl Seg {
         self.names.push(name.to_string());
         self.shapes.push(dims.to_vec());
         self.binds.push(buf);
+        self.data_inputs.push(self.binds.len() - 1);
         self.datas.insert(name.to_string());
+        name.to_string()
+    }
+
+    /// mm 权重注册（host [rows,cols] → [cols,rows] 转置）：GEB_WCONST 时
+    /// Const 入图（binds 仍持上传副本供 eager，但不占图输入位/idx）；
+    /// 否则 Data（现状——每执行付设备侧 ND→NZ TransData ~63GB/s）。
+    fn wt(&mut self, ctx: &AscendContext, name: &str, dims: &[i64], host: &[f16], rows: i64, cols: i64) -> String {
+        let bytes = unsafe { std::slice::from_raw_parts(host.as_ptr() as *const u8, host.len() * 2) };
+        let t = aops::host_transpose(bytes, rows, cols);
+        let buf = upload_bytes(ctx, &t);
+        if self.wconst {
+            let th: Vec<f16> = t
+                .chunks_exact(2)
+                .map(|c| f16::from_bits(u16::from_le_bytes([c[0], c[1]])))
+                .collect();
+            self.const_f16(name, dims, &th);
+            self.binds.push(buf);
+            self.datas.insert(name.to_string());
+        } else {
+            self.data_buf(name, dims, buf);
+        }
         name.to_string()
     }
 
@@ -306,6 +346,7 @@ impl Seg {
         self.names.push(name.to_string());
         self.shapes.push(dims.to_vec());
         self.binds.push(buf);
+        self.data_inputs.push(self.binds.len() - 1);
         self.datas.insert(name.to_string());
         name.to_string()
     }
@@ -316,6 +357,28 @@ impl Seg {
     /// 调度（每边界 ~20ms 停顿；vision_ma OM 3220 个 unknown 标记取证）
     fn const_i32(&mut self, name: &str, vals: &[i32]) -> String {
         self.g.add_const_i32(name, vals).unwrap();
+        self.datas.insert(name.to_string());
+        name.to_string()
+    }
+
+    /// Const fp16 张量（GEB_OPTEST=wgt：权重入图，NZ 转换编译期折叠假设）
+    fn const_f16(&mut self, name: &str, dims: &[i64], host: &[f16]) -> String {
+        let bytes: Vec<u8> = host.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect();
+        self.g.add_const_raw(name, dims, Dtype::Fp16, &bytes).unwrap();
+        self.datas.insert(name.to_string());
+        name.to_string()
+    }
+
+    /// NZ 格式 Data 输入（绑定 buffer 必须已是 host_nz_reorder 产物）
+    fn data_nz(&mut self, name: &str, dims_nz: &[i64], buf: DeviceBuffer) -> String {
+        self.g
+            .add_data_fmt(name, self.idx, dims_nz, Dtype::Fp16, "FRACTAL_NZ")
+            .unwrap();
+        self.idx += 1;
+        self.names.push(name.to_string());
+        self.shapes.push(dims_nz.to_vec());
+        self.binds.push(buf);
+        self.data_inputs.push(self.binds.len() - 1);
         self.datas.insert(name.to_string());
         name.to_string()
     }
@@ -804,7 +867,7 @@ fn parity_and_bench(
     eager: &dyn Fn(&[DeviceBuffer]) -> Vec<DeviceBuffer>,
     bench: bool,
 ) {
-    let n_in = seg.binds.len();
+    let n_in = seg.ins().len();
     // 缓存加载（替代编译；数据/图构造仍跑——权重 buffer 是运行输入）
     if let Ok(path) = std::env::var("GEB_LOAD") {
         println!("loading OM from {path}");
@@ -835,8 +898,8 @@ fn parity_and_bench(
     probe_malloc("after-eager");
     mem("after-eager");
 
-    // GE run（加载缓存或已 build 的图）
-    let ins: Vec<&DeviceBuffer> = seg.binds.iter().collect();
+    // GE run（加载缓存或已 build 的图；GEB_WCONST 时 ins 只含真图输入）
+    let ins: Vec<&DeviceBuffer> = seg.ins();
     let n_out = seg.g.num_outputs().unwrap();
     for i in 0..n_out {
         println!("[out-dims] {i}: size={} dims={:?}", seg.g.output_size(i).unwrap_or(0), seg.g.output_dims(i).unwrap_or_default());
@@ -907,7 +970,9 @@ fn parity_and_bench(
         // （如 ROUNDS=5 PER=3，十几秒出数），全深度留作最终确认
         let rounds = envi("GEB_ROUNDS", 30) as usize;
         let per = envi("GEB_PER", 10).max(1) as usize;
-        let skip = rounds.min(3);
+        // rounds=3 时 min(3) 会把全部轮次吃成 warmup → ts 空仓 panic；
+        // 至少留 1 个样本轮
+        let skip = rounds.saturating_sub(1).min(3);
         for _ in 0..3 {
             seg.g.run(&ins, &out_refs, stream).unwrap();
         }
@@ -959,8 +1024,7 @@ fn seg_vision(be: &AscendBackend, bench: bool) {
     s.data(ctx, "patches", &[t, V_PATCH_W], &rand_f16((t * V_PATCH_W) as usize, &mut seed, 300.0));
     {
         let host = rand_f16((V_PATCH_W * VW) as usize, &mut seed, 30000.0);
-        let b = wbuf_t(ctx, &host, V_PATCH_W, VW);
-        s.data_buf("patch_wt", &[VW, V_PATCH_W], b);
+        s.wt(ctx, "patch_wt", &[VW, V_PATCH_W], &host, V_PATCH_W, VW);
     }
     s.data(ctx, "patch_b", &[1, VW], &rand_f16(VW as usize, &mut seed, 12000.0));
     {
@@ -1036,9 +1100,9 @@ fn seg_vision(be: &AscendBackend, bench: bool) {
                 // qkv3 下不注册融合 qkvwt/qkvb（图无消费者，GE 可能将其
                 // 从模型输入中消除 → dataset 错位）——层内输入位次
                 // 2..8，eager 闭包按 qkv3 偏移读
-                s.data_buf(&format!("{}qw", p), &[vqd, VW], wbuf_t(ctx, &wq_s, VW, vqd));
-                s.data_buf(&format!("{}kw", p), &[vqd, VW], wbuf_t(ctx, &wk, VW, vqd));
-                s.data_buf(&format!("{}vw", p), &[vqd, VW], wbuf_t(ctx, &wv, VW, vqd));
+                s.wt(ctx, &format!("{}qw", p), &[vqd, VW], &wq_s, VW, vqd);
+                s.wt(ctx, &format!("{}kw", p), &[vqd, VW], &wk, VW, vqd);
+                s.wt(ctx, &format!("{}vw", p), &[vqd, VW], &wv, VW, vqd);
                 s.data(ctx, &format!("{}qb", p), &[1, vqd], &bias_s[..vqd as usize]);
                 s.data(ctx, &format!("{}kb", p), &[1, vqd], &bias_s[vqd as usize..2 * vqd as usize]);
                 s.data(ctx, &format!("{}vb", p), &[1, vqd], &bias_s[2 * vqd as usize..]);
@@ -1050,8 +1114,7 @@ fn seg_vision(be: &AscendBackend, bench: bool) {
                     fused.extend_from_slice(&wk[base..base + vqd as usize]);
                     fused.extend_from_slice(&wv[base..base + vqd as usize]);
                 }
-                let b = wbuf_t(ctx, &fused, VW, qkvw);
-                s.data_buf(&format!("{}qkvwt", p), &[qkvw, VW], b);
+                s.wt(ctx, &format!("{}qkvwt", p), &[qkvw, VW], &fused, VW, qkvw);
                 s.data(ctx, &format!("{}qkvb", p), &[1, qkvw], &bias_s);
             }
             let bq = upload(ctx, &bias[0..vqd as usize]);
@@ -1064,8 +1127,7 @@ fn seg_vision(be: &AscendBackend, bench: bool) {
         }
         {
             let host = rand_f16((vqd * VW) as usize, &mut seed, 30000.0);
-            let b = wbuf_t(ctx, &host, vqd, VW);
-            s.data_buf(&format!("{}outwt", p), &[VW, vqd], b);
+            s.wt(ctx, &format!("{}outwt", p), &[VW, vqd], &host, vqd, VW);
         }
         s.data(ctx, &format!("{}outb", p), &[1, VW], &rand_f16(VW as usize, &mut seed, 12000.0));
         let n2w_h = norm_f16(VW as usize, &mut seed, 1.0);
@@ -1075,14 +1137,12 @@ fn seg_vision(be: &AscendBackend, bench: bool) {
         eager_norms.push((n1w_h, n1b_h, n2w_h, n2b_h));
         {
             let host = rand_f16((VW * V_INTER) as usize, &mut seed, 30000.0);
-            let b = wbuf_t(ctx, &host, VW, V_INTER);
-            s.data_buf(&format!("{}fc1wt", p), &[V_INTER, VW], b);
+            s.wt(ctx, &format!("{}fc1wt", p), &[V_INTER, VW], &host, VW, V_INTER);
         }
         s.data(ctx, &format!("{}fc1b", p), &[1, V_INTER], &rand_f16(V_INTER as usize, &mut seed, 12000.0));
         {
             let host = rand_f16((V_INTER * VW) as usize, &mut seed, 30000.0);
-            let b = wbuf_t(ctx, &host, V_INTER, VW);
-            s.data_buf(&format!("{}fc2wt", p), &[VW, V_INTER], b);
+            s.wt(ctx, &format!("{}fc2wt", p), &[VW, V_INTER], &host, V_INTER, VW);
         }
         s.data(ctx, &format!("{}fc2b", p), &[1, VW], &rand_f16(VW as usize, &mut seed, 12000.0));
 
@@ -1155,8 +1215,7 @@ fn seg_vision(be: &AscendBackend, bench: bool) {
     s.data(ctx, "pnb", &[VW], &pnb_h);
     {
         let host = rand_f16((VW * PW) as usize, &mut seed, 30000.0);
-        let b = wbuf_t(ctx, &host, VW, PW);
-        s.data_buf("projwt", &[PW, VW], b);
+        s.wt(ctx, "projwt", &[PW, VW], &host, VW, PW);
     }
     s.data(ctx, "projb", &[1, PW], &rand_f16(PW as usize, &mut seed, 12000.0));
     let pln = s.addln("pln", &cur, "pnw", "pnb", "nsh", &[t, VW]);
@@ -1167,7 +1226,7 @@ fn seg_vision(be: &AscendBackend, bench: bool) {
         fin.extend(dbg_outs.iter().map(|x| x.as_str()));
     }
     s.finish(&fin);
-    println!("vision OM built: depth={depth} n_in={} n_out=1", s.binds.len());
+    println!("vision OM built: depth={depth} n_in={} n_out=1", s.ins().len());
 
     // ---- eager 参考（vision_layer_ascend 序列镜像；qkv 独立投影）----
     let trace = std::env::var("GEB_TRACE").is_ok();
@@ -1340,9 +1399,9 @@ fn seg_prefix(be: &AscendBackend, bench: bool) {
             }
             if qkv3 {
                 // qkv3 层内输入位次 1..7（g1 之后）；eager 按 qkv3 偏移读
-                s.data_buf(&format!("{}qw", tag), &[QD, PW], wbuf_t(ctx, &wq_s, PW, QD));
-                s.data_buf(&format!("{}kw", tag), &[KVD, PW], wbuf_t(ctx, &wk, PW, KVD));
-                s.data_buf(&format!("{}vw", tag), &[KVD, PW], wbuf_t(ctx, &wv, PW, KVD));
+                s.wt(ctx, &format!("{}qw", tag), &[QD, PW], &wq_s, PW, QD);
+                s.wt(ctx, &format!("{}kw", tag), &[KVD, PW], &wk, PW, KVD);
+                s.wt(ctx, &format!("{}vw", tag), &[KVD, PW], &wv, PW, KVD);
                 s.data(ctx, &format!("{}qb", tag), &[1, QD], &bias_s[..QD as usize]);
                 s.data(ctx, &format!("{}kb", tag), &[1, KVD], &bias_s[QD as usize..(QD + KVD) as usize]);
                 s.data(ctx, &format!("{}vb", tag), &[1, KVD], &bias_s[(QD + KVD) as usize..]);
@@ -1355,8 +1414,7 @@ fn seg_prefix(be: &AscendBackend, bench: bool) {
                     fused.extend_from_slice(&wk[rb..rb + KVD as usize]);
                     fused.extend_from_slice(&wv[rb..rb + KVD as usize]);
                 }
-                let b = wbuf_t(ctx, &fused, PW, QKVW);
-                s.data_buf(&format!("{}qkvwt", tag), &[QKVW, PW], b);
+                s.wt(ctx, &format!("{}qkvwt", tag), &[QKVW, PW], &fused, PW, QKVW);
                 s.data(ctx, &format!("{}qkvb", tag), &[1, QKVW], &bias_s);
             }
             let bq = upload(ctx, &bias[0..QD as usize]);
@@ -1369,25 +1427,21 @@ fn seg_prefix(be: &AscendBackend, bench: bool) {
         }
         {
             let host = rand_f16((QD * PW) as usize, &mut seed, 8000.0);
-            let b = wbuf_t(ctx, &host, QD, PW);
-            s.data_buf(&format!("{}outwt", tag), &[PW, QD], b);
+            s.wt(ctx, &format!("{}outwt", tag), &[PW, QD], &host, QD, PW);
         }
         s.data(ctx, &format!("{}outb", tag), &[1, PW], &rand_f16(PW as usize, &mut seed, 4000.0));
         s.data(ctx, &format!("{}g2", tag), &[PW], &norm_f16(PW as usize, &mut seed, 1.0));
         {
             let host = rand_f16((PW * INTER) as usize, &mut seed, 8000.0);
-            let b = wbuf_t(ctx, &host, PW, INTER);
-            s.data_buf(&format!("{}gatewt", tag), &[INTER, PW], b);
+            s.wt(ctx, &format!("{}gatewt", tag), &[INTER, PW], &host, PW, INTER);
         }
         {
             let host = rand_f16((PW * INTER) as usize, &mut seed, 8000.0);
-            let b = wbuf_t(ctx, &host, PW, INTER);
-            s.data_buf(&format!("{}upwt", tag), &[INTER, PW], b);
+            s.wt(ctx, &format!("{}upwt", tag), &[INTER, PW], &host, PW, INTER);
         }
         {
             let host = rand_f16((INTER * PW) as usize, &mut seed, 8000.0);
-            let b = wbuf_t(ctx, &host, INTER, PW);
-            s.data_buf(&format!("{}downwt", tag), &[PW, INTER], b);
+            s.wt(ctx, &format!("{}downwt", tag), &[PW, INTER], &host, INTER, PW);
         }
         s.data(ctx, &format!("{}downb", tag), &[1, PW], &rand_f16(PW as usize, &mut seed, 4000.0));
 
@@ -1452,7 +1506,7 @@ fn seg_prefix(be: &AscendBackend, bench: bool) {
     }
     let out_names: Vec<&str> = kv_outs.iter().map(|x| x.as_str()).collect();
     s.finish(&out_names);
-    println!("prefix OM built: depth={depth} P={p} n_in={} n_out={}", s.binds.len(), kv_outs.len());
+    println!("prefix OM built: depth={depth} P={p} n_in={} n_out={}", s.ins().len(), kv_outs.len());
 
     // ---- eager 参考（language_layer_ascend 序列镜像；qkv 独立投影）----
     let layer_bases2 = layer_bases.clone();
@@ -1571,8 +1625,7 @@ fn seg_flow(be: &AscendBackend, bench: bool) {
     s.const_i32("shp_fa4", &[1, HEADS as i32, HOR as i32, HD as i32]);
     {
         let host = rand_f16((ADIM * AW) as usize, &mut seed, 8000.0);
-        let b = wbuf_t(ctx, &host, ADIM, AW);
-        s.data_buf("ainwt", &[AW, ADIM], b);
+        s.wt(ctx, "ainwt", &[AW, ADIM], &host, ADIM, AW);
     }
     s.data(ctx, "ainb", &[1, AW], &rand_f16(AW as usize, &mut seed, 4000.0));
     // prefix k/v（rank-2——ConcatD axis=0 拼接后统一 Unsqueeze）
@@ -1608,9 +1661,9 @@ fn seg_flow(be: &AscendBackend, bench: bool) {
             }
             if qkv3 {
                 // qkv3 层内输入位次 2..8（ascl/ash 之后）；eager 按 qkv3 偏移读
-                s.data_buf(&format!("{}qw", tag), &[QD, AW], wbuf_t(ctx, &wq_s, AW, QD));
-                s.data_buf(&format!("{}kw", tag), &[KVD, AW], wbuf_t(ctx, &wk, AW, KVD));
-                s.data_buf(&format!("{}vw", tag), &[KVD, AW], wbuf_t(ctx, &wv, AW, KVD));
+                s.wt(ctx, &format!("{}qw", tag), &[QD, AW], &wq_s, AW, QD);
+                s.wt(ctx, &format!("{}kw", tag), &[KVD, AW], &wk, AW, KVD);
+                s.wt(ctx, &format!("{}vw", tag), &[KVD, AW], &wv, AW, KVD);
                 s.data(ctx, &format!("{}qb", tag), &[1, QD], &bias_s[..QD as usize]);
                 s.data(ctx, &format!("{}kb", tag), &[1, KVD], &bias_s[QD as usize..(QD + KVD) as usize]);
                 s.data(ctx, &format!("{}vb", tag), &[1, KVD], &bias_s[(QD + KVD) as usize..]);
@@ -1623,8 +1676,7 @@ fn seg_flow(be: &AscendBackend, bench: bool) {
                     fused.extend_from_slice(&wk[rb..rb + KVD as usize]);
                     fused.extend_from_slice(&wv[rb..rb + KVD as usize]);
                 }
-                let b = wbuf_t(ctx, &fused, AW, QKVW);
-                s.data_buf(&format!("{}qkvwt", tag), &[QKVW, AW], b);
+                s.wt(ctx, &format!("{}qkvwt", tag), &[QKVW, AW], &fused, AW, QKVW);
                 s.data(ctx, &format!("{}qkvb", tag), &[1, QKVW], &bias_s);
             }
             let bq = upload(ctx, &bias[0..QD as usize]);
@@ -1637,26 +1689,22 @@ fn seg_flow(be: &AscendBackend, bench: bool) {
         }
         {
             let host = rand_f16((QD * AW) as usize, &mut seed, 8000.0);
-            let b = wbuf_t(ctx, &host, QD, AW);
-            s.data_buf(&format!("{}outwt", tag), &[AW, QD], b);
+            s.wt(ctx, &format!("{}outwt", tag), &[AW, QD], &host, QD, AW);
         }
         s.data(ctx, &format!("{}outb", tag), &[1, AW], &rand_f16(AW as usize, &mut seed, 4000.0));
         s.data(ctx, &format!("{}mscl", tag), &[AW], &norm_f16(AW as usize, &mut seed, 1.0));
         s.data(ctx, &format!("{}msh", tag), &[AW], &norm_f16(AW as usize, &mut seed, 0.0));
         {
             let host = rand_f16((AW * AINTER) as usize, &mut seed, 8000.0);
-            let b = wbuf_t(ctx, &host, AW, AINTER);
-            s.data_buf(&format!("{}gatewt", tag), &[AINTER, AW], b);
+            s.wt(ctx, &format!("{}gatewt", tag), &[AINTER, AW], &host, AW, AINTER);
         }
         {
             let host = rand_f16((AW * AINTER) as usize, &mut seed, 8000.0);
-            let b = wbuf_t(ctx, &host, AW, AINTER);
-            s.data_buf(&format!("{}upwt", tag), &[AINTER, AW], b);
+            s.wt(ctx, &format!("{}upwt", tag), &[AINTER, AW], &host, AW, AINTER);
         }
         {
             let host = rand_f16((AINTER * AW) as usize, &mut seed, 8000.0);
-            let b = wbuf_t(ctx, &host, AINTER, AW);
-            s.data_buf(&format!("{}downwt", tag), &[AW, AINTER], b);
+            s.wt(ctx, &format!("{}downwt", tag), &[AW, AINTER], &host, AINTER, AW);
         }
         s.data(ctx, &format!("{}downb", tag), &[1, AW], &norm_f16(AW as usize, &mut seed, 0.0));
     }
@@ -1664,8 +1712,7 @@ fn seg_flow(be: &AscendBackend, bench: bool) {
     s.data(ctx, "fsh", &[AW], &norm_f16(AW as usize, &mut seed, 0.0));
     {
         let host = rand_f16((AW * ADIM) as usize, &mut seed, 8000.0);
-        let b = wbuf_t(ctx, &host, AW, ADIM);
-        s.data_buf("aoutwt", &[ADIM, AW], b);
+        s.wt(ctx, "aoutwt", &[ADIM, AW], &host, AW, ADIM);
     }
     s.data(ctx, "aoutb", &[1, ADIM], &rand_f16(ADIM as usize, &mut seed, 4000.0));
     // euler 常数（σ = dt = -0.1：x' = (1+σ)x + σ·v）
@@ -1777,7 +1824,7 @@ fn seg_flow(be: &AscendBackend, bench: bool) {
     let t2 = s.mul2("eul2", &vel, "c2", &[HOR, ADIM]);
     let out = s.add2("eul", &t1, &t2, &[HOR, ADIM]);
     s.finish(&[&out]);
-    println!("flow OM built: depth={depth} P={p} n_in={} n_out=1", s.binds.len());
+    println!("flow OM built: depth={depth} P={p} n_in={} n_out=1", s.ins().len());
 
     // ---- eager 参考（action_layer_ascend 序列镜像；qkv 独立投影）----
     let layer_bases2 = layer_bases.clone();
@@ -3041,7 +3088,86 @@ fn optest(be: &AscendBackend, which: &str) {
             }
             println!("bc4 numeric: ge |max|={gm:.3} max_diff={md:.5}");
         }
-        other => panic!("GEB_OPTEST: ...|v3n|tldn|lnv4c|asc*|ma*|bc4, got {other}"),
+        // wgt: NZ 权重税裁决——同 mm（[m,k]×[n,k]ᵀ, transpose_x2）三种权重
+        // 形态对拍 + bench。背景（C2 收尾 flow profile）：TransData 占 54%
+        // = GE 对每个 ND Data 权重每执行插一次设备侧 ND→FRACTAL_NZ 转换
+        // （8MB ≈ 130µs @~63GB/s）；torch_npu 的 TransData 100ms 同源税，
+        // TorchAir 378ms 靠权重入图逃掉。
+        //   nd  = Data [n,k] ND（现状基线）
+        //   cst = Const fp16（编译期折叠假设：OM 自带 NZ 权重、零运行时税）
+        //   nz  = Data NZ desc + host_nz_reorder 字节（零税且 OM 权重无关）
+        "wgt" => {
+            let (m, k, n) = (832i64, 1024i64, 4096i64);
+            let mut seed = 0x51EEu32;
+            let xh = rand_f16((m * k) as usize, &mut seed, 2.0);
+            let wh = rand_f16((n * k) as usize, &mut seed, 100.0); // [n,k]
+            let stream = be.stream();
+            // eager 参考（生产同款 b_t：物理 [n,k] + 转置视图）
+            let xb = upload(ctx, &xh);
+            let wb = upload(ctx, &wh);
+            let er = aops::matmul_b_t_fp16(ctx, &stream, &xb, [m, k], &wb, k, n).unwrap();
+            drop(stream.synchronize());
+            let er_host = download_f16(ctx, &er, (m * n) as usize);
+            let w_bytes: Vec<u8> = wh.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect();
+            let (nz_bytes, nz_dims, _strides) = aops::host_nz_reorder(&w_bytes, n, k);
+            for variant in ["nd", "cst", "nz"] {
+                let mut s = Seg::new(&format!("wgt_{variant}"));
+                let x = s.data(ctx, "x", &[m, k], &xh);
+                let wname = match variant {
+                    "cst" => s.const_f16("w", &[n, k], &wh),
+                    "nz" => {
+                        let buf = upload_bytes(ctx, &nz_bytes);
+                        s.data_nz("w", &nz_dims, buf)
+                    }
+                    _ => s.data(ctx, "w", &[n, k], &wh),
+                };
+                s.g.add_op("mm", "MatMulV2").unwrap();
+                s.g.set_input_desc("mm", "x1", &[m, k], Dtype::Fp16).unwrap();
+                if variant == "nz" {
+                    s.g
+                        .set_input_desc_fmt("mm", "x2", &nz_dims, Dtype::Fp16, "FRACTAL_NZ")
+                        .unwrap();
+                } else {
+                    s.g.set_input_desc("mm", "x2", &[n, k], Dtype::Fp16).unwrap();
+                }
+                s.g.set_output_desc("mm", "y", &[m, n], Dtype::Fp16).unwrap();
+                s.g.set_attr_bool("mm", "transpose_x1", false).unwrap();
+                s.g.set_attr_bool("mm", "transpose_x2", true).unwrap();
+                s.wire("mm", "x1", &x);
+                s.g.link("mm", "x2", &wname).unwrap();
+                let y = s.reg_out("mm", "y");
+                s.finish(&[&y]);
+                let ins: Vec<&DeviceBuffer> = s.binds.iter().collect();
+                let out = ctx.malloc((m * n * 2) as usize).unwrap();
+                s.g.run(&ins, &[&out], stream).unwrap();
+                drop(stream.synchronize());
+                let ge = download_f16(ctx, &out, (m * n) as usize);
+                let (mut md, mut gm) = (0f32, 0f32);
+                for (a, b) in ge.iter().zip(&er_host) {
+                    md = md.max((a.to_f32() - b.to_f32()).abs());
+                    gm = gm.max(b.to_f32().abs());
+                }
+                for _ in 0..3 {
+                    s.g.run(&ins, &[&out], stream).unwrap();
+                }
+                drop(stream.synchronize());
+                let rounds = 30;
+                let mut ts = Vec::new();
+                for _ in 0..rounds {
+                    let t0 = std::time::Instant::now();
+                    s.g.run(&ins, &[&out], stream).unwrap();
+                    drop(stream.synchronize());
+                    ts.push(t0.elapsed().as_secs_f64() * 1000.0);
+                }
+                ts.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                println!(
+                    "wgt[{variant}]: max_diff={md:.5} rel={:.2}%  {:.4} ms/mm (median/{rounds})",
+                    md / gm * 100.0,
+                    ts[ts.len() / 2]
+                );
+            }
+        }
+        other => panic!("GEB_OPTEST: ...|v3n|tldn|lnv4c|asc*|ma*|bc4|wgt, got {other}"),
     }
     println!("OPTEST_{which}_OK");
     ge_builder::fini().expect("fini");

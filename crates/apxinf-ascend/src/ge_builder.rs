@@ -213,6 +213,42 @@ impl GeGraph {
         Ok(())
     }
 
+    /// Data 输入（desc format 可指定）——FRACTAL_NZ 权重直入实验。
+    pub fn add_data_fmt(
+        &self,
+        name: &str,
+        index: i64,
+        dims: &[i64],
+        dtype: Dtype,
+        fmt: &str,
+    ) -> Result<()> {
+        type F = unsafe extern "C" fn(
+            *const std::os::raw::c_char,
+            i64,
+            *const i64,
+            i32,
+            *const std::os::raw::c_char,
+            *const std::os::raw::c_char,
+        ) -> i32;
+        let l = lib().map_err(|e| {
+            eprintln!("[ge_builder] {e}");
+            AclError { code: -1, op: "ge load" }
+        })?;
+        let f: Symbol<F> = unsafe { l.get(b"geb_add_data_fmt") }.map_err(|e| {
+            eprintln!("[ge_builder] dlsym geb_add_data_fmt: {e}");
+            AclError { code: -1, op: "ge dlsym" }
+        })?;
+        let n = CString::new(name).expect("name");
+        let dt = dtype.as_c();
+        let fm = CString::new(fmt).expect("fmt");
+        let rc =
+            unsafe { f(n.as_ptr(), index, dims.as_ptr(), dims.len() as i32, dt.as_ptr(), fm.as_ptr()) };
+        if rc != 0 {
+            return Err(cerr("geb_add_data_fmt", rc));
+        }
+        Ok(())
+    }
+
     /// 算子节点（GE IR 注册名，如 MatMulV2 / PromptFlashAttention）。
     pub fn add_op(&self, name: &str, ty: &str) -> Result<()> {
         type F = unsafe extern "C" fn(*const std::os::raw::c_char, *const std::os::raw::c_char) -> i32;
@@ -250,6 +286,37 @@ impl GeGraph {
         let rc = unsafe { f(n.as_ptr(), vals.as_ptr(), vals.len() as i32) };
         if rc != 0 {
             return Err(cerr("geb_add_const_i32", rc));
+        }
+        Ok(())
+    }
+
+    /// Const 节点（任意 dtype/shape 原始字节）——权重入图实验（NZ 权重税
+    /// 裁决：Const 若编译期折叠 NZ 转换 → OM 自带 NZ 权重，零运行时税）。
+    pub fn add_const_raw(&self, name: &str, dims: &[i64], dtype: Dtype, bytes: &[u8]) -> Result<()> {
+        type F = unsafe extern "C" fn(
+            *const std::os::raw::c_char,
+            *const i64,
+            i32,
+            *const std::os::raw::c_char,
+            *const u8,
+            i64,
+        ) -> i32;
+        let l = lib().map_err(|e| {
+            eprintln!("[ge_builder] {e}");
+            AclError { code: -1, op: "ge load" }
+        })?;
+        let f: Symbol<F> = unsafe { l.get(b"geb_add_const_raw") }.map_err(|e| {
+            eprintln!("[ge_builder] dlsym geb_add_const_raw: {e}");
+            AclError { code: -1, op: "ge dlsym" }
+        })?;
+        let n = CString::new(name).expect("name");
+        let dt = dtype.as_c();
+        let rc = unsafe {
+            f(n.as_ptr(), dims.as_ptr(), dims.len() as i32, dt.as_ptr(), bytes.as_ptr(),
+              bytes.len() as i64)
+        };
+        if rc != 0 {
+            return Err(cerr("geb_add_const_raw", rc));
         }
         Ok(())
     }
@@ -360,6 +427,45 @@ impl GeGraph {
 
     pub fn set_output_desc(&self, op: &str, port: &str, dims: &[i64], dtype: Dtype) -> Result<()> {
         self.set_desc(b"geb_set_output_desc", "geb_set_output_desc", op, port, dims, dtype)
+    }
+
+    /// 消费算子输入 desc（format 可指定，ND/FRACTAL_NZ）——NZ 权重直入
+    /// 实验的 MatMulV2 x2 用（dims 传 NZ 4-D，与上游 NZ Data desc 一致）。
+    pub fn set_input_desc_fmt(
+        &self,
+        op: &str,
+        port: &str,
+        dims: &[i64],
+        dtype: Dtype,
+        fmt: &str,
+    ) -> Result<()> {
+        type F = unsafe extern "C" fn(
+            *const std::os::raw::c_char,
+            *const std::os::raw::c_char,
+            *const i64,
+            i32,
+            *const std::os::raw::c_char,
+            *const std::os::raw::c_char,
+        ) -> i32;
+        let l = lib().map_err(|e| {
+            eprintln!("[ge_builder] {e}");
+            AclError { code: -1, op: "ge load" }
+        })?;
+        let f: Symbol<F> = unsafe { l.get(b"geb_set_input_desc_fmt") }.map_err(|e| {
+            eprintln!("[ge_builder] dlsym geb_set_input_desc_fmt: {e}");
+            AclError { code: -1, op: "ge dlsym" }
+        })?;
+        let n = CString::new(op).expect("op");
+        let p = CString::new(port).expect("port");
+        let dt = dtype.as_c();
+        let fm = CString::new(fmt).expect("fmt");
+        let rc = unsafe {
+            f(n.as_ptr(), p.as_ptr(), dims.as_ptr(), dims.len() as i32, dt.as_ptr(), fm.as_ptr())
+        };
+        if rc != 0 {
+            return Err(cerr("geb_set_input_desc_fmt", rc));
+        }
+        Ok(())
     }
 
     pub fn set_attr_bool(&self, op: &str, attr: &str, v: bool) -> Result<()> {

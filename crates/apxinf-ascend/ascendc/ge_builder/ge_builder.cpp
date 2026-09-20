@@ -412,6 +412,51 @@ extern "C" int geb_add_data(const char *name, int64_t index, const int64_t *dims
     return 0;
 }
 
+static bool ParseFormat(const char *s, ge::Format &fmt) {
+    const std::string v = (s != nullptr) ? s : "";
+    if (v == "ND") {
+        fmt = ge::FORMAT_ND;
+    } else if (v == "FRACTAL_NZ") {
+        fmt = ge::FORMAT_FRACTAL_NZ;
+    } else {
+        std::cerr << "[geb] unknown format '" << v << "' (ND/FRACTAL_NZ)" << std::endl;
+        return false;
+    }
+    return true;
+}
+
+// Data 输入（desc format 可指定）。FRACTAL_NZ 权重直入实验：MatMulV2 的
+// b 算子在 310P 走 NZ，Data ND 权重会被 GE 插每执行一次的设备侧
+// TransData（ND→NZ，~63GB/s 实测）——desc 直接声明 NZ 则可能免插。
+extern "C" int geb_add_data_fmt(const char *name, int64_t index, const int64_t *dims, int32_t n_dims,
+                                const char *dtype, const char *fmt) {
+    GebModel *m = Cur();
+    if (m == nullptr) {
+        return -1;
+    }
+    ge::DataType dt;
+    if (!ParseDtype(dtype, dt)) {
+        return -2;
+    }
+    ge::Format f;
+    if (!ParseFormat(fmt, f)) {
+        return -3;
+    }
+    ge::Shape shape{std::vector<int64_t>(dims, dims + n_dims)};
+    ge::TensorDesc td(shape, f, dt);
+    (void)td.SetOriginShape(shape);
+    (void)td.SetOriginFormat(f);
+    ge::Operator op = ge::OperatorFactory::CreateOperator(name, "Data");
+    if (op.UpdateInputDesc(0U, td) != ge::GRAPH_SUCCESS) {
+        std::cerr << "[geb] add_data_fmt '" << name << "': phantom input desc 0 rejected" << std::endl;
+        return -4;
+    }
+    (void)op.UpdateOutputDesc("y", td);
+    (void)op.SetAttr(std::string("index"), index);
+    m->ops.emplace(name, op);
+    return 0;
+}
+
 extern "C" int geb_add_op(const char *name, const char *type) {
     GebModel *m = Cur();
     if (m == nullptr) {
@@ -434,6 +479,27 @@ extern "C" int geb_add_const_i32(const char *name, const int32_t *vals, int32_t 
     }
     ge::TensorDesc td(ge::Shape(std::vector<int64_t>(1, static_cast<int64_t>(n))), ge::FORMAT_ND, ge::DT_INT32);
     ge::Tensor t(td, reinterpret_cast<const uint8_t *>(vals), static_cast<size_t>(n) * sizeof(int32_t));
+    ge::Operator op = ge::OperatorFactory::CreateOperator(name, "Const");
+    (void)op.SetAttr(std::string("value"), t);
+    (void)op.UpdateOutputDesc("y", td);
+    m->ops.emplace(name, op);
+    return 0;
+}
+
+// Const 节点（任意 dtype/shape 的原始字节）——权重入图实验：ND Data 权重
+// 每执行触发设备侧 ND→NZ TransData；Const 权重若被编译期折叠转换，则
+// OM 自带 NZ 权重、零运行时税（TorchAir 378ms 的逃税路径同款假设）。
+extern "C" int geb_add_const_raw(const char *name, const int64_t *dims, int32_t n_dims,
+                                 const char *dtype, const uint8_t *data, int64_t len) {
+    GebModel *m = Cur();
+    if (m == nullptr) {
+        return -1;
+    }
+    ge::TensorDesc td;
+    if (!MkDesc(dims, n_dims, dtype, td)) {
+        return -2;
+    }
+    ge::Tensor t(td, data, static_cast<size_t>(len));
     ge::Operator op = ge::OperatorFactory::CreateOperator(name, "Const");
     (void)op.SetAttr(std::string("value"), t);
     (void)op.UpdateOutputDesc("y", td);
@@ -564,6 +630,38 @@ extern "C" int geb_set_input_desc_idx(const char *op_name, int32_t port, const i
         std::cerr << "[geb] set_input_desc_idx: op '" << op_name << "' rejected port " << port
                   << std::endl;
         return -4;
+    }
+    return 0;
+}
+
+// 消费算子输入 desc（format 可指定）——NZ 直入实验的 MatMulV2 x2 用：
+// dims 传 NZ 4-D [k/16, n/16, 16, 16] + FRACTAL_NZ，与上游 NZ Data 一致。
+extern "C" int geb_set_input_desc_fmt(const char *op_name, const char *port, const int64_t *dims,
+                                      int32_t n_dims, const char *dtype, const char *fmt) {
+    GebModel *m = Cur();
+    if (m == nullptr) {
+        return -1;
+    }
+    ge::Operator *op = FindOp(*m, op_name, "set_input_desc_fmt");
+    if (op == nullptr) {
+        return -2;
+    }
+    ge::DataType dt;
+    if (!ParseDtype(dtype, dt)) {
+        return -3;
+    }
+    ge::Format f;
+    if (!ParseFormat(fmt, f)) {
+        return -4;
+    }
+    ge::Shape shape{std::vector<int64_t>(dims, dims + n_dims)};
+    ge::TensorDesc td(shape, f, dt);
+    (void)td.SetOriginShape(shape);
+    (void)td.SetOriginFormat(f);
+    if (op->UpdateInputDesc(std::string(port), td) != ge::GRAPH_SUCCESS) {
+        std::cerr << "[geb] set_input_desc_fmt: op '" << op_name << "' rejected port '" << port
+                  << "'" << std::endl;
+        return -5;
     }
     return 0;
 }
