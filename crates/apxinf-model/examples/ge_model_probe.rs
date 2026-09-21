@@ -1189,7 +1189,7 @@ fn seg_e2e(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>) {
             }
             keys.extend(
                 t.keys()
-                    .filter(|k| k.starts_with("kvk_l"))
+                    .filter(|k| k.starts_with("kvk_l") || k.starts_with("kvv_l") || k.starts_with("cond_s"))
                     .cloned()
                     .collect::<Vec<_>>(),
             );
@@ -2052,6 +2052,7 @@ fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e: 
         let key_off = envi("GEB_LAYER_OFFSET", 0) as usize;
         for li in 0..depth {
             st.cmp_mid(&format!("kvk_l{}", li + key_off), &st.kv[2 * li]);
+            st.cmp_mid(&format!("kvv_l{}", li + key_off), &st.kv[2 * li + 1]);
         }
         return;
     }
@@ -2143,14 +2144,41 @@ fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e: Op
     s.data(ctx, "ainb", &[1, AW], &ainb_h);
     // prefix k/v（rank-2——ConcatD axis=0 拼接后统一 Unsqueeze）；
     // e2e：prefix OM 36 输出直连（k0,v0,k1,v1,... → pk{i}=kv[2i]/pv{i}=kv[2i+1]）
+    // GEB_E2E_PK_GOLD=1：pk/pv 改喂 golden kvk_l{i}/kvv_l{i}（step0 残差
+    // bisect——检验 prefix 主路 k/v 残差喂 cross-attn 的贡献）
+    let pk_gold = envi("GEB_E2E_PK_GOLD", 0) == 1;
+    if pk_gold {
+        println!("[e2e] PK_GOLD: pk/pv 替入 golden kvk/kvv（bisect）");
+    }
+    let gold_key_f16 = |st: &E2eStage, k: &str| -> Vec<f16> {
+        let v = st
+            .golden_mid
+            .iter()
+            .find(|(gk, _)| gk == k)
+            .map(|(_, v)| v.clone())
+            .unwrap_or_else(|| panic!("GEB_E2E_PK_GOLD 需要 golden 键 {k}"));
+        v.into_iter().map(f16::from_f32).collect()
+    };
     for i in 0..depth {
         let pk_h = e2e
             .as_ref()
-            .map(|st| st.kv[2 * i].clone())
+            .map(|st| {
+                if pk_gold {
+                    gold_key_f16(st, &format!("kvk_l{i}"))
+                } else {
+                    st.kv[2 * i].clone()
+                }
+            })
             .unwrap_or_else(|| rand_f16((p * KVD) as usize, &mut seed, 100.0));
         let pv_h = e2e
             .as_ref()
-            .map(|st| st.kv[2 * i + 1].clone())
+            .map(|st| {
+                if pk_gold {
+                    gold_key_f16(st, &format!("kvv_l{i}"))
+                } else {
+                    st.kv[2 * i + 1].clone()
+                }
+            })
             .unwrap_or_else(|| rand_f16((p * KVD) as usize, &mut seed, 100.0));
         s.data(ctx, &format!("pk{i}"), &[p, KVD], &pk_h);
         s.data(ctx, &format!("pv{i}"), &[p, KVD], &pv_h);
@@ -2481,6 +2509,33 @@ fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e: Op
                 cfg.time_max_period,
             );
             let cond = e2e_conditioning(rw, &te);
+            // styles bisect：golden cond_s{step}（frame0_v3b）存在时打印 host
+            // f32 cond 与 golden 的差；GEB_E2E_STYLE_GOLD=1 则替入 golden cond
+            // （styles 仍由 host 投影重算——分离 {te+mlp 链} 与 {style 投影}）
+            let gold_cond = {
+                let key = format!("cond_s{step}");
+                st.golden_mid
+                    .iter()
+                    .find(|(k, _)| *k == key)
+                    .map(|(_, v)| v.clone())
+            };
+            if let Some(want) = &gold_cond {
+                assert_eq!(cond.len(), want.len(), "cond 与 golden cond_s{step} 长度不符");
+                let mut md = 0f32;
+                for (a, b) in cond.iter().zip(want.iter()) {
+                    md = md.max((a - b).abs());
+                }
+                let rm = want.iter().fold(0f32, |m, v| m.max(v.abs()));
+                println!(
+                    "[e2e] step {step} cond host-vs-golden max_diff={md:.6} (golden |max|={rm:.3})"
+                );
+            }
+            let cond: Vec<f32> = if envi("GEB_E2E_STYLE_GOLD", 0) == 1 {
+                println!("[e2e] step {step} STYLE_GOLD: cond 替入 golden（bisect）");
+                gold_cond.expect("GEB_E2E_STYLE_GOLD 需要 golden cond_s{step} 键（frame0_v3b）")
+            } else {
+                cond
+            };
             for i in 0..depth {
                 let lay = &rw.action_layers[i];
                 let (a_scl, a_sh) = e2e_style_pair(&lay.input_norm.style, &cond, AW as usize);
