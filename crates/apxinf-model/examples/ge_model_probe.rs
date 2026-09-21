@@ -1149,9 +1149,32 @@ fn e2e_run(ctx: &AscendContext, stream: &AscendStream, s: &mut Seg, seg: &str) -
     let refs: Vec<&DeviceBuffer> = outs.iter().collect();
     s.g.run(&ins, &refs, stream).expect("ge run");
     drop(stream.synchronize());
-    (0..n_out)
+    let dl: Vec<Vec<f16>> = (0..n_out)
         .map(|i| download_f16(ctx, &outs[i], s.g.output_size(i).unwrap() / 2))
-        .collect()
+        .collect();
+    // GEB_E2E_BENCH=N：稳态 rerun bench（输入 binds 不变重跑；含全输出 d2h
+    // ——prefix 的 36 路 kv 下载 = today 生产 host 中转 glue，如实计入）
+    let nb = envi("GEB_E2E_BENCH", 0) as usize;
+    if nb > 0 {
+        let mut ts = Vec::with_capacity(nb);
+        for _ in 0..nb {
+            let t = std::time::Instant::now();
+            s.g.run(&ins, &refs, stream).expect("ge run");
+            drop(stream.synchronize());
+            let _: Vec<_> = (0..n_out)
+                .map(|i| download_f16(ctx, &outs[i], s.g.output_size(i).unwrap() / 2))
+                .collect();
+            ts.push(t.elapsed().as_secs_f64() * 1e3);
+        }
+        ts.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        println!(
+            "[e2e] {seg} 稳态 bench ×{nb}: P50={:.2}ms min={:.2} max={:.2}（run + sync + {n_out} 路 d2h）",
+            ts[nb / 2],
+            ts[0],
+            ts[nb - 1]
+        );
+    }
+    dl
 }
 
 fn seg_e2e(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>) {
@@ -2498,57 +2521,76 @@ fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e: Op
         let nb = s.binds.len();
         h2d_f16(&s.binds[nb - 2], &c1_h);
         h2d_f16(&s.binds[nb - 1], &c2_h);
+        // styles 预计算缓存：10 步 time 调度固定（1+step·dt）⇒ styles 跨调用
+        // 不变，生产口径一次性算 + 常驻（每步 host 现算 ≈173ms/步 是 glue 大头，
+        // 2026-09-21 bring-up 计时定罪）。cond 对拍/替入诊断（bisect）保留在此
+        let tpre = std::time::Instant::now();
+        let style_cache: Vec<Vec<Vec<f16>>> = (0..cfg.num_flow_steps)
+            .map(|step| {
+                let time = cfg.flow_start_time * (1.0 - step as f32 / cfg.num_flow_steps as f32);
+                let te = sinusoidal_time_embedding(
+                    time,
+                    cfg.action_expert.width,
+                    cfg.time_min_period,
+                    cfg.time_max_period,
+                );
+                let cond = e2e_conditioning(rw, &te);
+                // styles bisect：golden cond_s{step}（frame0_v3b）存在时打印 host
+                // f32 cond 与 golden 的差；GEB_E2E_STYLE_GOLD=1 则替入 golden cond
+                // （styles 仍由 host 投影重算——分离 {te+mlp 链} 与 {style 投影}）
+                let gold_cond = {
+                    let key = format!("cond_s{step}");
+                    st.golden_mid
+                        .iter()
+                        .find(|(k, _)| *k == key)
+                        .map(|(_, v)| v.clone())
+                };
+                if let Some(want) = &gold_cond {
+                    assert_eq!(cond.len(), want.len(), "cond 与 golden cond_s{step} 长度不符");
+                    let mut md = 0f32;
+                    for (a, b) in cond.iter().zip(want.iter()) {
+                        md = md.max((a - b).abs());
+                    }
+                    println!("[e2e] step {step} cond host-vs-golden max_diff={md:.6}");
+                }
+                let cond: Vec<f32> = if envi("GEB_E2E_STYLE_GOLD", 0) == 1 {
+                    gold_cond.expect("GEB_E2E_STYLE_GOLD 需要 golden cond_s{step} 键（frame0_v3b）")
+                } else {
+                    cond
+                };
+                let mut v: Vec<Vec<f16>> = Vec::with_capacity(depth * 4 + 2);
+                for i in 0..depth {
+                    let lay = &rw.action_layers[i];
+                    let (a_scl, a_sh) = e2e_style_pair(&lay.input_norm.style, &cond, AW as usize);
+                    let (m_scl, m_sh) = e2e_style_pair(&lay.post_attention_norm.style, &cond, AW as usize);
+                    v.push(a_scl);
+                    v.push(a_sh);
+                    v.push(m_scl);
+                    v.push(m_sh);
+                }
+                let (f_scl, f_sh) = e2e_style_pair(&rw.action_final_norm.style, &cond, AW as usize);
+                v.push(f_scl);
+                v.push(f_sh);
+                v
+            })
+            .collect();
+        println!(
+            "[e2e] styles 预计算 ×{} 步 {:?}（一次性，跨调用缓存）",
+            cfg.num_flow_steps,
+            tpre.elapsed()
+        );
         let t0 = std::time::Instant::now();
         for step in 0..cfg.num_flow_steps {
-            // t = flow_start·(1-step/N)（ascend_vla 同式）→ te → cond → styles
-            let time = cfg.flow_start_time * (1.0 - step as f32 / cfg.num_flow_steps as f32);
-            let te = sinusoidal_time_embedding(
-                time,
-                cfg.action_expert.width,
-                cfg.time_min_period,
-                cfg.time_max_period,
-            );
-            let cond = e2e_conditioning(rw, &te);
-            // styles bisect：golden cond_s{step}（frame0_v3b）存在时打印 host
-            // f32 cond 与 golden 的差；GEB_E2E_STYLE_GOLD=1 则替入 golden cond
-            // （styles 仍由 host 投影重算——分离 {te+mlp 链} 与 {style 投影}）
-            let gold_cond = {
-                let key = format!("cond_s{step}");
-                st.golden_mid
-                    .iter()
-                    .find(|(k, _)| *k == key)
-                    .map(|(_, v)| v.clone())
-            };
-            if let Some(want) = &gold_cond {
-                assert_eq!(cond.len(), want.len(), "cond 与 golden cond_s{step} 长度不符");
-                let mut md = 0f32;
-                for (a, b) in cond.iter().zip(want.iter()) {
-                    md = md.max((a - b).abs());
-                }
-                let rm = want.iter().fold(0f32, |m, v| m.max(v.abs()));
-                println!(
-                    "[e2e] step {step} cond host-vs-golden max_diff={md:.6} (golden |max|={rm:.3})"
-                );
-            }
-            let cond: Vec<f32> = if envi("GEB_E2E_STYLE_GOLD", 0) == 1 {
-                println!("[e2e] step {step} STYLE_GOLD: cond 替入 golden（bisect）");
-                gold_cond.expect("GEB_E2E_STYLE_GOLD 需要 golden cond_s{step} 键（frame0_v3b）")
-            } else {
-                cond
-            };
+            let sc = &style_cache[step];
             for i in 0..depth {
-                let lay = &rw.action_layers[i];
-                let (a_scl, a_sh) = e2e_style_pair(&lay.input_norm.style, &cond, AW as usize);
-                let (m_scl, m_sh) = e2e_style_pair(&lay.post_attention_norm.style, &cond, AW as usize);
                 let b = layer_bases[i];
-                h2d_f16(&s.binds[b], &a_scl);
-                h2d_f16(&s.binds[b + 1], &a_sh);
-                h2d_f16(&s.binds[b + 10], &m_scl);
-                h2d_f16(&s.binds[b + 11], &m_sh);
+                h2d_f16(&s.binds[b], &sc[4 * i]);
+                h2d_f16(&s.binds[b + 1], &sc[4 * i + 1]);
+                h2d_f16(&s.binds[b + 10], &sc[4 * i + 2]);
+                h2d_f16(&s.binds[b + 11], &sc[4 * i + 3]);
             }
-            let (f_scl, f_sh) = e2e_style_pair(&rw.action_final_norm.style, &cond, AW as usize);
-            h2d_f16(&s.binds[fs_idx], &f_scl);
-            h2d_f16(&s.binds[fs_idx + 1], &f_sh);
+            h2d_f16(&s.binds[fs_idx], &sc[4 * depth]);
+            h2d_f16(&s.binds[fs_idx + 1], &sc[4 * depth + 1]);
             h2d_f16(&s.binds[0], &x); // state = 当前 x
             let ins = s.ins();
             let oref: Vec<&DeviceBuffer> = vec![&ob];
@@ -2561,7 +2603,42 @@ fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e: Op
                 st.cmp_mid("step0_x1", &x);
             }
         }
-        println!("[e2e] flow 10 步 {:?}（含每步 styles host 计算 + h2d 换绑）", t0.elapsed());
+        println!("[e2e] flow 10 步 {:?}（styles 已缓存——纯 h2d 换绑 + run + d2h）", t0.elapsed());
+        // GEB_E2E_BENCH=N：稳态 per-call bench——每迭代 = 完整 10 步 flow
+        // （styles 缓存直取 + h2d + run + sync + d2h），x 每迭代从 noise 重启
+        let nb = envi("GEB_E2E_BENCH", 0) as usize;
+        if nb > 0 {
+            let mut ts = Vec::with_capacity(nb);
+            for _ in 0..nb {
+                let t = std::time::Instant::now();
+                let mut xx = st.noise.clone();
+                for sc in &style_cache {
+                    for i in 0..depth {
+                        let b = layer_bases[i];
+                        h2d_f16(&s.binds[b], &sc[4 * i]);
+                        h2d_f16(&s.binds[b + 1], &sc[4 * i + 1]);
+                        h2d_f16(&s.binds[b + 10], &sc[4 * i + 2]);
+                        h2d_f16(&s.binds[b + 11], &sc[4 * i + 3]);
+                    }
+                    h2d_f16(&s.binds[fs_idx], &sc[4 * depth]);
+                    h2d_f16(&s.binds[fs_idx + 1], &sc[4 * depth + 1]);
+                    h2d_f16(&s.binds[0], &xx);
+                    let ins = s.ins();
+                    let oref: Vec<&DeviceBuffer> = vec![&ob];
+                    s.g.run(&ins, &oref, stream).expect("ge run");
+                    drop(stream.synchronize());
+                    xx = download_f16(ctx, &ob, (HOR * ADIM) as usize);
+                }
+                ts.push(t.elapsed().as_secs_f64() * 1e3);
+            }
+            ts.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            println!(
+                "[e2e] flow 稳态 bench ×{nb} 调用（10 步/调用，styles 缓存 + h2d + run + sync + d2h）: P50={:.2}ms min={:.2} max={:.2}",
+                ts[nb / 2],
+                ts[0],
+                ts[nb - 1]
+            );
+        }
         st.actions = x;
         if let Some(g) = &st.golden_actions {
             // golden actions = predict_action_chunk 的 deployable 切片
