@@ -1045,6 +1045,21 @@ fn parity_and_bench(
 //   （executor L714-719：ascl=1+s0 / ash=s1）
 // ---------------------------------------------------------------------------
 
+/// GEB_E2E_REPLAY 离线轨迹帧：真 LIBERO rollout（record_rollout.py 录制，
+/// torch npu-torch 路径）——patches/token_ids/noise/nact 为录制值，三段
+/// 链逐帧产物（vision_out/kv/actions）随回放填充。actions 前 gd 列与
+/// nact（= torch normalized_actions，x_t 终态切片，同 noise）对拍 = 离线
+/// 行为裁判（闭环 env 前的中间验收）
+struct ReplayFrame {
+    patches: Vec<f16>,     // [VT, V_PATCH_W]（含 empty 视图 -1 pad 行）
+    token_ids: Vec<u32>,   // PaliGemma tokenizer + state 离散化（真 prompt）
+    noise: Vec<f16>,       // [HOR, ADIM] 录制时注入
+    nact: Vec<f16>,        // [HOR, 7] torch normalized_actions 参考值
+    vision_out: Vec<f16>,  // [VT, PW] 本帧 vision 段产物
+    kv: Vec<Vec<f16>>,     // 本帧 prefix 36 输出
+    actions: Vec<f16>,     // 本帧 flow 终态 [HOR, ADIM]
+}
+
 struct E2eStage {
     /// 输入（golden 或合成 bring-up）
     patches: Vec<f16>,          // [VT, V_PATCH_W]
@@ -1058,6 +1073,10 @@ struct E2eStage {
     vision_out: Vec<f16>,       // [VT, PW] post-projector
     kv: Vec<Vec<f16>>,          // prefix 36 输出（k0,v0,k1,v1,... 各 [p,KVD]）
     actions: Vec<f16>,          // flow 终态 [HOR, ADIM]
+    /// 离线轨迹回放帧（GEB_E2E_REPLAY；token 长度须全帧 = GEB_TOKENS——
+    /// 真 prompt 的 pad 行在 torch 侧被 mask，引擎静态全可见不等价，等长
+    /// 真 token 才是精确对拍）
+    replay: Vec<ReplayFrame>,
 }
 
 impl E2eStage {
@@ -1237,6 +1256,7 @@ fn seg_e2e(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>) {
                 vision_out: Vec::new(),
                 kv: Vec::new(),
                 actions: Vec::new(),
+                replay: Vec::new(),
             }
         }
         Err(_) => {
@@ -1252,9 +1272,42 @@ fn seg_e2e(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>) {
                 vision_out: Vec::new(),
                 kv: Vec::new(),
                 actions: Vec::new(),
+                replay: Vec::new(),
             }
         }
     };
+    // GEB_E2E_REPLAY=<safetensors>：离线轨迹回放（record_rollout.py 录制，
+    // 键 patches_{i}/token_ids_{i}/noise_{i}/nact_{i}）。bring-up 后三段各
+    // 自逐帧换绑重跑（bring-up 的 golden 对拍照旧作金丝雀）
+    if let Ok(path) = std::env::var("GEB_E2E_REPLAY") {
+        let (t, _) = apxinf_loader::safetensors::load_native_path(std::path::Path::new(&path))
+            .expect("replay load");
+        let n = t.keys().filter(|k| k.starts_with("noise_")).count();
+        assert!(n > 0, "replay 文件无 noise_{{i}} 键: {path}");
+        let rf32 = |k: &str| -> Vec<f32> {
+            t.get(k).unwrap_or_else(|| panic!("replay 缺键 {k}")).to_f32_vec().unwrap()
+        };
+        for i in 0..n {
+            let ids: Vec<u32> = rf32(&format!("token_ids_{i}")).iter().map(|&v| v as u32).collect();
+            assert_eq!(
+                ids.len(),
+                tokens,
+                "replay 帧 {i} token 长度 {} ≠ GEB_TOKENS {tokens}——真 prompt token 数随 \
+                 state 离散值位数浮动，静态 OM 须按等长真 token 帧过滤/重烤",
+                ids.len()
+            );
+            st.replay.push(ReplayFrame {
+                patches: rf32(&format!("patches_{i}")).into_iter().map(f16::from_f32).collect(),
+                token_ids: ids,
+                noise: rf32(&format!("noise_{i}")).into_iter().map(f16::from_f32).collect(),
+                nact: rf32(&format!("nact_{i}")).into_iter().map(f16::from_f32).collect(),
+                vision_out: Vec::new(),
+                kv: Vec::new(),
+                actions: Vec::new(),
+            });
+        }
+        println!("[e2e] replay: {path} ×{n} 帧（token 等长断言已过）");
+    }
     let t0 = std::time::Instant::now();
     seg_vision(be, false, Some(real), Some(&mut st));
     let t1 = std::time::Instant::now();
@@ -1657,6 +1710,29 @@ fn seg_vision(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e: 
         let m = st.vision_out.iter().fold(0f32, |m, v| m.max(v.to_f32().abs()));
         println!("[e2e] vision_out |max|={m:.4}");
         st.cmp_mid("vision_out", &st.vision_out);
+        // GEB_E2E_REPLAY：逐帧覆写 patches（binds[0] = 段首注册的 patches
+        // 输入）重跑；aux 输出 buffer 一次分配复用、只下载主输出 idx0
+        if !st.replay.is_empty() {
+            let n_out = s.g.num_outputs().unwrap();
+            let routs: Vec<DeviceBuffer> = (0..n_out)
+                .map(|i| ctx.malloc(s.g.output_size(i).unwrap().max(16)).expect("replay out malloc"))
+                .collect();
+            let h2d = |buf: &DeviceBuffer, vals: &[f16]| {
+                let bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect();
+                ctx.copy_h2d(buf, &bytes).expect("replay h2d");
+            };
+            let t0 = std::time::Instant::now();
+            for f in st.replay.iter_mut() {
+                assert_eq!(f.patches.len() * 2, s.binds[0].len(), "replay patches 尺寸不符");
+                h2d(&s.binds[0], &f.patches);
+                let ins = s.ins();
+                let refs: Vec<&DeviceBuffer> = routs.iter().collect();
+                s.g.run(&ins, &refs, stream).expect("ge run");
+                drop(stream.synchronize());
+                f.vision_out = download_f16(ctx, &routs[0], s.g.output_size(0).unwrap() / 2);
+            }
+            println!("[e2e] replay vision ×{} {:?}", st.replay.len(), t0.elapsed());
+        }
         return;
     }
     parity_and_bench(ctx, stream, &mut s, "vision", &[(t * PW) as usize], &eager, bench);
@@ -2077,6 +2153,45 @@ fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e: 
             st.cmp_mid(&format!("kvk_l{}", li + key_off), &st.kv[2 * li]);
             st.cmp_mid(&format!("kvv_l{}", li + key_off), &st.kv[2 * li + 1]);
         }
+        // GEB_E2E_REPLAY：逐帧重组 x0（本帧 vision_out 可见行 + 真 token 查表
+        // ×√PW——bring-up 同式）覆写 binds[0]（段首注册的 x0）重跑，36 路
+        // kv 下载（aux 槽不下载）。嵌入表 2.1GB 一次性物化复用
+        if !st.replay.is_empty() {
+            let w = real.expect("replay prefix 需要 GEB_CKPT（token 嵌入查表）");
+            let n_out = s.g.num_outputs().unwrap();
+            let routs: Vec<DeviceBuffer> = (0..n_out)
+                .map(|i| ctx.malloc(s.g.output_size(i).unwrap().max(16)).expect("replay out malloc"))
+                .collect();
+            let emb = w.vision.token_embedding.to_f32_vec().unwrap();
+            let vocab_w = PW as usize;
+            let lang_scale = (PW as f32).sqrt();
+            let vis_rows = ((VT - drop_v) * PW) as usize;
+            let h2d = |buf: &DeviceBuffer, vals: &[f16]| {
+                let bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect();
+                ctx.copy_h2d(buf, &bytes).expect("replay h2d");
+            };
+            let t0 = std::time::Instant::now();
+            for f in st.replay.iter_mut() {
+                assert_eq!(f.vision_out.len(), (VT * PW) as usize, "须先跑 vision replay");
+                let mut x0 = f.vision_out[..vis_rows].to_vec();
+                x0.reserve(f.token_ids.len() * vocab_w);
+                for &id in &f.token_ids {
+                    let r = id as usize * vocab_w;
+                    assert!(r + vocab_w <= emb.len(), "token id {id} 超 vocab");
+                    x0.extend(emb[r..r + vocab_w].iter().map(|&v| f16::from_f32(v * lang_scale)));
+                }
+                assert_eq!(x0.len() * 2, s.binds[0].len(), "replay x0 尺寸不符");
+                h2d(&s.binds[0], &x0);
+                let ins = s.ins();
+                let refs: Vec<&DeviceBuffer> = routs.iter().collect();
+                s.g.run(&ins, &refs, stream).expect("ge run");
+                drop(stream.synchronize());
+                f.kv = (0..nkv)
+                    .map(|i| download_f16(ctx, &routs[i], s.g.output_size(i).unwrap() / 2))
+                    .collect();
+            }
+            println!("[e2e] replay prefix ×{} {:?}", st.replay.len(), t0.elapsed());
+        }
         return;
     }
     let elems = [(p * KVD) as usize];
@@ -2182,6 +2297,8 @@ fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e: Op
             .unwrap_or_else(|| panic!("GEB_E2E_PK_GOLD 需要 golden 键 {k}"));
         v.into_iter().map(f16::from_f32).collect()
     };
+    // pk/pv 注册基址（replay 逐帧换绑用——循环体恰好两次 s.data）
+    let pk_base = s.binds.len();
     for i in 0..depth {
         let pk_h = e2e
             .as_ref()
@@ -2663,6 +2780,65 @@ fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e: Op
             println!("[e2e] 无 golden actions——只验有限性（golden 对拍/LIBERO 归下一步）");
         }
         assert!(st.actions.iter().all(|v| v.to_f32().is_finite()), "actions 含非有限值");
+        // GEB_E2E_REPLAY：逐帧 pk/pv 换绑（36 路 host 中转，同生产链）+ noise
+        // 重启 10 步（styles 预计算缓存跨帧不变）→ actions 前 gd 列 vs torch
+        // normalized_actions（同 noise 对拍 = 离线行为裁判）
+        if !st.replay.is_empty() {
+            let t0 = std::time::Instant::now();
+            let mut rels: Vec<f32> = Vec::with_capacity(st.replay.len());
+            for (fi, f) in st.replay.iter_mut().enumerate() {
+                assert_eq!(f.kv.len(), depth * 2, "须先跑 prefix replay");
+                for i in 0..depth {
+                    h2d_f16(&s.binds[pk_base + 2 * i], &f.kv[2 * i]);
+                    h2d_f16(&s.binds[pk_base + 2 * i + 1], &f.kv[2 * i + 1]);
+                }
+                let mut xx = f.noise.clone();
+                for sc in &style_cache {
+                    for i in 0..depth {
+                        let b = layer_bases[i];
+                        h2d_f16(&s.binds[b], &sc[4 * i]);
+                        h2d_f16(&s.binds[b + 1], &sc[4 * i + 1]);
+                        h2d_f16(&s.binds[b + 10], &sc[4 * i + 2]);
+                        h2d_f16(&s.binds[b + 11], &sc[4 * i + 3]);
+                    }
+                    h2d_f16(&s.binds[fs_idx], &sc[4 * depth]);
+                    h2d_f16(&s.binds[fs_idx + 1], &sc[4 * depth + 1]);
+                    h2d_f16(&s.binds[0], &xx);
+                    let ins = s.ins();
+                    let oref: Vec<&DeviceBuffer> = vec![&ob];
+                    s.g.run(&ins, &oref, stream).expect("ge run");
+                    drop(stream.synchronize());
+                    xx = download_f16(ctx, &ob, (HOR * ADIM) as usize);
+                }
+                f.actions = xx;
+                let gd = f.nact.len() / 50;
+                assert!(gd > 0 && gd <= ADIM as usize, "replay nact 形状异常（帧 {fi}）");
+                let mut md = 0f32;
+                for r in 0..50usize {
+                    for c in 0..gd {
+                        let a = f.actions[r * ADIM as usize + c].to_f32();
+                        let b = f.nact[r * gd + c].to_f32();
+                        md = md.max((a - b).abs());
+                    }
+                }
+                let rm = f.nact.iter().fold(0f32, |m, v| m.max(v.to_f32().abs()));
+                let xm = f.actions.iter().fold(0f32, |m, v| m.max(v.to_f32().abs()));
+                let rel = if rm > 0.0 { md / rm * 100.0 } else { md };
+                rels.push(rel);
+                println!(
+                    "[e2e] replay 帧 {fi}: |x|max={xm:.3} max_diff={md:.5} rel={rel:.1}% (nact|max|={rm:.3})",
+                );
+            }
+            rels.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            println!(
+                "[e2e] REPLAY 对拍 ×{} 帧 {:?}: rel P50={:.1}% min={:.1}% max={:.1}%（torch normalized_actions，同 noise）",
+                st.replay.len(),
+                t0.elapsed(),
+                rels[rels.len() / 2],
+                rels[0],
+                rels[rels.len() - 1]
+            );
+        }
         return;
     }
     parity_and_bench(ctx, stream, &mut s, "flow", &[(HOR * ADIM) as usize], &eager, bench);
