@@ -3911,7 +3911,646 @@ fn optest(be: &AscendBackend, which: &str, real: Option<&Pi05Weights>) {
                 std::fs::write(format!("/tmp/oproj_ge{variant}.f16"), &bytes).expect("dump ge");
             }
         }
-        other => panic!("GEB_OPTEST: ...|v3n|tldn|lnv4c|asc*|ma*|bc4|wgt|oproj|arm, got {other}"),
+        // attn: manual attention 链孤立对拍（2026-09-21 M3 第一动作）。
+        // 裁决"槽与消费值不一致"：全图 m0 槽回读 0.52% 但 norm2 级 2.82%，
+        // oproj 单算（干净上传 buffer）已证 GE mm 逐位 0.000% ⇒ 嫌疑只剩
+        // ① 图内 attention 链真实输出本就 2.8% 级（槽值被覆写美化）或
+        // ② o_proj 消费 headmerge 图内产物时布局/状态异常。本模式：真
+        // x0_vis(712×2048) 输入，[norm1→qkv3→ropeflat→headsplit→GQA→
+        // headmerge→o_proj→+res] 最小图（生产四件套同款算子序列与 scale
+        // 折叠；配 GEB_WCONST=1 同款 Const 权重），逐级 rank-2 输出全是
+        // fresh buffer——链尾无后续算子，槽位覆写不可能。判读：m0sq vs
+        // golden m0_vis（①裁决）；res vs golden res0（②裁决——mm 消费的
+        // 是本图 headmerge 产物而非上传 buffer）。逐级落盘
+        // /tmp/attnmin_*.f16 供离线结构分析
+        "attn" => {
+            let real = real.expect("attn 需要 GEB_CKPT");
+            let gpath = std::env::var("GEB_E2E_GOLDEN").expect("attn 需要 GEB_E2E_GOLDEN（golden v3）");
+            let (t, _) = apxinf_loader::safetensors::load_native_path(std::path::Path::new(&gpath))
+                .expect("golden load");
+            let gf = |k: &str| -> Vec<f16> {
+                let v = t.get(k).unwrap_or_else(|| panic!("golden 缺 {k}")).to_f32_vec().unwrap();
+                v.iter().map(|&x| f16::from_f32(x)).collect()
+            };
+            let (x0h, m0h, resh, h1h, kvk1h) =
+                (gf("x0_vis"), gf("m0_vis"), gf("res0"), gf("h1_vis"), gf("kvk_l1"));
+            let stream = be.stream();
+            let p = 712i64;
+            assert_eq!(x0h.len(), (p * PW) as usize, "x0_vis 长度 ≠ 712×2048");
+            let pscale = 1.0f32 / (HD as f32).sqrt();
+            let lay = real.language_layers.get(0).expect("L0 权重");
+            let mut s = Seg::new("attn_min");
+            // GEB_ATTN_MIN：x0 = golden res0 直入 MLP 尾 + L1 k（无 n1/qkv/
+            // rope/proj 簇）——补矩阵缺失格：wmm3（净）停在 h1 输出，本格
+            // 验证 [MLP 尾→L1 {addrms→k mm→bias→rope}] 组合本身是否带病。
+            // GEB_ATTN_FAKE：golden m0_vis Data 替掉 [headsplit→GQA→headmerge]
+            // 簇（保留 qkv/rope/proj→MLP→L1）——二分触发簇
+            let minmode = std::env::var("GEB_ATTN_MIN").is_ok();
+            let fake = std::env::var("GEB_ATTN_FAKE").is_ok();
+            let x0_src: &Vec<f16> = if minmode { &resh } else { &x0h };
+            s.data(ctx, "x0", &[p, PW], x0_src);
+            s.data_zeros(ctx, "zeros", p, PW);
+            // rope flat 表（prefix 语义 pos_offset=0，f16 量化同源）
+            let (qc, qs, qi) = rope_flat_const(p, HEADS, 0);
+            let (kc, ks, ki) = rope_flat_const(p, KV_HEADS, 0);
+            let (qf, kf) = ((p * HEADS * 2, HD / 2), (p * KV_HEADS * 2, HD / 2));
+            s.data(ctx, "qcos", &[qf.0, qf.1], &qc);
+            s.data(ctx, "qsin", &[qf.0, qf.1], &qs);
+            s.data(ctx, "kcos", &[kf.0, kf.1], &kc);
+            s.data(ctx, "ksin", &[kf.0, kf.1], &ks);
+            s.const_i32("qswap_c", &qi);
+            s.const_i32("kswap_c", &ki);
+            s.const_i32("shp_qflat", &[qf.0 as i32, qf.1 as i32]);
+            s.const_i32("shp_kflat", &[kf.0 as i32, kf.1 as i32]);
+            s.const_i32("shp_kb2", &[p as i32, KVD as i32]);
+            s.const_i32("shp_q3", &[1, p as i32, QD as i32]);
+            s.const_i32("shp_k3", &[1, p as i32, KVD as i32]);
+            s.const_i32("shp_v3", &[1, p as i32, KVD as i32]);
+            s.const_i32("shp_mq4", &[1, p as i32, HEADS as i32, HD as i32]);
+            s.const_i32("shp_mq3", &[HEADS as i32, p as i32, HD as i32]);
+            s.const_i32("shp_ma4", &[1, HEADS as i32, p as i32, HD as i32]);
+            s.const_i32("shp_mflat", &[p as i32, QD as i32]);
+            // L0 真权重（q 侧折 1/√hd——图内无 scale 算子，同生产 manual
+            // 路径；Gemma 投影 bias = zeros）
+            s.data(ctx, "g1", &[PW], &t_f16(&lay.input_norm_scale));
+            let (wq, wk, wv) =
+                (lw_f16(&lay.attention.q), lw_f16(&lay.attention.k), lw_f16(&lay.attention.v));
+            let wq_s: Vec<f16> = wq.iter().map(|v| f16::from_f32(v.to_f32() * pscale)).collect();
+            s.wt(ctx, "qw", &[QD, PW], &wq_s, PW, QD);
+            s.wt(ctx, "kw", &[KVD, PW], &wk, PW, KVD);
+            s.wt(ctx, "vw", &[KVD, PW], &wv, PW, KVD);
+            s.data(ctx, "qb", &[1, QD], &vec![f16::from_f32(0.0); QD as usize]);
+            s.data(ctx, "kb", &[1, KVD], &vec![f16::from_f32(0.0); KVD as usize]);
+            s.data(ctx, "vb", &[1, KVD], &vec![f16::from_f32(0.0); KVD as usize]);
+            s.wt(ctx, "outwt", &[PW, QD], &lw_f16(&lay.attention.output), QD, PW);
+            s.data(ctx, "outb", &[1, PW], &vec![f16::from_f32(0.0); PW as usize]);
+            // L0 MLP 权重 + norm2 gamma + L1 k 投影（延伸：全层 0 → h1 →
+            // 层 1 [norm1→k→rope] = kvk_l1 公式——孤立裁决漂移是否在
+            // MLP 尾或跨层产生；最小图 L0 span 已证 0.23%/0.089% 干净）
+            s.data(ctx, "g2", &[PW], &t_f16(&lay.post_attention_norm_scale));
+            s.wt(ctx, "gatewt", &[INTER, PW], &lw_f16(&lay.mlp.gate), PW, INTER);
+            s.wt(ctx, "upwt", &[INTER, PW], &lw_f16(&lay.mlp.up), PW, INTER);
+            s.wt(ctx, "downwt", &[PW, INTER], &lw_f16(&lay.mlp.down), INTER, PW);
+            s.data(ctx, "downb", &[1, PW], &vec![f16::from_f32(0.0); PW as usize]);
+            let lay1 = real.language_layers.get(1).expect("L1 权重");
+            s.data(ctx, "g1l1", &[PW], &t_f16(&lay1.input_norm_scale));
+            s.wt(ctx, "kwl1", &[KVD, PW], &lw_f16(&lay1.attention.k), PW, KVD);
+            s.data(ctx, "kbl1", &[1, KVD], &vec![f16::from_f32(0.0); KVD as usize]);
+            // ---- 链：seg_prefix L0 逐算子复刻（qkv3+ropeflat+manual GQA）----
+            let (qf2, kf2) = ([qf.0, qf.1], [kf.0, kf.1]);
+            let (sq, res) = if minmode {
+                (String::new(), "x0".to_string())
+            } else {
+                let norm1 = s.addrms("n1", "x0", "zeros", "g1", &[p, PW]);
+                let qm = s.mm("qm", &norm1, &[p, PW], "qw", &[QD, PW], &[p, QD]);
+                let km = s.mm("km", &norm1, &[p, PW], "kw", &[KVD, PW], &[p, KVD]);
+                let vm = s.mm("vm", &norm1, &[p, PW], "vw", &[KVD, PW], &[p, KVD]);
+                let qb_ = s.bias("qb_", &qm, &[p, QD], "qb");
+                let kb_ = s.bias("kb_", &km, &[p, KVD], "kb");
+                let vb_ = s.bias("vb_", &vm, &[p, KVD], "vb");
+                let (kr2, kr3) = s.rope2_flat(
+                    "kr", &kb_, &[p, KVD], &kf2, "kcos", "ksin", "kswap_c", "shp_kflat", "shp_kb2", "shp_k3",
+                );
+                let (qr2, _) = s.rope2_flat(
+                    "qr", &qb_, &[p, QD], &qf2, "qcos", "qsin", "qswap_c", "shp_qflat", "shp_mflat", "shp_q3",
+                );
+                let v3 = s.reshape("v3", &vb_, &[p, KVD], "shp_v3", &[1, p, KVD]);
+                if fake {
+                    let m0 = s.data(ctx, "m0g", &[p, QD], &m0h);
+                    let proj = s.mm("proj", &m0, &[p, QD], "outwt", &[PW, QD], &[p, PW]);
+                    let projb = s.bias("projb", &proj, &[p, PW], "outb");
+                    (proj, s.add2("res", &projb, "x0", &[p, PW]))
+                } else {
+                    let q3 = s.headsplit("qh", &qr2, p, 1, p, HEADS, HD, "shp_mq4", "shp_mq3");
+                    let attn = s.attn_manual_gqa("attn", &q3, &kr3, &v3, HEADS, p, p, HD);
+                    let sq = s.headmerge("am", &attn, 1, p, HEADS, HD, "shp_ma4", "shp_mflat");
+                    let proj = s.mm("proj", &sq, &[p, QD], "outwt", &[PW, QD], &[p, PW]);
+                    let projb = s.bias("projb", &proj, &[p, PW], "outb");
+                    (sq, s.add2("res", &projb, "x0", &[p, PW]))
+                }
+            };
+            // ---- 延伸：L0 MLP 全尾 → h1 → L1 [norm1→k→rope] → kvk_l1 ----
+            // GEB_ATTN_MLP_PAD：MLP 段 mm 的 M 垫到 16 倍数（712→720：行尾
+            // ConcatD 8 零行，down 后 GatherV2D 行切回）——eager 路径当年
+            // "宽 N × 非 16 倍 M" 507015 崩；GE 图内同 shape 疑似静默数值错
+            // （act 20.8%，f16 分块累加模拟仅 0.145% ⇒ 非精度问题）
+            let mlp_pad = std::env::var("GEB_ATTN_MLP_PAD").is_ok();
+            // GEB_ATTN_SWAPADD：残差 Add 操作数对调（x1=Data/激活侧，
+            // x2=投影侧——in-place 别名若依赖 x1 次序即可躲开，零成本）
+            let swapadd = std::env::var("GEB_ATTN_SWAPADD").is_ok();
+            // GEB_ATTN_RES_GOLDEN：MLP 尾改吃 golden res0 Data（attention 子图
+            // 仍在图中、m0sq 仍为图输出）——裁决"res 在图 buffer 被踩"vs
+            // "attention 算子存在本身污染无关 buffer"（V1 实验）
+            let mlp_in = if std::env::var("GEB_ATTN_RES_GOLDEN").is_ok() {
+                s.data(ctx, "resg", &[p, PW], &resh);
+                "resg".to_string()
+            } else {
+                res.clone()
+            };
+            let norm2 = s.addrms("n2", &mlp_in, "zeros", "g2", &[p, PW]);
+            let (act_tap, h1) = if mlp_pad {
+                let mp = (p + 15) / 16 * 16;
+                s.data_zeros(ctx, "zpad", mp - p, PW);
+                s.g.add_op("n2cat", "ConcatD").unwrap();
+                s.g.dyn_inputs("n2cat", "x", 2).unwrap();
+                s.g.set_input_desc("n2cat", "x0", &[p, PW], Dtype::Fp16).unwrap();
+                s.g.set_input_desc("n2cat", "x1", &[mp - p, PW], Dtype::Fp16).unwrap();
+                s.g.set_output_desc("n2cat", "y", &[mp, PW], Dtype::Fp16).unwrap();
+                s.g.set_attr_int("n2cat", "concat_dim", 0).unwrap();
+                s.g.set_attr_int("n2cat", "N", 2).unwrap();
+                s.wire("n2cat", "x0", &norm2);
+                s.wire("n2cat", "x1", "zpad");
+                let n2p = s.reg_out("n2cat", "y");
+                let gate = s.mm("gate", &n2p, &[mp, PW], "gatewt", &[INTER, PW], &[mp, INTER]);
+                let up = s.mm("up", &n2p, &[mp, PW], "upwt", &[INTER, PW], &[mp, INTER]);
+                let gact = s.gelu("gact", &gate, &[mp, INTER], true);
+                let act = s.mul2("act", &gact, &up, &[mp, INTER]);
+                let down = s.mm("down", &act, &[mp, INTER], "downwt", &[PW, INTER], &[mp, PW]);
+                let idx712: Vec<i32> = (0..p as i32).collect();
+                s.const_i32("cut_idx", &idx712);
+                s.g.add_op("cut", "GatherV2D").unwrap();
+                s.g.set_input_desc("cut", "x", &[mp, PW], Dtype::Fp16).unwrap();
+                s.g.set_input_desc("cut", "indices", &[p], Dtype::Int32).unwrap();
+                s.g.set_output_desc("cut", "y", &[p, PW], Dtype::Fp16).unwrap();
+                s.g.set_attr_int("cut", "axis", 0).unwrap();
+                s.wire("cut", "x", &down);
+                s.g.link("cut", "indices", "cut_idx").unwrap();
+                let cut = s.reg_out("cut", "y");
+                let downb = s.bias("downb_", &cut, &[p, PW], "downb");
+                (act, s.add2("h1", &downb, &mlp_in, &[p, PW]))
+            } else {
+                let gate = s.mm("gate", &norm2, &[p, PW], "gatewt", &[INTER, PW], &[p, INTER]);
+                let up = s.mm("up", &norm2, &[p, PW], "upwt", &[INTER, PW], &[p, INTER]);
+                let gact = s.gelu("gact", &gate, &[p, INTER], true);
+                let act = s.mul2("act", &gact, &up, &[p, INTER]);
+                let down = s.mm("down", &act, &[p, INTER], "downwt", &[PW, INTER], &[p, PW]);
+                let downb = s.bias("downb_", &down, &[p, PW], "downb");
+                if swapadd {
+                    (act, s.add2("h1", &mlp_in, &downb, &[p, PW]))
+                } else {
+                    (act, s.add2("h1", &downb, &mlp_in, &[p, PW]))
+                }
+            };
+            // GEB_ATTN_L1=bar|mm：L1 段二分——[add2→addrms] 邻接是当前最小
+            // 脏图（MIN 11%）的唯一候选模式（wmm3 无此邻接即净 0.032%；
+            // 生产图每层都有 [proj→add→addrms]，与 kvk_l0 净 / kvk_l1 45%
+            // 脏吻合）。bar = h1 过 mul(ones) 屏障再进 addrms（屏障若治愈
+            // ⇒ 可用生产 workaround）；mm = 跳过 addrms 直接 k 投影（输出
+            // pre-rope k，判 add2 输出被 mm 消费是否也坏）
+            let l1mode = std::env::var("GEB_ATTN_L1").unwrap_or_default();
+            let kvk1 = if l1mode == "mm" {
+                let kml1 = s.mm("l1km", &h1, &[p, PW], "kwl1", &[KVD, PW], &[p, KVD]);
+                s.bias("l1kb_", &kml1, &[p, KVD], "kbl1")
+            } else if l1mode == "swap" || l1mode == "rshp" {
+                // 修复原型①：h1 走 x2 端口（x1=zeros）——若 AddRmsNorm 的
+                // 病在 x1 端口的在图输入，端口对调即治愈；② 恒等 Reshape
+                // 屏障（元数据级，若强制了 buffer 重新分配亦可治愈）
+                let h1_in = if l1mode == "swap" {
+                    h1.clone()
+                } else {
+                    s.reshape("h1rsh", &h1, &[p, PW], "shp_mflat", &[p, QD])
+                };
+                s.g.add_op("l1n2", "AddRmsNorm").unwrap();
+                s.g.set_input_desc("l1n2", "x1", &[p, PW], Dtype::Fp16).unwrap();
+                s.g.set_input_desc("l1n2", "x2", &[p, PW], Dtype::Fp16).unwrap();
+                s.g.set_input_desc("l1n2", "gamma", &[PW], Dtype::Fp16).unwrap();
+                s.g.set_output_desc("l1n2", "y", &[p, PW], Dtype::Fp16).unwrap();
+                s.g.set_attr_float("l1n2", "epsilon", RMS_EPS).unwrap();
+                s.g.link("l1n2", "x1", "zeros").unwrap();
+                s.wire("l1n2", "x2", &h1_in);
+                s.g.link("l1n2", "gamma", "g1l1").unwrap();
+                let n1l1 = s.reg_out("l1n2", "y");
+                let kml1 = s.mm("l1km", &n1l1, &[p, PW], "kwl1", &[KVD, PW], &[p, KVD]);
+                let kbl1_ = s.bias("l1kb_", &kml1, &[p, KVD], "kbl1");
+                s.rope2_flat(
+                    "l1kr", &kbl1_, &[p, KVD], &kf2, "kcos", "ksin", "kswap_c", "shp_kflat", "shp_kb2", "shp_k3",
+                )
+                .0
+            } else {
+                let h1_in = if l1mode == "bar" {
+                    let ones = vec![f16::from_f32(1.0); (p * PW) as usize];
+                    s.data(ctx, "ones", &[p, PW], &ones);
+                    s.mul2("h1bar", &h1, "ones", &[p, PW])
+                } else if l1mode == "mbar" {
+                    // 恒等 mm 屏障：wmm5-M 已证 [mm 输出 → addrms] 干净——
+                    // 生产修复原型（代价 ~0.3ms/实例）
+                    let mut idw = vec![f16::from_f32(0.0); (PW * PW) as usize];
+                    for i in 0..PW as usize {
+                        idw[i * PW as usize + i] = f16::from_f32(1.0);
+                    }
+                    s.wt(ctx, "idw", &[PW, PW], &idw, PW, PW);
+                    s.mm("h1id", &h1, &[p, PW], "idw", &[PW, PW], &[p, PW])
+                } else {
+                    h1.clone()
+                };
+                let n1l1 = s.addrms("l1n1", &h1_in, "zeros", "g1l1", &[p, PW]);
+                let kml1 = s.mm("l1km", &n1l1, &[p, PW], "kwl1", &[KVD, PW], &[p, KVD]);
+                let kbl1_ = s.bias("l1kb_", &kml1, &[p, KVD], "kbl1");
+                if l1mode == "norm" {
+                    // 只去 rope（addrms 保留）——与 mm 模式（两者都去）对分
+                    kbl1_
+                } else {
+                    s.rope2_flat(
+                        "l1kr", &kbl1_, &[p, KVD], &kf2, "kcos", "ksin", "kswap_c", "shp_kflat", "shp_kb2", "shp_k3",
+                    )
+                    .0
+                }
+            };
+            // 逐级图输出（显示名, 算子名）。⚠ 不声明 addrms 输出（norm1/
+            // norm2）——绑定 AddRmsNorm 的 y 会触发 GE 自动补绑 rstd/x_out
+            // （wmm3 无 addrms 输出绑定时无 extras 且全净；attn 图有 extras
+            // 且脏——auto-bind 破坏内存计划的嫌疑，去掉后 kvk1 若转净即坐实）
+            // MIN 二分：只留 kvk1——去掉 h1 的 dual-role（既是图输出又被
+            // l1n1 消费）。若转净 ⇒ "输出 tap+消费者" 双角色破坏 GE 内存
+            // 计划（也解释各图槽读数不可信）
+            let mut taps: Vec<(&'static str, String)> = if minmode {
+                if l1mode == "mm" {
+                    // mm 模式附 h1 tap：此时 h1 在链早期被 k-mm 消费、尾部
+                    // 无算子，输出槽不会被覆写——取在图 h1 的真实 f16 值做
+                    // 离线判决（wmm4 喂 h1_vis 干净 vs 在图 h1 脏的最终分裂）
+                    vec![("h1", h1.clone()), ("k", kvk1)]
+                } else {
+                    vec![("kvk1", kvk1)]
+                }
+            } else {
+                vec![
+                    ("m0sq", sq.clone()),
+                    ("res", res.clone()),
+                    ("act", act_tap),
+                    ("h1", h1),
+                    ("kvk1", kvk1),
+                ]
+            };
+            let out_names: Vec<&str> = taps.iter().map(|(_, n)| n.as_str()).collect();
+            s.finish(&out_names);
+            let ins: Vec<&DeviceBuffer> = s.ins();
+            // 输出按模型 introspection 分配（声明 8 个但模型可能自动补绑悬空
+            // required 输出——首跑实测 model=10 > 声明 8，geb_run rc=-3；
+            // 全量 dump 后离线按值/形状对号，不猜槽序）
+            let n_out = s.g.num_outputs().unwrap();
+            let mut bufs = Vec::new();
+            for i in 0..n_out {
+                let sz = s.g.output_size(i).unwrap();
+                let dims = s.g.output_dims(i).unwrap();
+                println!("attn: out[{i}] size={sz} dims={dims:?}");
+                bufs.push(ctx.malloc(sz).unwrap());
+            }
+            let out_refs: Vec<&DeviceBuffer> = bufs.iter().collect();
+            s.g.run(&ins, &out_refs, stream).unwrap();
+            drop(stream.synchronize());
+            for (i, buf) in bufs.iter().enumerate() {
+                let sz = s.g.output_size(i).unwrap();
+                let vals = download_f16(ctx, buf, sz / 2);
+                let bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect();
+                std::fs::write(format!("/tmp/attnmin_out{i}.f16"), &bytes).expect("dump");
+                // [712,2048] 槽就地多比 golden（m0_vis / res0 / h1_vis）+
+                // [712,256] 槽比 kvk_l1——attention 链、o_proj 消费值、MLP
+                // 尾、跨层 k 的一手判读（精确对号离线脚本做）
+                if vals.len() == (p * PW) as usize {
+                    for (tn, tgt) in [("m0_vis", &m0h), ("res0", &resh), ("h1_vis", &h1h)] {
+                        let (mut md, mut gm) = (0f32, 0f32);
+                        for (a, b) in vals.iter().zip(tgt.iter()) {
+                            md = md.max((a.to_f32() - b.to_f32()).abs());
+                            gm = gm.max(b.to_f32().abs());
+                        }
+                        println!("attn[out{i}]: vs_golden_{tn} max_diff={md:.5} rel={:.3}%", md / gm * 100.0);
+                    }
+                }
+                if vals.len() == (p * KVD) as usize {
+                    let (mut md, mut gm) = (0f32, 0f32);
+                    for (a, b) in vals.iter().zip(kvk1h.iter()) {
+                        md = md.max((a.to_f32() - b.to_f32()).abs());
+                        gm = gm.max(b.to_f32().abs());
+                    }
+                    println!("attn[out{i}]: vs_golden_kvk_l1 max_diff={md:.5} rel={:.3}%", md / gm * 100.0);
+                }
+            }
+        }
+        // wmm: 宽 N mm 隔离矩阵（gate 单算，2026-09-21）——attn 最小图已把
+        // 漂移钉到 gate/up 段（act 20.8%，垫 M 后 3.05%，f16 累加模拟仅
+        // 0.145% ⇒ 非精度）。一次裁决四变量：M∈{712,720} × 权重{Const,Data}
+        // × {全宽 N=16384, 拆半 8192×2} + eager aclnn（内部自动垫 M）。
+        // 输入 = golden res0 的 f64 rms 归一化（gamma=ones，权重已折叠）。
+        // 输出落盘 /tmp/wmm_*.f16，Python 对拍 f64
+        "wmm" => {
+            let real = real.expect("wmm 需要 GEB_CKPT");
+            let gpath = std::env::var("GEB_E2E_GOLDEN").expect("wmm 需要 GEB_E2E_GOLDEN（golden v3）");
+            let (t, _) = apxinf_loader::safetensors::load_native_path(std::path::Path::new(&gpath))
+                .expect("golden load");
+            let rv = t.get("res0").expect("golden 缺 res0").to_f32_vec().unwrap();
+            let p = 712i64;
+            assert_eq!(rv.len(), (p * PW) as usize, "res0 长度 ≠ 712×2048");
+            let mut n2h = Vec::with_capacity((p * PW) as usize);
+            for r in 0..p as usize {
+                let row = &rv[r * PW as usize..(r + 1) * PW as usize];
+                let ms: f64 = row.iter().map(|&v| { let x = v as f64; x * x }).sum::<f64>() / PW as f64;
+                let rms = (ms + 1e-6f64).sqrt();
+                for &v in row {
+                    n2h.push(f16::from_f32((v as f64 / rms) as f32));
+                }
+            }
+            let mut x720 = n2h.clone();
+            x720.extend(std::iter::repeat(f16::from_f32(0.0)).take((8 * PW) as usize));
+            let lay = real.language_layers.get(0).expect("L0 权重");
+            let wgt = lw_f16(&lay.mlp.gate); // [PW, INTER] 物理（in,out，已折叠）
+            assert_eq!(wgt.len(), (PW * INTER) as usize);
+            let bytes = unsafe { std::slice::from_raw_parts(wgt.as_ptr() as *const u8, wgt.len() * 2) };
+            let trans = |src: &[f16], rows: i64, cols: i64| -> Vec<f16> {
+                let b = unsafe { std::slice::from_raw_parts(src.as_ptr() as *const u8, src.len() * 2) };
+                let t = aops::host_transpose(b, rows, cols);
+                t.chunks_exact(2)
+                    .map(|c| f16::from_bits(u16::from_le_bytes([c[0], c[1]])))
+                    .collect()
+            };
+            let wfull_t = trans(&wgt, PW, INTER); // [INTER, PW]
+            let half = (INTER / 2) as usize;
+            let (mut wlo, mut whi) =
+                (Vec::with_capacity(PW as usize * half), Vec::with_capacity(PW as usize * half));
+            for r in 0..PW as usize {
+                let row = &wgt[r * INTER as usize..(r + 1) * INTER as usize];
+                wlo.extend_from_slice(&row[..half]);
+                whi.extend_from_slice(&row[half..]);
+            }
+            let wlo_t = trans(&wlo, PW, INTER / 2);
+            let whi_t = trans(&whi, PW, INTER / 2);
+            let stream = be.stream();
+            let mut s = Seg::new("wmm");
+            let x712 = s.data(ctx, "x712", &[p, PW], &n2h);
+            let x720n = s.data(ctx, "x720", &[p + 8, PW], &x720);
+            s.const_f16("wcst", &[INTER, PW], &wfull_t);
+            s.data(ctx, "wnd", &[INTER, PW], &wfull_t);
+            s.const_f16("wlo", &[INTER / 2, PW], &wlo_t);
+            s.const_f16("whi", &[INTER / 2, PW], &whi_t);
+            let _ = x712;
+            let _ = x720n;
+            let o1 = s.mm("mm_cst712", "x712", &[p, PW], "wcst", &[INTER, PW], &[p, INTER]);
+            let o2 = s.mm("mm_nd712", "x712", &[p, PW], "wnd", &[INTER, PW], &[p, INTER]);
+            let o3 = s.mm("mm_cst720", "x720", &[p + 8, PW], "wcst", &[INTER, PW], &[p + 8, INTER]);
+            let o4 = s.mm("mm_lo712", "x712", &[p, PW], "wlo", &[INTER / 2, PW], &[p, INTER / 2]);
+            let o5 = s.mm("mm_hi712", "x712", &[p, PW], "whi", &[INTER / 2, PW], &[p, INTER / 2]);
+            let outs = [o1, o2, o3, o4, o5];
+            let out_names: Vec<&str> = outs.iter().map(|x| x.as_str()).collect();
+            s.finish(&out_names);
+            let ins: Vec<&DeviceBuffer> = s.ins();
+            let n_out = s.g.num_outputs().unwrap();
+            let mut bufs = Vec::new();
+            for i in 0..n_out {
+                let sz = s.g.output_size(i).unwrap();
+                bufs.push(ctx.malloc(sz).unwrap());
+            }
+            let out_refs: Vec<&DeviceBuffer> = bufs.iter().collect();
+            s.g.run(&ins, &out_refs, stream).unwrap();
+            drop(stream.synchronize());
+            let names = ["cst712", "nd712", "cst720", "lo712", "hi712"];
+            for (i, buf) in bufs.iter().enumerate() {
+                let sz = s.g.output_size(i).unwrap();
+                let vals = download_f16(ctx, buf, sz / 2);
+                let bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect();
+                let dn = names.get(i).map(|x| *x).unwrap_or("extra");
+                std::fs::write(format!("/tmp/wmm_ge_{dn}.f16"), &bytes).expect("dump");
+            }
+            // eager aclnn（aops matmul 内部自动垫 M 到 16 倍数——生产 eager
+            // 从未踩此坑的原因）
+            let wb = upload(ctx, &wfull_t);
+            let xb = upload(ctx, &n2h);
+            let er = aops::matmul_b_t_fp16(ctx, &stream, &xb, [p, PW], &wb, PW, INTER).unwrap();
+            drop(stream.synchronize());
+            let ef = download_f16(ctx, &er, (p * INTER) as usize);
+            let bytes: Vec<u8> = ef.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect();
+            std::fs::write("/tmp/wmm_eager712.f16", &bytes).expect("dump eager");
+            let _ = &bytes;
+        }
+        // wmm2: down mm 隔离（K=16384——wmm 已洗 gate/up N=16384 宽 mm，
+        // 全变体 0.057% 干净；down 的 K 维是唯一未隔离嫌疑）。输入 =
+        // Python f64 链产的 act16（/data/apxinf/wmm/act_in.f16，wmm2_prep）
+        // × L0 down 真权重，M∈{712,720} × {GE cst} + eager 三方。
+        "wmm2" => {
+            let real = real.expect("wmm2 需要 GEB_CKPT");
+            let raw = std::fs::read("/data/apxinf/wmm/act_in.f16").expect("act_in.f16（先跑 wmm2_prep.py）");
+            let p = 712i64;
+            let n_in = (p * INTER) as usize;
+            assert_eq!(raw.len(), n_in * 2, "act_in 长度 ≠ 712×16384");
+            let x712: Vec<f16> = raw
+                .chunks_exact(2)
+                .map(|c| f16::from_bits(u16::from_le_bytes([c[0], c[1]])))
+                .collect();
+            let mut x720 = x712.clone();
+            x720.extend(std::iter::repeat(f16::from_f32(0.0)).take((8 * INTER) as usize));
+            let lay = real.language_layers.get(0).expect("L0 权重");
+            let wgt = lw_f16(&lay.mlp.down); // [INTER, PW] 物理（in,out）
+            assert_eq!(wgt.len(), (INTER * PW) as usize);
+            let bytes = unsafe { std::slice::from_raw_parts(wgt.as_ptr() as *const u8, wgt.len() * 2) };
+            let t = aops::host_transpose(bytes, INTER, PW);
+            let wt_t: Vec<f16> = t
+                .chunks_exact(2)
+                .map(|c| f16::from_bits(u16::from_le_bytes([c[0], c[1]])))
+                .collect();
+            let stream = be.stream();
+            let mut s = Seg::new("wmm2");
+            s.data(ctx, "x712", &[p, INTER], &x712);
+            s.data(ctx, "x720", &[p + 8, INTER], &x720);
+            s.const_f16("wcst", &[PW, INTER], &wt_t);
+            let o1 = s.mm("mm_dn712", "x712", &[p, INTER], "wcst", &[PW, INTER], &[p, PW]);
+            let o2 = s.mm("mm_dn720", "x720", &[p + 8, INTER], "wcst", &[PW, INTER], &[p + 8, PW]);
+            s.finish(&[&o1, &o2]);
+            let ins: Vec<&DeviceBuffer> = s.ins();
+            let n_out = s.g.num_outputs().unwrap();
+            let mut bufs = Vec::new();
+            for i in 0..n_out {
+                let sz = s.g.output_size(i).unwrap();
+                bufs.push(ctx.malloc(sz).unwrap());
+            }
+            let out_refs: Vec<&DeviceBuffer> = bufs.iter().collect();
+            s.g.run(&ins, &out_refs, stream).unwrap();
+            drop(stream.synchronize());
+            for (i, buf) in bufs.iter().enumerate() {
+                let sz = s.g.output_size(i).unwrap();
+                let vals = download_f16(ctx, buf, sz / 2);
+                let bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect();
+                std::fs::write(format!("/tmp/wmm2_ge_{i}.f16"), &bytes).expect("dump");
+            }
+            let wb = upload(ctx, &wt_t);
+            let xb = upload(ctx, &x712);
+            let er = aops::matmul_b_t_fp16(ctx, &stream, &xb, [p, INTER], &wb, INTER, PW).unwrap();
+            drop(stream.synchronize());
+            let ef = download_f16(ctx, &er, (p * PW) as usize);
+            let bytes: Vec<u8> = ef.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect();
+            std::fs::write("/tmp/wmm2_eager712.f16", &bytes).expect("dump eager");
+        }
+        // wmm3: MLP 尾组合阶梯（gate/down 单算全净后的组合性裁决）。
+        // 同一 golden res0 输入，四条独立链：A[addrms→gate mm] /
+        // B[addrms→gate→gelu] / C[addrms→gate,up→gelu·up=act] /
+        // D[全尾→down→bias→+res=h1]。独立 addrms 实例（链间零共享）。
+        // 第一条坏链 = 组合性根因的位置；A 净而 attn 图脏 ⇒ addrms→mm
+        // 组合（而非 mm 本身）有布局/交互问题
+        "wmm3" => {
+            let real = real.expect("wmm3 需要 GEB_CKPT");
+            let gpath = std::env::var("GEB_E2E_GOLDEN").expect("wmm3 需要 GEB_E2E_GOLDEN（golden v3）");
+            let (t, _) = apxinf_loader::safetensors::load_native_path(std::path::Path::new(&gpath))
+                .expect("golden load");
+            let rv = t.get("res0").expect("golden 缺 res0").to_f32_vec().unwrap();
+            let p = 712i64;
+            assert_eq!(rv.len(), (p * PW) as usize, "res0 长度 ≠ 712×2048");
+            let resh: Vec<f16> = rv.iter().map(|&v| f16::from_f32(v)).collect();
+            let lay = real.language_layers.get(0).expect("L0 权重");
+            let stream = be.stream();
+            let mut s = Seg::new("wmm3");
+            s.data(ctx, "x", &[p, PW], &resh);
+            s.data_zeros(ctx, "zeros", p, PW);
+            s.data(ctx, "g2", &[PW], &t_f16(&lay.post_attention_norm_scale));
+            s.wt(ctx, "gw", &[INTER, PW], &lw_f16(&lay.mlp.gate), PW, INTER);
+            s.wt(ctx, "uw", &[INTER, PW], &lw_f16(&lay.mlp.up), PW, INTER);
+            s.wt(ctx, "dw", &[PW, INTER], &lw_f16(&lay.mlp.down), INTER, PW);
+            s.data(ctx, "db", &[1, PW], &vec![f16::from_f32(0.0); PW as usize]);
+            // 链 A：addrms → gate mm
+            let a1 = s.addrms("a1", "x", "zeros", "g2", &[p, PW]);
+            let ga = s.mm("gA", &a1, &[p, PW], "gw", &[INTER, PW], &[p, INTER]);
+            // 链 B：addrms → gate → gelu
+            let a2 = s.addrms("a2", "x", "zeros", "g2", &[p, PW]);
+            let gb = s.mm("gB", &a2, &[p, PW], "gw", &[INTER, PW], &[p, INTER]);
+            let eb = s.gelu("eB", &gb, &[p, INTER], true);
+            // 链 C：addrms → gate,up → gelu·up = act
+            let a3 = s.addrms("a3", "x", "zeros", "g2", &[p, PW]);
+            let gc = s.mm("gC", &a3, &[p, PW], "gw", &[INTER, PW], &[p, INTER]);
+            let uc = s.mm("uC", &a3, &[p, PW], "uw", &[INTER, PW], &[p, INTER]);
+            let ec = s.gelu("eC", &gc, &[p, INTER], true);
+            let actc = s.mul2("actC", &ec, &uc, &[p, INTER]);
+            // 链 D：全尾 → down → bias → +res = h1
+            let a4 = s.addrms("a4", "x", "zeros", "g2", &[p, PW]);
+            let gd = s.mm("gD", &a4, &[p, PW], "gw", &[INTER, PW], &[p, INTER]);
+            let ud = s.mm("uD", &a4, &[p, PW], "uw", &[INTER, PW], &[p, INTER]);
+            let ed = s.gelu("eD", &gd, &[p, INTER], true);
+            let actd = s.mul2("actD", &ed, &ud, &[p, INTER]);
+            let dnd = s.mm("dnD", &actd, &[p, INTER], "dw", &[PW, INTER], &[p, PW]);
+            let dbd = s.bias("dbD", &dnd, &[p, PW], "db");
+            let h1d = s.add2("h1D", &dbd, "x", &[p, PW]);
+            let outs = [ga, eb, actc, h1d];
+            let out_names: Vec<&str> = outs.iter().map(|x| x.as_str()).collect();
+            s.finish(&out_names);
+            let ins: Vec<&DeviceBuffer> = s.ins();
+            let n_out = s.g.num_outputs().unwrap();
+            let mut bufs = Vec::new();
+            for i in 0..n_out {
+                let sz = s.g.output_size(i).unwrap();
+                bufs.push(ctx.malloc(sz).unwrap());
+            }
+            let out_refs: Vec<&DeviceBuffer> = bufs.iter().collect();
+            s.g.run(&ins, &out_refs, stream).unwrap();
+            drop(stream.synchronize());
+            let names = ["A_gate", "B_gelu", "C_act", "D_h1"];
+            for (i, buf) in bufs.iter().enumerate() {
+                let sz = s.g.output_size(i).unwrap();
+                let vals = download_f16(ctx, buf, sz / 2);
+                let bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect();
+                let dn = names.get(i).map(|x| *x).unwrap_or("extra");
+                std::fs::write(format!("/tmp/wmm3_{dn}.f16"), &bytes).expect("dump");
+            }
+        }
+        // wmm4: addrms 值域 vs 输入来源裁决（norm 模式已定罪 l1n1 的
+        // AddRmsNorm：12.9% 值级误差；但 n2-on-res0(|max|559，平方同样
+        // >f16) 干净 ⇒ f16 平方饱和解释不了区分度）。golden h1_vis 作
+        // Data 直喂 [addrms→k mm→bias]：净 ⇒ 病在"在图中间量作输入"；
+        // 脏 ⇒ 病在 h1 值域（|max|1562）与来源无关
+        "wmm4" => {
+            let real = real.expect("wmm4 需要 GEB_CKPT");
+            let gpath = std::env::var("GEB_E2E_GOLDEN").expect("wmm4 需要 GEB_E2E_GOLDEN（golden v3）");
+            let (t, _) = apxinf_loader::safetensors::load_native_path(std::path::Path::new(&gpath))
+                .expect("golden load");
+            let hv = t.get("h1_vis").expect("golden 缺 h1_vis").to_f32_vec().unwrap();
+            let h1h: Vec<f16> = hv.iter().map(|&v| f16::from_f32(v)).collect();
+            let p = 712i64;
+            assert_eq!(h1h.len(), (p * PW) as usize, "h1_vis 长度 ≠ 712×2048");
+            let lay1 = real.language_layers.get(1).expect("L1 权重");
+            let stream = be.stream();
+            let mut s = Seg::new("wmm4");
+            s.data(ctx, "x", &[p, PW], &h1h);
+            s.data_zeros(ctx, "zeros", p, PW);
+            s.data(ctx, "g1", &[PW], &t_f16(&lay1.input_norm_scale));
+            s.wt(ctx, "kw", &[KVD, PW], &lw_f16(&lay1.attention.k), PW, KVD);
+            s.data(ctx, "kb", &[1, KVD], &vec![f16::from_f32(0.0); KVD as usize]);
+            let n1 = s.addrms("n1", "x", "zeros", "g1", &[p, PW]);
+            let km = s.mm("km", &n1, &[p, PW], "kw", &[KVD, PW], &[p, KVD]);
+            let out = s.bias("kb_", &km, &[p, KVD], "kb");
+            s.finish(&[&out]);
+            let ins: Vec<&DeviceBuffer> = s.ins();
+            let n_out = s.g.num_outputs().unwrap();
+            let mut bufs = Vec::new();
+            for i in 0..n_out {
+                let sz = s.g.output_size(i).unwrap();
+                bufs.push(ctx.malloc(sz).unwrap());
+            }
+            let out_refs: Vec<&DeviceBuffer> = bufs.iter().collect();
+            s.g.run(&ins, &out_refs, stream).unwrap();
+            drop(stream.synchronize());
+            for (i, buf) in bufs.iter().enumerate() {
+                let sz = s.g.output_size(i).unwrap();
+                let vals = download_f16(ctx, buf, sz / 2);
+                let bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect();
+                std::fs::write(format!("/tmp/wmm4_out{i}.f16"), &bytes).expect("dump");
+            }
+        }
+        // wmm5: addrms 输入来源机制判别 + 修复原型。wmm4 已证 [h1_vis 值
+        // 作 Data → addrms] 净 ⇒ 病在"在图中间量作 x1"。三链同源：
+        // M[Data→mm→addrms→k mm]（mm 输出喂 addrms 行不行）/
+        // G[mm 输出过 GatherV2D 恒等拷贝→addrms]（真拷贝屏障能否治愈——
+        // bar 的 mul 无效说明"新 buffer"不够，需判格式/搬运差异）
+        "wmm5" => {
+            let real = real.expect("wmm5 需要 GEB_CKPT");
+            let gpath = std::env::var("GEB_E2E_GOLDEN").expect("wmm5 需要 GEB_E2E_GOLDEN（golden v3）");
+            let (t, _) = apxinf_loader::safetensors::load_native_path(std::path::Path::new(&gpath))
+                .expect("golden load");
+            let rv = t.get("res0").expect("golden 缺 res0").to_f32_vec().unwrap();
+            let p = 712i64;
+            let resh: Vec<f16> = rv.iter().map(|&v| f16::from_f32(v)).collect();
+            assert_eq!(resh.len(), (p * PW) as usize);
+            let lay = real.language_layers.get(0).expect("L0 权重");
+            let lay1 = real.language_layers.get(1).expect("L1 权重");
+            let stream = be.stream();
+            let mut s = Seg::new("wmm5");
+            s.data(ctx, "x", &[p, PW], &resh);
+            s.data_zeros(ctx, "zeros", p, PW);
+            s.data(ctx, "g2", &[PW], &t_f16(&lay.post_attention_norm_scale));
+            s.wt(ctx, "outwt", &[PW, QD], &lw_f16(&lay.attention.output), QD, PW);
+            s.data(ctx, "outb", &[1, PW], &vec![f16::from_f32(0.0); PW as usize]);
+            s.wt(ctx, "kw", &[KVD, PW], &lw_f16(&lay1.attention.k), PW, KVD);
+            s.data(ctx, "kb", &[1, KVD], &vec![f16::from_f32(0.0); KVD as usize]);
+            let id_idx: Vec<i32> = (0..p as i32).collect();
+            s.const_i32("id_idx", &id_idx);
+            // 公共生产段：y = bias(mm(res0, outwt)) —— addrms 的在图输入
+            let y0 = s.mm("yM", "x", &[p, PW], "outwt", &[PW, QD], &[p, PW]);
+            let yb = s.bias("ybM", &y0, &[p, PW], "outb");
+            // 链 M：addrms 直读 mm+bias 输出
+            let nm = s.addrms("nM", &yb, "zeros", "g2", &[p, PW]);
+            let km = s.mm("kM", &nm, &[p, PW], "kw", &[KVD, PW], &[p, KVD]);
+            let outm = s.bias("kbM", &km, &[p, KVD], "kb");
+            // 链 G：mm 输出过 GatherV2D 恒等拷贝再进 addrms
+            let yg = s.gather_rows("yg", &yb, &[p, PW], "id_idx");
+            let ng = s.addrms("nG", &yg, "zeros", "g2", &[p, PW]);
+            let kg = s.mm("kG", &ng, &[p, PW], "kw", &[KVD, PW], &[p, KVD]);
+            let outg = s.bias("kbG", &kg, &[p, KVD], "kb");
+            let outs = [outm, outg];
+            let out_names: Vec<&str> = outs.iter().map(|x| x.as_str()).collect();
+            s.finish(&out_names);
+            let ins: Vec<&DeviceBuffer> = s.ins();
+            let n_out = s.g.num_outputs().unwrap();
+            let mut bufs = Vec::new();
+            for i in 0..n_out {
+                let sz = s.g.output_size(i).unwrap();
+                bufs.push(ctx.malloc(sz).unwrap());
+            }
+            let out_refs: Vec<&DeviceBuffer> = bufs.iter().collect();
+            s.g.run(&ins, &out_refs, stream).unwrap();
+            drop(stream.synchronize());
+            let names = ["M", "G"];
+            for (i, buf) in bufs.iter().enumerate() {
+                let sz = s.g.output_size(i).unwrap();
+                let vals = download_f16(ctx, buf, sz / 2);
+                let bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect();
+                let dn = names.get(i).map(|x| *x).unwrap_or("extra");
+                std::fs::write(format!("/tmp/wmm5_{dn}.f16"), &bytes).expect("dump");
+            }
+        }
+        other => panic!("GEB_OPTEST: ...|v3n|tldn|lnv4c|asc*|ma*|bc4|wgt|oproj|arm|attn|wmm|wmm2|wmm3|wmm4|wmm5, got {other}"),
     }
     println!("OPTEST_{which}_OK");
     ge_builder::fini().expect("fini");
