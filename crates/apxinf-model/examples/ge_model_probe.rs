@@ -1077,6 +1077,135 @@ struct E2eStage {
     /// 真 prompt 的 pad 行在 torch 侧被 mask，引擎静态全可见不等价，等长
     /// 真 token 才是精确对拍）
     replay: Vec<ReplayFrame>,
+    /// GEB_E2E_SERVE 常驻机械（三段 per-frame 执行器；ctx/stream 由
+    /// serve 循环传入，机械只持 owned 状态——多桶 = 每桶一个进程）
+    vmech: Option<VisionMech>,
+    pmech: Option<PrefixMech>,
+    fmech: Option<FlowMech>,
+}
+
+// ---------------------------------------------------------------------------
+// GEB_E2E_SERVE 常驻机械：三段 per-frame 执行器（闭环 eval 用）。
+// 单进程单桶（GEB_TOKENS=L + GEB_OM_DIR=tl{L}），Python 侧按帧挑桶/每桶
+// 起一个 serve 进程（supervisor 在 apxinf_rust 容器内 spawn——引擎二进制
+// 绑定 9.0.1 GE）。ctx/stream 不入机械，机械只持 owned 状态：Seg
+// （OM + binds）/输出 buffer/嵌入表/styles 缓存。
+// ---------------------------------------------------------------------------
+
+struct VisionMech {
+    s: Seg,
+    routs: Vec<DeviceBuffer>, // 108 路 LN aux 槽一次分配复用（只下载主输出）
+}
+
+impl VisionMech {
+    /// 一帧 vision：覆写 binds[0]（patches）重跑，只下载主输出 idx0
+    /// （replay 同式）
+    fn one_frame(&mut self, ctx: &AscendContext, stream: &AscendStream, patches: &[f16]) -> Vec<f16> {
+        assert_eq!(patches.len() * 2, self.s.binds[0].len(), "serve patches 尺寸不符");
+        let bytes: Vec<u8> = patches.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect();
+        ctx.copy_h2d(&self.s.binds[0], &bytes).expect("serve h2d patches");
+        let ins = self.s.ins();
+        let refs: Vec<&DeviceBuffer> = self.routs.iter().collect();
+        self.s.g.run(&ins, &refs, stream).expect("ge run");
+        drop(stream.synchronize());
+        download_f16(ctx, &self.routs[0], self.s.g.output_size(0).unwrap() / 2)
+    }
+}
+
+struct PrefixMech {
+    s: Seg,
+    routs: Vec<DeviceBuffer>,
+    emb: Vec<f32>,     // [vocab, PW] host 查表（~2.1GB 常驻复用）
+    lang_scale: f32,   // √PW（gemma embed scale）
+    vis_rows: usize,   // (VT-drop_v)*PW——空视图剔除后的可见行
+    nkv: usize,        // depth*2
+    vocab_w: usize,
+}
+
+impl PrefixMech {
+    /// 一帧 prefix：重组 x0（本帧 vision_out 可见行 + 真 token 查表
+    /// ×lang_scale）覆写 binds[0] 重跑，36 路 kv 下载（aux 槽不下载）
+    fn one_frame(
+        &mut self,
+        ctx: &AscendContext,
+        stream: &AscendStream,
+        vision_out: &[f16],
+        token_ids: &[u32],
+    ) -> Vec<Vec<f16>> {
+        assert_eq!(vision_out.len(), (VT * PW) as usize, "serve vision_out 尺寸不符");
+        let mut x0 = vision_out[..self.vis_rows].to_vec();
+        x0.reserve(token_ids.len() * self.vocab_w);
+        for &id in token_ids {
+            let r = id as usize * self.vocab_w;
+            assert!(r + self.vocab_w <= self.emb.len(), "token id {id} 超 vocab");
+            x0.extend(
+                self.emb[r..r + self.vocab_w]
+                    .iter()
+                    .map(|&v| f16::from_f32(v * self.lang_scale)),
+            );
+        }
+        assert_eq!(x0.len() * 2, self.s.binds[0].len(), "serve x0 尺寸不符");
+        let bytes: Vec<u8> = x0.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect();
+        ctx.copy_h2d(&self.s.binds[0], &bytes).expect("serve h2d x0");
+        let ins = self.s.ins();
+        let refs: Vec<&DeviceBuffer> = self.routs.iter().collect();
+        self.s.g.run(&ins, &refs, stream).expect("ge run");
+        drop(stream.synchronize());
+        (0..self.nkv)
+            .map(|i| download_f16(ctx, &self.routs[i], self.s.g.output_size(i).unwrap() / 2))
+            .collect()
+    }
+}
+
+struct FlowMech {
+    s: Seg,
+    ob: DeviceBuffer,
+    style_cache: Vec<Vec<Vec<f16>>>, // 10 步 × (4*depth+2) 段（跨请求不变）
+    layer_bases: Vec<usize>,
+    fs_idx: usize,
+    pk_base: usize,
+    depth: usize,
+}
+
+impl FlowMech {
+    /// 一帧 flow：36 路 pk/pv 换绑 + noise 重启 10 步（styles 缓存直取；
+    /// euler c1/c2 已在 bring-up 换绑 LeRobot 语义且 buffer 内容恒持）
+    fn one_frame(
+        &mut self,
+        ctx: &AscendContext,
+        stream: &AscendStream,
+        kv: &[Vec<f16>],
+        noise: &[f16],
+    ) -> Vec<f16> {
+        let h2d = |buf: &DeviceBuffer, vals: &[f16]| {
+            let bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect();
+            ctx.copy_h2d(buf, &bytes).expect("serve h2d");
+        };
+        assert_eq!(kv.len(), self.depth * 2, "serve kv 路数不符");
+        for i in 0..self.depth {
+            h2d(&self.s.binds[self.pk_base + 2 * i], &kv[2 * i]);
+            h2d(&self.s.binds[self.pk_base + 2 * i + 1], &kv[2 * i + 1]);
+        }
+        let mut x = noise.to_vec();
+        for sc in &self.style_cache {
+            for i in 0..self.depth {
+                let b = self.layer_bases[i];
+                h2d(&self.s.binds[b], &sc[4 * i]);
+                h2d(&self.s.binds[b + 1], &sc[4 * i + 1]);
+                h2d(&self.s.binds[b + 10], &sc[4 * i + 2]);
+                h2d(&self.s.binds[b + 11], &sc[4 * i + 3]);
+            }
+            h2d(&self.s.binds[self.fs_idx], &sc[4 * self.depth]);
+            h2d(&self.s.binds[self.fs_idx + 1], &sc[4 * self.depth + 1]);
+            h2d(&self.s.binds[0], &x); // state = 当前 x
+            let ins = self.s.ins();
+            let oref: Vec<&DeviceBuffer> = vec![&self.ob];
+            self.s.g.run(&ins, &oref, stream).expect("ge run");
+            drop(stream.synchronize());
+            x = download_f16(ctx, &self.ob, (HOR * ADIM) as usize);
+        }
+        x
+    }
 }
 
 impl E2eStage {
@@ -1257,6 +1386,9 @@ fn seg_e2e(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>) {
                 kv: Vec::new(),
                 actions: Vec::new(),
                 replay: Vec::new(),
+                vmech: None,
+                pmech: None,
+                fmech: None,
             }
         }
         Err(_) => {
@@ -1273,6 +1405,9 @@ fn seg_e2e(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>) {
                 kv: Vec::new(),
                 actions: Vec::new(),
                 replay: Vec::new(),
+                vmech: None,
+                pmech: None,
+                fmech: None,
             }
         }
     };
@@ -1326,8 +1461,153 @@ fn seg_e2e(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>) {
     println!("[e2e] flow 段 {:?}（含 OM 加载 + 10 步）", t3.duration_since(t2));
     let head: Vec<f32> = st.actions[..8.min(st.actions.len())].iter().map(|v| v.to_f32()).collect();
     println!("[e2e] actions head={head:?}");
+    // GEB_E2E_SERVE=<dir>：闭环 eval 常驻服务（三段机械已由各段 e2e 分支
+    // 下沉 E2eStage；多桶 = Python 侧每桶一个 serve 进程）
+    if let Ok(dir) = std::env::var("GEB_E2E_SERVE") {
+        serve_loop(be, &mut st, &dir, tokens);
+        ge_builder::fini().expect("fini");
+        println!("GE_E2E_SERVE_OK");
+        return;
+    }
     ge_builder::fini().expect("fini");
     println!("GE_E2E_PROBE_OK");
+}
+
+// ---------------------------------------------------------------------------
+// GEB_E2E_SERVE 常驻服务循环（闭环 eval 用）
+// ---------------------------------------------------------------------------
+
+/// GEB_E2E_SERVE=<dir>：文件轮询常驻服务。单进程单桶（GEB_TOKENS=L、
+/// GEB_OM_DIR=tl{L}），Python 侧按帧挑桶、每桶一个 serve 进程（supervisor
+/// 在 apxinf_rust 容器内 spawn——引擎二进制绑定 9.0.1 GE，eval 的 torch
+/// 侧在 apxinf_npu，跨容器靠 /data 共享目录）。
+/// 协议（spool 目录，tmp+rename 原子交付，单客户端串行）：
+///   ready              —— 三段机械就绪标志（内容 "L=<tokens>"）
+///   req_{seq:06}.bin   —— u32 magic 0x47514531 / u32 L / patches f32
+///                          ×VT*V_PATCH_W / token_ids u32 ×L / noise f32
+///                          ×HOR*ADIM
+///   resp_{seq:06}.bin  —— u32 magic 0x47525331 / u32 status /
+///                          f32 vision_ms/prefix_ms/flow_ms /
+///                          actions f32 ×HOR*7（x_t 终态前 7 列）
+///   shutdown           —— 退出信号
+fn serve_loop(be: &AscendBackend, st: &mut E2eStage, dir: &str, tokens: usize) {
+    let ctx = be.ctx();
+    let stream = be.stream();
+    let mut vm = st.vmech.take().expect("serve 需要 vision 机械");
+    let mut pm = st.pmech.take().expect("serve 需要 prefix 机械");
+    let mut fm = st.fmech.take().expect("serve 需要 flow 机械");
+    std::fs::create_dir_all(dir).expect("serve spool create");
+    // 清残留（上次运行的 req/resp/ready 会混淆 seq 与就绪判定）。
+    // ⚠ 只删协议文件：pid 是 supervisor 的活体判定依据、stdout.log 是
+    // 本进程重定向目标——全删会让 supervisor 判死重复 spawn（双 engine
+    // 抢同一 spool 目录，2026-09-22 实踩）
+    for e in std::fs::read_dir(dir).expect("serve spool read") {
+        let p = e.expect("dir entry").path();
+        let Some(name) = p.file_name().and_then(|n| n.to_str()) else { continue };
+        let is_proto = name.starts_with("req_")
+            || name.starts_with("resp_")
+            || name.starts_with(".req_")
+            || name.starts_with(".resp_")
+            || name == "ready"
+            || name == "shutdown";
+        if is_proto {
+            let _ = std::fs::remove_file(&p);
+        }
+    }
+    std::fs::write(format!("{dir}/ready"), format!("L={tokens}\n")).expect("serve ready write");
+    println!("[serve] ready: {dir} L={tokens}（文件轮询中，shutdown 退出）");
+    let mut served: u64 = 0;
+    let exp_patches = (VT * V_PATCH_W) as usize;
+    let exp_noise = (HOR * ADIM) as usize;
+    loop {
+        if std::path::Path::new(&format!("{dir}/shutdown")).exists() {
+            println!("[serve] shutdown 信号，退出（已服务 {served} 请求）");
+            return;
+        }
+        // 最小现存 seq（不做 last_seq 门限：eval 进程重启后 python 端 seq
+        // 回卷到 1，门限会把新请求当旧丢弃——单客户端串行下按"目录里
+        // 最小现存 req 处理"即正确序；上个进程的死请求至多被白跑一次）
+        let mut best: Option<(i64, std::path::PathBuf)> = None;
+        for e in std::fs::read_dir(dir).expect("serve spool read") {
+            let p = e.expect("dir entry").path();
+            let Some(name) = p.file_name().and_then(|n| n.to_str()) else { continue };
+            let Some(num) = name.strip_prefix("req_").and_then(|r| r.strip_suffix(".bin")) else { continue };
+            let (Ok(seq), true) = (num.parse::<i64>(), num.len() == 6) else { continue };
+            if best.as_ref().map(|(s, _)| seq < *s).unwrap_or(true) {
+                best = Some((seq, p));
+            }
+        }
+        let Some((seq, path)) = best else {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            continue;
+        };
+        let t_all = std::time::Instant::now();
+        let raw = std::fs::read(&path).expect("serve req read");
+        assert_eq!(
+            raw.len(),
+            8 + exp_patches * 4 + tokens * 4 + exp_noise * 4,
+            "serve 请求长度不符（seq {seq}）"
+        );
+        let magic = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
+        assert_eq!(magic, 0x4751_4531, "serve 请求 magic 不符");
+        let l = u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]) as usize;
+        assert_eq!(
+            l, tokens,
+            "serve 请求 L={l} ≠ 本进程桶 GEB_TOKENS={tokens}（Python 侧挑桶错）"
+        );
+        let mut off = 8usize;
+        let f32s = |b: &[u8]| f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
+        let patches: Vec<f16> = raw[off..off + exp_patches * 4]
+            .chunks_exact(4)
+            .map(|c| f16::from_f32(f32s(c)))
+            .collect();
+        off += exp_patches * 4;
+        let ids: Vec<u32> = raw[off..off + tokens * 4]
+            .chunks_exact(4)
+            .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect();
+        off += tokens * 4;
+        let noise: Vec<f16> = raw[off..off + exp_noise * 4]
+            .chunks_exact(4)
+            .map(|c| f16::from_f32(f32s(c)))
+            .collect();
+        let t0 = std::time::Instant::now();
+        let vision_out = vm.one_frame(ctx, stream, &patches);
+        let tv = t0.elapsed().as_secs_f64() * 1e3;
+        let t0 = std::time::Instant::now();
+        let kv = pm.one_frame(ctx, stream, &vision_out, &ids);
+        let tp = t0.elapsed().as_secs_f64() * 1e3;
+        let t0 = std::time::Instant::now();
+        let actions = fm.one_frame(ctx, stream, &kv, &noise);
+        let tf = t0.elapsed().as_secs_f64() * 1e3;
+        // actions [HOR, ADIM] → 前 7 列（LIBERO deployable 维；
+        // normalized_actions = x_t 终态切片，denorm 在 torch postprocess）
+        let gd = 7usize;
+        let mut a7: Vec<f32> = Vec::with_capacity(HOR as usize * gd);
+        for r in 0..HOR as usize {
+            for c in 0..gd {
+                a7.push(actions[r * ADIM as usize + c].to_f32());
+            }
+        }
+        let mut resp: Vec<u8> = Vec::with_capacity(8 + 12 + a7.len() * 4);
+        resp.extend_from_slice(&0x4752_5331u32.to_le_bytes());
+        resp.extend_from_slice(&0u32.to_le_bytes());
+        resp.extend_from_slice(&(tv as f32).to_le_bytes());
+        resp.extend_from_slice(&(tp as f32).to_le_bytes());
+        resp.extend_from_slice(&(tf as f32).to_le_bytes());
+        resp.extend(a7.iter().flat_map(|v| v.to_le_bytes()));
+        let rpath = format!("{dir}/resp_{seq:06}.bin");
+        let tmp = format!("{dir}/.resp_{seq:06}.tmp");
+        std::fs::write(&tmp, &resp).expect("serve resp write");
+        std::fs::rename(&tmp, &rpath).expect("serve resp rename");
+        std::fs::remove_file(&path).expect("serve req unlink");
+        println!(
+            "[serve] #{seq}: vision={tv:.1} prefix={tp:.1} flow={tf:.1} total={:.1}ms |x|max={:.3}",
+            t_all.elapsed().as_secs_f64() * 1e3,
+            actions.iter().fold(0f32, |m, v| m.max(v.to_f32().abs()))
+        );
+        served += 1;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1732,6 +2012,15 @@ fn seg_vision(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e: 
                 f.vision_out = download_f16(ctx, &routs[0], s.g.output_size(0).unwrap() / 2);
             }
             println!("[e2e] replay vision ×{} {:?}", st.replay.len(), t0.elapsed());
+        }
+        // GEB_E2E_SERVE：机械下沉 E2eStage（per-frame 执行由 seg_e2e 的
+        // serve 循环驱动；routs 一次分配跨请求复用，同 replay 语义）
+        if std::env::var("GEB_E2E_SERVE").is_ok() {
+            let n_out = s.g.num_outputs().unwrap();
+            let routs: Vec<DeviceBuffer> = (0..n_out)
+                .map(|i| ctx.malloc(s.g.output_size(i).unwrap().max(16)).expect("serve out malloc"))
+                .collect();
+            st.vmech = Some(VisionMech { s, routs });
         }
         return;
     }
@@ -2191,6 +2480,24 @@ fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e: 
                     .collect();
             }
             println!("[e2e] replay prefix ×{} {:?}", st.replay.len(), t0.elapsed());
+        }
+        // GEB_E2E_SERVE：机械下沉（嵌入表 ~2.1GB 常驻机械内，跨请求查表复用）
+        if std::env::var("GEB_E2E_SERVE").is_ok() {
+            let w = real.expect("serve prefix 需要 GEB_CKPT（token 嵌入查表）");
+            let n_out = s.g.num_outputs().unwrap();
+            let routs: Vec<DeviceBuffer> = (0..n_out)
+                .map(|i| ctx.malloc(s.g.output_size(i).unwrap().max(16)).expect("serve out malloc"))
+                .collect();
+            let emb = w.vision.token_embedding.to_f32_vec().unwrap();
+            st.pmech = Some(PrefixMech {
+                s,
+                routs,
+                lang_scale: (PW as f32).sqrt(),
+                vis_rows: ((VT - drop_v) * PW) as usize,
+                nkv: depth * 2,
+                vocab_w: PW as usize,
+                emb,
+            });
         }
         return;
     }
@@ -2838,6 +3145,19 @@ fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e: Op
                 rels[0],
                 rels[rels.len() - 1]
             );
+        }
+        // GEB_E2E_SERVE：机械下沉（styles 缓存跨请求不变——10 步调度固定；
+        // euler c1/c2 已换绑 LeRobot 语义，buffer 内容恒持）
+        if std::env::var("GEB_E2E_SERVE").is_ok() {
+            st.fmech = Some(FlowMech {
+                s,
+                ob,
+                style_cache,
+                layer_bases,
+                fs_idx,
+                pk_base,
+                depth,
+            });
         }
         return;
     }
