@@ -918,7 +918,10 @@ pub fn action_layer_ascend(
     let proj = aq::matmul(be, &mut cache.nz, &attn, [tokens, qd], tensor_buf(&weights.output.weight)?, [qd, width])?;
     mark!("output proj");
     let proj = bias_add(be, &proj, weights.output.bias.as_ref(), tokens, width)?;
-    let res = aq::add(be, &proj, &normalized, &[tokens, width])?;
+    // 残差基 = input 本体（cuda bf16_executor 语义：fused::
+    // adaptive_gate_residual_rms_bf16(projection, input)）——曾误用
+    // normalized 作残差基，2026-09-23 与 ge_model_probe flow 段同源定罪
+    let res = aq::add(be, &proj, input_b, &[tokens, width])?;
     let normed = adaptive_rms(be, cache, &res, mlp_style, tokens, width, rms_eps)?;
     mark!("mlp ada-norm");
 

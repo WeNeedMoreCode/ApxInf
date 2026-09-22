@@ -485,6 +485,27 @@ impl Seg {
         self.reg_out(&ba, "y")
     }
 
+    /// 行广播门控乘：TileD(gate [1,cols], multiples=[rows,1]) × Mul——torch
+    /// _gated_residual 的 gate 通路（residual + branch·gate）。与 bias 同
+    /// dim0 整行复制方向（#39 干净路径；连续平铺方向 kernel 腐蚀）
+    fn gatew(&mut self, name: &str, x: &str, x_dims: &[i64], row: &str) -> String {
+        let gc = format!("{name}_gc");
+        let gm = format!("{name}_gm");
+        self.g.add_op(&gc, "TileD").unwrap();
+        self.g.set_input_desc(&gc, "x", &[1, x_dims[1]], Dtype::Fp16).unwrap();
+        self.g.set_output_desc(&gc, "y", x_dims, Dtype::Fp16).unwrap();
+        self.g.set_attr_int_list(&gc, "multiples", &[x_dims[0], 1]).unwrap();
+        self.g.link(&gc, "x", row).unwrap();
+        self.reg_out(&gc, "y");
+        self.g.add_op(&gm, "Mul").unwrap();
+        self.g.set_input_desc(&gm, "x1", x_dims, Dtype::Fp16).unwrap();
+        self.g.set_input_desc(&gm, "x2", x_dims, Dtype::Fp16).unwrap();
+        self.g.set_output_desc(&gm, "y", x_dims, Dtype::Fp16).unwrap();
+        self.wire(&gm, "x1", x);
+        self.wire(&gm, "x2", &gc);
+        self.reg_out(&gm, "y")
+    }
+
     fn add2(&mut self, name: &str, a: &str, b: &str, dims: &[i64]) -> String {
         self.g.add_op(name, "Add").unwrap();
         self.g.set_input_desc(name, "x1", dims, Dtype::Fp16).unwrap();
@@ -1399,7 +1420,7 @@ impl PrefixMech {
 struct FlowMech {
     s: Seg,
     ob: DeviceBuffer,
-    style_cache: Vec<Vec<Vec<f16>>>, // 10 步 × (4*depth+2) 段（跨请求不变）
+    style_cache: Vec<Vec<Vec<f16>>>, // 10 步 × (6*depth+2) 段（含 gate；跨请求不变）
     layer_bases: Vec<usize>,
     fs_idx: usize,
     pk_base: usize,
@@ -1429,13 +1450,15 @@ impl FlowMech {
         for sc in &self.style_cache {
             for i in 0..self.depth {
                 let b = self.layer_bases[i];
-                h2d(&self.s.binds[b], &sc[4 * i]);
-                h2d(&self.s.binds[b + 1], &sc[4 * i + 1]);
-                h2d(&self.s.binds[b + 10], &sc[4 * i + 2]);
-                h2d(&self.s.binds[b + 11], &sc[4 * i + 3]);
+                h2d(&self.s.binds[b], &sc[6 * i]);
+                h2d(&self.s.binds[b + 1], &sc[6 * i + 1]);
+                h2d(&self.s.binds[b + 10], &sc[6 * i + 2]);
+                h2d(&self.s.binds[b + 11], &sc[6 * i + 3]);
+                h2d(&self.s.binds[b + 16], &sc[6 * i + 4]);
+                h2d(&self.s.binds[b + 17], &sc[6 * i + 5]);
             }
-            h2d(&self.s.binds[self.fs_idx], &sc[4 * self.depth]);
-            h2d(&self.s.binds[self.fs_idx + 1], &sc[4 * self.depth + 1]);
+            h2d(&self.s.binds[self.fs_idx], &sc[6 * self.depth]);
+            h2d(&self.s.binds[self.fs_idx + 1], &sc[6 * self.depth + 1]);
             h2d(&self.s.binds[0], &x); // state = 当前 x
             let ins = self.s.ins();
             let oref: Vec<&DeviceBuffer> = vec![&self.ob];
@@ -1512,12 +1535,16 @@ fn e2e_conditioning(real: &Pi05Weights, te: &[f32]) -> Vec<f32> {
     c.iter().map(|&v| silu_f32(v)).collect()
 }
 
-/// style 投影 [ADIM,3W] → (scale=1+s0, shift=s1)；第三段 [2w:3w] 引擎未消费
-fn e2e_style_pair(w: &LinearWeights, cond: &[f32], width: usize) -> (Vec<f16>, Vec<f16>) {
+/// style 投影 [ADIM,3W] → (scale=1+s0, shift=s1, gate=s2)。第三段 gate 是
+/// openpi `_gated_residual` 的分支门控（residual + branch·gate，无激活直出
+/// f16 cast）——2026-09-23 定罪：引擎此前整体未消费该段，flow 输出 v 近随
+/// 机、闭环 0/10 的主因
+fn e2e_style_pair(w: &LinearWeights, cond: &[f32], width: usize) -> (Vec<f16>, Vec<f16>, Vec<f16>) {
     let raw = host_lin_f32(w, cond, cond.len());
     let scl = raw[..width].iter().map(|&v| f16::from_f32(1.0 + v)).collect();
     let sh = raw[width..2 * width].iter().map(|&v| f16::from_f32(v)).collect();
-    (scl, sh)
+    let gt = raw[2 * width..3 * width].iter().map(|&v| f16::from_f32(v)).collect();
+    (scl, sh, gt)
 }
 
 /// e2e 收尾共通：GEB_OM_DIR（默认 /data/apxinf/om_cache）加载 {seg}_real.om
@@ -2883,8 +2910,9 @@ fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e: Op
         s.data(ctx, &format!("pk{i}"), &[p, KVD], &pk_h);
         s.data(ctx, &format!("pv{i}"), &[p, KVD], &pv_h);
     }
-    // 层权重 12 项（GEB_QKV3: 16 项）：ascl ash [qkvwt qkvb | qw kw vw qb
-    // kb vb] outwt outb mscl msh gatewt upwt downwt downb（eager qkv 独立投影）
+    // 层权重 12 项（GEB_QKV3: 16 项）+ 尾部 agate/mgate 两项（2026-09-23
+    // gate 通路补全）：ascl ash [qkvwt qkvb | qw kw vw qb kb vb] outwt outb
+    // mscl msh gatewt upwt downwt downb agate mgate（eager qkv 独立投影）
     let mut eager_qkv: Vec<(DeviceBuffer, DeviceBuffer, DeviceBuffer, DeviceBuffer, DeviceBuffer, DeviceBuffer)> = Vec::new();
     let mut layer_bases = Vec::with_capacity(depth);
     for i in 0..depth {
@@ -2984,6 +3012,11 @@ fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e: Op
             .map(|_| vec![f16::from_f32(0.0); AW as usize])
             .unwrap_or_else(|| norm_f16(AW as usize, &mut seed, 0.0));
         s.data(ctx, &format!("{}downb", tag), &[1, AW], &downb_h);
+        // ada-norm 门控第三段（chunk 3 of dense(cond)）：attention/MLP 分支
+        // 输出 ×gate 后进残差（torch _gated_residual）。块尾追加——qkv3
+        // eager 偏移 8..15 不动，gate 固定位 16/17（默认布局 12/13）
+        s.data(ctx, &format!("{}agate", tag), &[1, AW], &norm_f16(AW as usize, &mut seed, 1.0));
+        s.data(ctx, &format!("{}mgate", tag), &[1, AW], &norm_f16(AW as usize, &mut seed, 1.0));
     }
     // e2e 每步覆写 final norm 条件用（fsc/fsh 的 bind 位）
     let fs_idx = s.binds.len();
@@ -3008,9 +3041,16 @@ fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e: Op
     // ---- 图构造 ----
     // action_in + 第一层 attention ada-norm（eager：第一层无预解析
     // normalized，用 adaptive_rms(action_in_out, attention_style[0])）
-    let mut normed = s.mm("ain", "state", &[HOR, ADIM], "ainwt", &[AW, ADIM], &[HOR, AW]);
-    normed = s.bias("ainb2", &normed, &[HOR, AW], "ainb");
-    normed = s.ada("l0ada", &normed, "zeros", "l0_ascl", "l0_ash", &[HOR, AW]);
+    let ain = s.mm("ain", "state", &[HOR, ADIM], "ainwt", &[AW, ADIM], &[HOR, AW]);
+    let ain = s.bias("ainb2", &ain, &[HOR, AW], "ainb");
+    let mut normed = s.ada("l0ada", &ain, "zeros", "l0_ascl", "l0_ash", &[HOR, AW]);
+    // ⚠ 残差流（未归一化 x）双轨携带——cuda bf16_executor 语义：attention
+    // 残差基是 input 本体（fused::adaptive_gate_residual_rms_bf16(
+    // projection, input)），normed 只喂 qkv。2026-09-23 定罪：本段曾以
+    // normed 作残差基（两处镜像同 bug，组件 parity 全绿因为参考 eager 同
+    // 错）——18 层累积 → v 输出近随机、闭环 0/10；step0_x1 仅 11.5% 是
+    // dt=0.1 对 v 误差的掩盖（Δx1=0.1·Δv ⇒ v 已 ~100% 错）
+    let mut xstream = ain;
 
     let total = p + HOR;
     for i in 0..depth {
@@ -3080,7 +3120,9 @@ fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e: Op
         };
         let proj = s.mm(&format!("{}proj", tag), &sq, &[HOR, QD], &format!("{}outwt", tag), &[AW, QD], &[HOR, AW]);
         let projb = s.bias(&format!("{}projb", tag), &proj, &[HOR, AW], &format!("{}outb", tag));
-        let res = s.add2(&format!("{}res", tag), &projb, &normed, &[HOR, AW]);
+        // 分支 ×gate 进残差（torch _gated_residual：residual + branch·gate）
+        let gated = s.gatew(&format!("{}ag", tag), &projb, &[HOR, AW], &format!("{}agate", tag));
+        let res = s.add2(&format!("{}res", tag), &gated, &xstream, &[HOR, AW]);
 
         // mlp
         let mnorm = s.ada(&format!("{}mn", tag), &res, "zeros", &format!("{}mscl", tag), &format!("{}msh", tag), &[HOR, AW]);
@@ -3090,7 +3132,8 @@ fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e: Op
         let act = s.mul2(&format!("{}act", tag), &gact, &up, &[HOR, AINTER]);
         let down = s.mm(&format!("{}down", tag), &act, &[HOR, AINTER], &format!("{}downwt", tag), &[AW, AINTER], &[HOR, AW]);
         let downb = s.bias(&format!("{}downb", tag), &down, &[HOR, AW], &format!("{}downb", tag));
-        let hidden = s.add2(&format!("{}h", tag), &downb, &res, &[HOR, AW]);
+        let gated2 = s.gatew(&format!("{}mg", tag), &downb, &[HOR, AW], &format!("{}mgate", tag));
+        let hidden = s.add2(&format!("{}h", tag), &gated2, &res, &[HOR, AW]);
 
         // 下一层 attention 的 ada-norm（eager attention_normalized 同构）
         let (nscl, nsh) = if i + 1 < depth {
@@ -3099,6 +3142,7 @@ fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e: Op
             ("fsc".to_string(), "fsh".to_string())
         };
         normed = s.ada(&format!("{}nn", tag), &hidden, "zeros", &nscl, &nsh, &[HOR, AW]);
+        xstream = hidden;
     }
 
     // action_out + euler
@@ -3124,12 +3168,14 @@ fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e: Op
         // 16.. 层权重（const_i32 改造前 shape 占 4 槽，旧索引 16/17/18
         // 已失效——[832,256] 读到 qkvwt 的 size 断言 panic 取证）
         let ain = aops::matmul_b_t_fp16(ctx, stream, &b[0], [HOR, ADIM], &b[12], ADIM, AW).unwrap();
-        let mut normed = aops::bias_add_fp16(ctx, stream, &ain, &b[13], HOR, AW).unwrap();
-        normed = ada(&normed, &b[layer_bases2[0]], &b[layer_bases2[0] + 1]);
+        // 残差流双轨（同图构造修复——residual 基 = 未归一化 x）
+        let mut xstream = aops::bias_add_fp16(ctx, stream, &ain, &b[13], HOR, AW).unwrap();
+        let mut normed = ada(&xstream, &b[layer_bases2[0]], &b[layer_bases2[0] + 1]);
         for li in 0..depth {
             // qkv3 层内输入布局：ascl,ash,qw,kw,vw,qb,kb,vb,outwt,outb,
-            // mscl,msh,gatewt,upwt,downwt,downb（16 项）；默认 12 项
-            let w = &b[layer_bases2[li]..layer_bases2[li] + if qkv3 { 16 } else { 12 }];
+            // mscl,msh,gatewt,upwt,downwt,downb,agate,mgate（18 项）；默认 14 项
+            let w = &b[layer_bases2[li]..layer_bases2[li] + if qkv3 { 18 } else { 14 }];
+            let (g_a, g_m) = if qkv3 { (16, 17) } else { (12, 13) };
             let (ow, ob, msc, msh, gw, uw, dw, db) = if qkv3 { (8, 9, 10, 11, 12, 13, 14, 15) } else { (4, 5, 6, 7, 8, 9, 10, 11) };
             let (pk, pv) = (&b[14 + 2 * li], &b[15 + 2 * li]);
             let (wq, wk, wv, bq, bk, bv) = &eager_qkv[li];
@@ -3147,7 +3193,8 @@ fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e: Op
                 ctx, stream, &qr, &kall, &vall, HOR, total, HEADS, KV_HEADS, HD, None).unwrap();
             let proj = aops::matmul_b_t_fp16(ctx, stream, &attn, [HOR, QD], &w[ow], QD, AW).unwrap();
             let proj = aops::bias_add_fp16(ctx, stream, &proj, &w[ob], HOR, AW).unwrap();
-            let res = aops::add_fp16(ctx, stream, &proj, &normed, &[HOR, AW]).unwrap();
+            let proj = aops::gate_mul_fp16(ctx, stream, &proj, &w[g_a], HOR, AW).unwrap();
+            let res = aops::add_fp16(ctx, stream, &proj, &xstream, &[HOR, AW]).unwrap();
             let mnorm = ada(&res, &w[msc], &w[msh]);
             let gate = aops::matmul_b_t_fp16(ctx, stream, &mnorm, [HOR, AW], &w[gw], AW, AINTER).unwrap();
             let up = aops::matmul_b_t_fp16(ctx, stream, &mnorm, [HOR, AW], &w[uw], AW, AINTER).unwrap();
@@ -3155,6 +3202,7 @@ fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e: Op
             let act = aops::mul_fp16(ctx, stream, &g, &up, &[HOR, AINTER]).unwrap();
             let down = aops::matmul_b_t_fp16(ctx, stream, &act, [HOR, AINTER], &w[dw], AINTER, AW).unwrap();
             let down = aops::bias_add_fp16(ctx, stream, &down, &w[db], HOR, AW).unwrap();
+            let down = aops::gate_mul_fp16(ctx, stream, &down, &w[g_m], HOR, AW).unwrap();
             let hidden = aops::add_fp16(ctx, stream, &down, &res, &[HOR, AW]).unwrap();
             let n = b.len();
             let (ns, nh) = if li + 1 < depth {
@@ -3163,6 +3211,7 @@ fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e: Op
                 (&b[n - 6], &b[n - 5])
             };
             normed = ada(&hidden, ns, nh);
+            xstream = hidden;
         }
         let n = b.len();
         let vel = aops::matmul_b_t_fp16(ctx, stream, &normed, [HOR, AW], &b[n - 4], AW, ADIM).unwrap();
@@ -3235,17 +3284,19 @@ fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e: Op
                 } else {
                     cond
                 };
-                let mut v: Vec<Vec<f16>> = Vec::with_capacity(depth * 4 + 2);
+                let mut v: Vec<Vec<f16>> = Vec::with_capacity(depth * 6 + 2);
                 for i in 0..depth {
                     let lay = &rw.action_layers[i];
-                    let (a_scl, a_sh) = e2e_style_pair(&lay.input_norm.style, &cond, AW as usize);
-                    let (m_scl, m_sh) = e2e_style_pair(&lay.post_attention_norm.style, &cond, AW as usize);
+                    let (a_scl, a_sh, a_gt) = e2e_style_pair(&lay.input_norm.style, &cond, AW as usize);
+                    let (m_scl, m_sh, m_gt) = e2e_style_pair(&lay.post_attention_norm.style, &cond, AW as usize);
                     v.push(a_scl);
                     v.push(a_sh);
                     v.push(m_scl);
                     v.push(m_sh);
+                    v.push(a_gt);
+                    v.push(m_gt);
                 }
-                let (f_scl, f_sh) = e2e_style_pair(&rw.action_final_norm.style, &cond, AW as usize);
+                let (f_scl, f_sh, _) = e2e_style_pair(&rw.action_final_norm.style, &cond, AW as usize);
                 v.push(f_scl);
                 v.push(f_sh);
                 v
@@ -3261,13 +3312,15 @@ fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e: Op
             let sc = &style_cache[step];
             for i in 0..depth {
                 let b = layer_bases[i];
-                h2d_f16(&s.binds[b], &sc[4 * i]);
-                h2d_f16(&s.binds[b + 1], &sc[4 * i + 1]);
-                h2d_f16(&s.binds[b + 10], &sc[4 * i + 2]);
-                h2d_f16(&s.binds[b + 11], &sc[4 * i + 3]);
+                h2d_f16(&s.binds[b], &sc[6 * i]);
+                h2d_f16(&s.binds[b + 1], &sc[6 * i + 1]);
+                h2d_f16(&s.binds[b + 10], &sc[6 * i + 2]);
+                h2d_f16(&s.binds[b + 11], &sc[6 * i + 3]);
+                h2d_f16(&s.binds[b + 16], &sc[6 * i + 4]);
+                h2d_f16(&s.binds[b + 17], &sc[6 * i + 5]);
             }
-            h2d_f16(&s.binds[fs_idx], &sc[4 * depth]);
-            h2d_f16(&s.binds[fs_idx + 1], &sc[4 * depth + 1]);
+            h2d_f16(&s.binds[fs_idx], &sc[6 * depth]);
+            h2d_f16(&s.binds[fs_idx + 1], &sc[6 * depth + 1]);
             h2d_f16(&s.binds[0], &x); // state = 当前 x
             let ins = s.ins();
             let oref: Vec<&DeviceBuffer> = vec![&ob];
@@ -3292,13 +3345,15 @@ fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e: Op
                 for sc in &style_cache {
                     for i in 0..depth {
                         let b = layer_bases[i];
-                        h2d_f16(&s.binds[b], &sc[4 * i]);
-                        h2d_f16(&s.binds[b + 1], &sc[4 * i + 1]);
-                        h2d_f16(&s.binds[b + 10], &sc[4 * i + 2]);
-                        h2d_f16(&s.binds[b + 11], &sc[4 * i + 3]);
+                        h2d_f16(&s.binds[b], &sc[6 * i]);
+                        h2d_f16(&s.binds[b + 1], &sc[6 * i + 1]);
+                        h2d_f16(&s.binds[b + 10], &sc[6 * i + 2]);
+                        h2d_f16(&s.binds[b + 11], &sc[6 * i + 3]);
+                        h2d_f16(&s.binds[b + 16], &sc[6 * i + 4]);
+                        h2d_f16(&s.binds[b + 17], &sc[6 * i + 5]);
                     }
-                    h2d_f16(&s.binds[fs_idx], &sc[4 * depth]);
-                    h2d_f16(&s.binds[fs_idx + 1], &sc[4 * depth + 1]);
+                    h2d_f16(&s.binds[fs_idx], &sc[6 * depth]);
+                    h2d_f16(&s.binds[fs_idx + 1], &sc[6 * depth + 1]);
                     h2d_f16(&s.binds[0], &xx);
                     let ins = s.ins();
                     let oref: Vec<&DeviceBuffer> = vec![&ob];
@@ -3356,13 +3411,15 @@ fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e: Op
                 for sc in &style_cache {
                     for i in 0..depth {
                         let b = layer_bases[i];
-                        h2d_f16(&s.binds[b], &sc[4 * i]);
-                        h2d_f16(&s.binds[b + 1], &sc[4 * i + 1]);
-                        h2d_f16(&s.binds[b + 10], &sc[4 * i + 2]);
-                        h2d_f16(&s.binds[b + 11], &sc[4 * i + 3]);
+                        h2d_f16(&s.binds[b], &sc[6 * i]);
+                        h2d_f16(&s.binds[b + 1], &sc[6 * i + 1]);
+                        h2d_f16(&s.binds[b + 10], &sc[6 * i + 2]);
+                        h2d_f16(&s.binds[b + 11], &sc[6 * i + 3]);
+                        h2d_f16(&s.binds[b + 16], &sc[6 * i + 4]);
+                        h2d_f16(&s.binds[b + 17], &sc[6 * i + 5]);
                     }
-                    h2d_f16(&s.binds[fs_idx], &sc[4 * depth]);
-                    h2d_f16(&s.binds[fs_idx + 1], &sc[4 * depth + 1]);
+                    h2d_f16(&s.binds[fs_idx], &sc[6 * depth]);
+                    h2d_f16(&s.binds[fs_idx + 1], &sc[6 * depth + 1]);
                     h2d_f16(&s.binds[0], &xx);
                     let ins = s.ins();
                     let oref: Vec<&DeviceBuffer> = vec![&ob];
@@ -3398,6 +3455,26 @@ fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e: Op
                 rels[0],
                 rels[rels.len() - 1]
             );
+            // GEB_REPLAY_DUMP=<path>：逐帧 engine actions 落盘（LE 原始二进制：
+            // u32 帧数；每帧 u32 gd + 50*ADIM f32 actions + 50*gd f32 nact）——
+            // 行为刑侦用（bias/scale/corr：系统性与噪声性偏差的判别）
+            if let Ok(p) = std::env::var("GEB_REPLAY_DUMP") {
+                use std::io::Write as _;
+                let mut out = std::fs::File::create(&p).expect("replay dump create");
+                let n = st.replay.len() as u32;
+                out.write_all(&n.to_le_bytes()).unwrap();
+                for fr in st.replay.iter() {
+                    let gd = (fr.nact.len() / 50) as u32;
+                    out.write_all(&gd.to_le_bytes()).unwrap();
+                    for v in fr.actions.iter() {
+                        out.write_all(&v.to_f32().to_le_bytes()).unwrap();
+                    }
+                    for v in fr.nact.iter() {
+                        out.write_all(&v.to_f32().to_le_bytes()).unwrap();
+                    }
+                }
+                println!("[e2e] replay actions dumped: {p}");
+            }
         }
         // GEB_E2E_SERVE：机械下沉（styles 缓存跨请求不变——10 步调度固定；
         // euler c1/c2 已换绑 LeRobot 语义，buffer 内容恒持）

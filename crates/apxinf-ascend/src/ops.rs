@@ -298,6 +298,32 @@ pub fn bias_add_fp16(
     Ok(out)
 }
 
+/// Row-broadcast gate multiply: y[r,:] = x[r,:] * gate[:] (gate [1, cols]).
+/// The ada-norm gate path of openpi's `_gated_residual` (residual + branch*gate)
+/// -- 2026-09-23: the engine previously dropped the third chunk of dense(cond)
+/// entirely; this op restores it for the eager mirror.
+pub fn gate_mul_fp16(
+    ctx: &AscendContext,
+    stream: &AscendStream,
+    x: &crate::DeviceBuffer,
+    gate: &crate::DeviceBuffer,
+    rows: i64,
+    cols: i64,
+) -> Result<crate::DeviceBuffer> {
+    let out = ctx.malloc((rows * cols * 2) as usize)?;
+    let tx = AclTensor::fp16_nd(x, &[rows, cols])?;
+    let tg = AclTensor::fp16_row_broadcast(gate, rows, cols)?;
+    let tout = AclTensor::fp16_nd(&out, &[rows, cols])?;
+    two_stage(
+        ctx,
+        stream,
+        "aclnnMul(gate)",
+        |ws, ex| unsafe { ffi::aclnnMulGetWorkspaceSize(tx.handle(), tg.handle(), tout.handle(), ws, ex) },
+        |ws, size, ex| unsafe { ffi::aclnnMul(ws, size, ex, stream.handle()) },
+    )?;
+    Ok(out)
+}
+
 /// Flow-matching Euler step: x = x0 + sigma * (x1 - x0), elementwise fp16.
 /// Two composed aclnn calls (sub via mul(-1)+add avoided; muls+add used):
 /// dx = (x1 - x0) needs a sub op -- express as add(x1, muls(x0, -1)).
