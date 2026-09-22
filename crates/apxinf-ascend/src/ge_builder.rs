@@ -549,6 +549,31 @@ impl GeGraph {
         Ok(())
     }
 
+    /// DataType 类型 attr（Cast.dst_type 等）——C++ 侧 ParseDtype 转换
+    pub fn set_attr_dtype(&self, op: &str, attr: &str, v: &str) -> Result<()> {
+        type F = unsafe extern "C" fn(
+            *const std::os::raw::c_char,
+            *const std::os::raw::c_char,
+            *const std::os::raw::c_char,
+        ) -> i32;
+        let l = lib().map_err(|e| {
+            eprintln!("[ge_builder] {e}");
+            AclError { code: -1, op: "ge load" }
+        })?;
+        let f: Symbol<F> = unsafe { l.get(b"geb_set_attr_dtype") }.map_err(|e| {
+            eprintln!("[ge_builder] dlsym geb_set_attr_dtype: {e}");
+            AclError { code: -1, op: "ge dlsym" }
+        })?;
+        let n = CString::new(op).expect("op");
+        let a = CString::new(attr).expect("attr");
+        let s = CString::new(v).expect("value");
+        let rc = unsafe { f(n.as_ptr(), a.as_ptr(), s.as_ptr()) };
+        if rc != 0 {
+            return Err(cerr("geb_set_attr_dtype", rc));
+        }
+        Ok(())
+    }
+
     pub fn set_attr_int_list(&self, op: &str, attr: &str, v: &[i64]) -> Result<()> {
         type F = unsafe extern "C" fn(
             *const std::os::raw::c_char,
