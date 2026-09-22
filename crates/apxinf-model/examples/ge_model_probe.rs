@@ -296,8 +296,8 @@ struct Seg {
     /// 图输入在 binds 里的下标（GEB_WCONST 时权重是 Const 不占图输入，
     /// binds 仍全量持上传副本供 eager/层基址——索引两模式恒同）
     data_inputs: Vec<usize>,
-    /// GEB_NORM32 共享 fp32 标量池（prep_n32 注册；one/eps/w2048/w1024）
-    n32: Option<N32Scalars>,
+    /// GEB_NORM32 常量池（按宽度懒建：sc/kc/ones 的 Const 名——rms32 v2）
+    n32_c: std::collections::HashMap<i64, (String, String, String)>,
     /// GEB_WCONST：mm 权重 Const 入图（编译期折叠 ND→NZ 转换，零运行
     /// 时税；wgt 单算实证 0.3945→0.2945 ms/mm、OM 烤入权重 8.4MB）。
     /// 代价：OM 变 per-权重集（checkpoint 版本进缓存 key）
@@ -317,7 +317,7 @@ impl Seg {
             shapes: Vec::new(),
             binds: Vec::new(),
             data_inputs: Vec::new(),
-            n32: None,
+            n32_c: std::collections::HashMap::new(),
             wconst: std::env::var("GEB_WCONST").is_ok(),
             datas: std::collections::HashSet::new(),
             outports: std::collections::HashMap::new(),
@@ -520,8 +520,8 @@ impl Seg {
     fn addrms(&mut self, name: &str, x: &str, zeros: &str, gamma: &str, dims: &[i64]) -> String {
         // GEB_NORM32：组合手搓 fp32 方差（zeros 输入不需要——rms(x+0)=rms(x)）
         if norm32_enabled() {
-            let yf = self.rms32(&format!("{name}_r"), x, gamma, dims);
-            return self.cast_node(name, &yf, dims, false);
+            // rms32 v2 直出 f16（无 Cast 尾巴）
+            return self.rms32(&format!("{name}_r"), x, gamma, dims);
         }
         self.g.add_op(name, "AddRmsNorm").unwrap();
         self.g.set_input_desc(name, "x1", dims, Dtype::Fp16).unwrap();
@@ -554,20 +554,24 @@ impl Seg {
     /// ada-norm：y = rms(x)·scale + shift = AddRmsNorm(x, zeros, gamma=scale)
     /// + TileD(shift_row) + Add（BroadcastToD 310P 编译崩，换 TileD）
     fn ada(&mut self, name: &str, x: &str, zeros: &str, scale: &str, shift: &str, dims: &[i64]) -> String {
-        // GEB_NORM32：torch ada 版语义 = normed_f32·(1+scl)_f32 + shift_f32
-        // 落 f16（scale 已折 1+s0 进 host）——shift f16 输入图内 Cast
+        // GEB_NORM32：torch ada 版语义 = rms32(x,scale) + shift（v2 全
+        // f16 域——scale 已折 1+s0 进 host，shift 广播同非 NORM32 形态）
         if norm32_enabled() {
-            let yf = self.rms32(&format!("{name}_r"), x, scale, dims);
-            let sf = self.cast_node(&format!("{name}_sc"), shift, &[1, dims[1]], true);
+            let n = self.rms32(&format!("{name}_r"), x, scale, dims);
             let sbc = format!("{name}_sbc");
             self.g.add_op(&sbc, "TileD").unwrap();
-            self.g.set_input_desc(&sbc, "x", &[1, dims[1]], Dtype::Fp32).unwrap();
-            self.g.set_output_desc(&sbc, "y", dims, Dtype::Fp32).unwrap();
+            self.g.set_input_desc(&sbc, "x", &[1, dims[1]], Dtype::Fp16).unwrap();
+            self.g.set_output_desc(&sbc, "y", dims, Dtype::Fp16).unwrap();
             self.g.set_attr_int_list(&sbc, "multiples", &[dims[0], 1]).unwrap();
-            self.wire(&sbc, "x", &sf); // sf 是算子输出——link 只配 Data 名（陷阱 #8）
+            self.g.link(&sbc, "x", shift).unwrap();
             let st = self.reg_out(&sbc, "y");
-            let sum = self.add2_f32(&format!("{name}_ad"), &yf, &st, dims);
-            return self.cast_node(name, &sum, dims, false);
+            self.g.add_op(name, "Add").unwrap();
+            self.g.set_input_desc(name, "x1", dims, Dtype::Fp16).unwrap();
+            self.g.set_input_desc(name, "x2", dims, Dtype::Fp16).unwrap();
+            self.g.set_output_desc(name, "y", dims, Dtype::Fp16).unwrap();
+            self.wire(name, "x1", &n);
+            self.wire(name, "x2", &st);
+            return self.reg_out(name, "y");
         }
         let n = format!("{name}_n");
         let sbc = format!("{name}_sbc");
@@ -581,17 +585,24 @@ impl Seg {
         self.add2(name, &n, &sbc, dims)
     }
 
-    /// GEB_NORM32 的 fp32 标量池（one/eps/宽度倒数和——Data 输入共享，
-    /// 全段 norm 复用；prep_n32 段级一次性注册）
-    fn prep_n32(&mut self, ctx: &AscendContext) {
-        if self.n32.is_some() || !norm32_enabled() {
-            return;
+    /// NORM32 常量池（按宽度懒建 Const：sc=s 预缩放 / kc=s·√w /
+    /// ones [1,w]——Const 编译期折叠不占模型输入；多 norm 复用同名节点）
+    fn n32_consts(&mut self, w: i64) -> (String, String, String) {
+        if let Some(c) = self.n32_c.get(&w) {
+            return c.clone();
         }
-        let one = self.data_f32(ctx, "n32_one", &[1], &[1.0f32]);
-        let eps = self.data_f32(ctx, "n32_eps", &[1], &[RMS_EPS as f32]);
-        let w2048 = self.data_f32(ctx, "n32_w2048", &[1], &[2048.0f32]);
-        let w1024 = self.data_f32(ctx, "n32_w1024", &[1], &[1024.0f32]);
-        self.n32 = Some(N32Scalars { one, eps, w2048, w1024 });
+        let s = 1.0f32 / 32.0;
+        let k = s * (w as f32).sqrt();
+        let sc = format!("n32_sc_w{w}");
+        self.const_f16(&sc, &[1], &[f16::from_f32(s)]);
+        let kc = format!("n32_kc_w{w}");
+        self.const_f16(&kc, &[1], &[f16::from_f32(k)]);
+        let ones = format!("n32_ones_w{w}");
+        let ov: Vec<f16> = vec![f16::from_f32(1.0); w as usize];
+        self.const_f16(&ones, &[1, w], &ov);
+        let c = (sc, kc, ones);
+        self.n32_c.insert(w, c.clone());
+        c
     }
 
     /// Cast 节点（to_f32=true: f16→f32；false: f32→f16）。dst_type 是
@@ -607,77 +618,94 @@ impl Seg {
         self.reg_out(name, "y")
     }
 
-    /// NORM32 核心：y_f32 = x·rsqrt(mean(x²)+eps)·gamma（x/gamma 为 f16
-    /// 输入，图内 Cast；方差/scale 全 fp32 域——torch GemmaRMSNorm._norm
-    /// 同构）。返回 f32 节点 [rows,w]，调用方 Cast 回 f16 或续做 ada 的
-    /// shift 加法
+    /// NORM32 核心 v2（f16 域 + MatMul 立方体 fp32 累加，2026-09-22
+    /// n32v tap 矩阵定案）：310P tbe 的 ReduceSumD/ReduceSum f32 desc
+    /// 均为假支持——FE 混精度回退跑 f16 累加，行和 >65504 饱和（t4/t7
+    /// 实测 92% 偏差）；Cast f32 是真语义（t9 逐位）。方差精度改走 mm
+    /// 的 cube fp32 累加（t8 实测 0.05% = f16 量化级）：
+    ///   xs=x·s（防 outlier 平方溢出）→ sq=xs² → ssum=mm(sq,onesᵀ)
+    ///   → inv=rsqrt(ssum)·k（k=s·√w）→ 1-D Tile 广播 → x·invb·γ
+    /// 全程 f16 kernel；torch GemmaRMSNorm 对齐的关键是方差不饱和/
+    /// 不漂移（fp32 累加），f16 mul 舍入 ~0.05%/op 为残余差
     fn rms32(&mut self, name: &str, x: &str, gamma: &str, dims: &[i64]) -> String {
         let (rows, w) = (dims[0], dims[1]);
-        let sc = self.n32.as_ref().expect("NORM32 须先 prep_n32").clone();
-        let wname = if w == 2048 { sc.w2048 } else { sc.w1024 };
-        let xf = self.cast_node(&format!("{name}_xf"), x, dims, true);
-        let gf = self.cast_node(&format!("{name}_gf"), gamma, &[w], true);
-        // sq = xf·xf
-        let sq = format!("{name}_sq");
-        self.g.add_op(&sq, "Mul").unwrap();
-        self.g.set_input_desc(&sq, "x1", dims, Dtype::Fp32).unwrap();
-        self.g.set_input_desc(&sq, "x2", dims, Dtype::Fp32).unwrap();
-        self.g.set_output_desc(&sq, "y", dims, Dtype::Fp32).unwrap();
-        self.wire(&sq, "x1", &xf);
-        self.wire(&sq, "x2", &xf);
-        let sq = self.reg_out(&sq, "y");
-        // ssum = ReduceSumD(sq, axis=-1) → [rows,1]（attr 名是 "axes"——
-        // "axis" 编译 rc=-7，n32c 变体矩阵定罪 2026-09-22）
+        let (sc, kc, ones) = self.n32_consts(w);
+        // xs = x·s
+        let xs = format!("{name}_xs");
+        self.g.add_op(&xs, "Mul").unwrap();
+        self.g.set_input_desc(&xs, "x1", dims, Dtype::Fp16).unwrap();
+        self.g.set_input_desc(&xs, "x2", &[1], Dtype::Fp16).unwrap();
+        self.g.set_output_desc(&xs, "y", dims, Dtype::Fp16).unwrap();
+        self.wire(&xs, "x1", x);
+        self.g.link(&xs, "x2", &sc).unwrap();
+        let xs = self.reg_out(&xs, "y");
+        // sq = xs²
+        let sq = self.mul2_f16(&format!("{name}_sq"), &xs, &xs, dims);
+        // ssum = mm(sq, onesᵀ) [rows,1] —— cube 内 fp32 累加
+        let ssum = self.mm(&format!("{name}_mm"), &sq, dims, &ones, &[1, w], &[rows, 1]);
+        // inv = rsqrt(ssum) · k（k = s·√w，把预缩放折回）
         let rs = format!("{name}_rs");
-        self.g.add_op(&rs, "ReduceSumD").unwrap();
-        self.g.set_input_desc(&rs, "x", dims, Dtype::Fp32).unwrap();
-        self.g.set_output_desc(&rs, "y", &[rows, 1], Dtype::Fp32).unwrap();
-        self.g.set_attr_int_list(&rs, "axes", &[-1]).unwrap();
-        self.wire(&rs, "x", &sq);
-        let ssum = self.reg_out(&rs, "y");
-        // mean = ssum / w（eps 省略：真实方差 O(1)，1e-6 相对贡献可忽略；
-        // 也避开 Add-f32 标量广播这个未验证组合）
-        let vare = self.rdiv1(&format!("{name}_mn"), &ssum, &wname, rows);
-        // rt = sqrt(var)；inv = one / rt（都 [rows,1] 广播域）
-        let rt = format!("{name}_rt");
-        self.g.add_op(&rt, "Sqrt").unwrap();
-        self.g.set_input_desc(&rt, "x", &[rows, 1], Dtype::Fp32).unwrap();
-        self.g.set_output_desc(&rt, "y", &[rows, 1], Dtype::Fp32).unwrap();
-        self.wire(&rt, "x", &vare);
-        let rt = self.reg_out(&rt, "y");
-        // inv 广播：rt [rows,1] → Reshape 1-D [rows] → TileD multiples=[w]
-        // → [rows*w] → Reshape [rows,w]。⚠ 三条死路已定罪（2026-09-22）：
-        // TileD 直接吃 [rows,1]（推断扁成 [1,rows*w]）；RealDiv 广播
-        // [m,w]÷[m,1] kernel 拒；[1,rows] 转置域 multiples 语义陷阱
-        // （mul E80013 广播错 shape）。1-D Tile 域 + Reshape 桥全可靠
-        let flat = rows * w;
-        let ish1 = format!("{name}_ish1");
-        self.const_i32(&ish1, &[rows as i32]);
-        let ir1 = self.reshape(&format!("{name}_ir1"), &rt, &[rows, 1], &ish1, &[rows]);
-        let it = format!("{name}_it");
-        self.g.add_op(&it, "TileD").unwrap();
-        self.g.set_input_desc(&it, "x", &[rows], Dtype::Fp32).unwrap();
-        self.g.set_output_desc(&it, "y", &[flat], Dtype::Fp32).unwrap();
-        self.g.set_attr_int_list(&it, "multiples", &[w]).unwrap();
-        self.wire(&it, "x", &ir1);
-        let itiled = self.reg_out(&it, "y");
-        let ish2 = format!("{name}_ish2");
-        self.const_i32(&ish2, &[rows as i32, w as i32]);
-        let invt = self.reshape(&format!("{name}_ir2"), &itiled, &[flat], &ish2, dims);
-        let nx = self.mul2_f32(&format!("{name}_nx"), &xf, &invt, dims);
-        // gamma [w]（1-D）→ Reshape [1,w]（rank 桥，避免 Cast 1-D 输出直连
-        // 2-D desc 的 TileD）→ Tile [rows,w]
+        self.g.add_op(&rs, "Rsqrt").unwrap();
+        self.g.set_input_desc(&rs, "x", &[rows, 1], Dtype::Fp16).unwrap();
+        self.g.set_output_desc(&rs, "y", &[rows, 1], Dtype::Fp16).unwrap();
+        self.wire(&rs, "x", &ssum);
+        let rs = self.reg_out(&rs, "y");
+        let ik = format!("{name}_ik");
+        self.g.add_op(&ik, "Mul").unwrap();
+        self.g.set_input_desc(&ik, "x1", &[rows, 1], Dtype::Fp16).unwrap();
+        self.g.set_input_desc(&ik, "x2", &[1], Dtype::Fp16).unwrap();
+        self.g.set_output_desc(&ik, "y", &[rows, 1], Dtype::Fp16).unwrap();
+        self.wire(&ik, "x1", &rs);
+        self.g.link(&ik, "x2", &kc).unwrap();
+        let ik = self.reg_out(&ik, "y");
+        // 广播（t14 形态）：[rows,1] → Reshape [1,rows] → TileD
+        // multiples=[w,1]（dim0 整行复制——生产 bias/γ 链同款 kernel）
+        // → [w,rows] → TransposeD(1,0) → [rows,w]。⚠ 连续平铺方向
+        // （rank-1 [rows] 或 [1,rows]+[1,w] flat tile）的 TileD kernel
+        // 在 310P f16 散点腐蚀 ~8%（n32v t11/t13 逐位同错定罪，
+        // 2026-09-22）；t14 = 0.08% 干净
+        let bshp = format!("{name}_bshp");
+        self.const_i32(&bshp, &[1, rows as i32]);
+        let br1 = self.reshape(&format!("{name}_br1"), &ik, &[rows, 1], &bshp, &[1, rows]);
+        let bt = format!("{name}_bt");
+        self.g.add_op(&bt, "TileD").unwrap();
+        self.g.set_input_desc(&bt, "x", &[1, rows], Dtype::Fp16).unwrap();
+        self.g.set_output_desc(&bt, "y", &[w, rows], Dtype::Fp16).unwrap();
+        self.g.set_attr_int_list(&bt, "multiples", &[w, 1]).unwrap();
+        self.wire(&bt, "x", &br1);
+        let btiled = self.reg_out(&bt, "y");
+        let tp = format!("{name}_tp");
+        self.g.add_op(&tp, "TransposeD").unwrap();
+        self.g.set_input_desc(&tp, "x", &[w, rows], Dtype::Fp16).unwrap();
+        self.g.set_output_desc(&tp, "y", dims, Dtype::Fp16).unwrap();
+        self.g.set_attr_int_list(&tp, "perm", &[1, 0]).unwrap();
+        self.wire(&tp, "x", &btiled);
+        let invt = self.reg_out(&tp, "y");
+        // nx = x · invb
+        let nx = self.mul2_f16(&format!("{name}_nx"), x, &invt, dims);
+        // gamma [w] → Reshape [1,w]（rank 桥）→ Tile [rows,w]
         let gshp = format!("{name}_gshp");
         self.const_i32(&gshp, &[1, w as i32]);
-        let gfr = self.reshape(&format!("{name}_gfr"), &gf, &[w], &gshp, &[1, w]);
+        let gfr = self.reshape(&format!("{name}_gfr"), gamma, &[w], &gshp, &[1, w]);
         let gt = format!("{name}_gt");
         self.g.add_op(&gt, "TileD").unwrap();
-        self.g.set_input_desc(&gt, "x", &[1, w], Dtype::Fp32).unwrap();
-        self.g.set_output_desc(&gt, "y", dims, Dtype::Fp32).unwrap();
+        self.g.set_input_desc(&gt, "x", &[1, w], Dtype::Fp16).unwrap();
+        self.g.set_output_desc(&gt, "y", dims, Dtype::Fp16).unwrap();
         self.g.set_attr_int_list(&gt, "multiples", &[rows, 1]).unwrap();
         self.wire(&gt, "x", &gfr); // gfr 是算子输出——link 只配 Data 名（陷阱 #8）
         let gft = self.reg_out(&gt, "y");
-        self.mul2_f32(name, &nx, &gft, dims)
+        self.mul2_f16(name, &nx, &gft, dims)
+    }
+
+    /// f16 Mul（同形）——NORM32 v2 全 f16 域用
+    fn mul2_f16(&mut self, name: &str, a: &str, b: &str, dims: &[i64]) -> String {
+        self.g.add_op(name, "Mul").unwrap();
+        self.g.set_input_desc(name, "x1", dims, Dtype::Fp16).unwrap();
+        self.g.set_input_desc(name, "x2", dims, Dtype::Fp16).unwrap();
+        self.g.set_output_desc(name, "y", dims, Dtype::Fp16).unwrap();
+        self.wire(name, "x1", a);
+        self.wire(name, "x2", b);
+        self.reg_out(name, "y")
     }
 
     /// [rows,1] ÷ [1] 标量（RealDiv 广播——标量分母 TBE 接受）
@@ -1108,11 +1136,17 @@ fn parity_and_bench(
 ) {
     // GEB_NORM32：GE 是 fp32 方差语义、eager 参考（aclnnAddRmsNorm）是
     // f16——对拍必分叉；且标量池前插使 eager 的层索引错位。单段模式
-    // 下跳过对拍（数值裁判走 e2e 路径的 golden 对拍）
+    // 下跳过对拍（数值裁判走 GEB_OPTEST=n32v + e2e 路径的 golden 对拍）
     if norm32_enabled() {
         println!(
             "[parity] GEB_NORM32 开启：跳过 eager 对拍（f32 vs f16 语义差；golden 对拍走 e2e）"
         );
+        // 烤桶路径：OM 落盘不能被跳过（tl144n32 全靠这里；save 只需
+        // build 产物，不依赖 run）
+        if let Ok(p) = std::env::var("GEB_SAVE") {
+            seg.g.save(&p).expect("save om (n32)");
+            println!("OM saved: {p}");
+        }
         return;
     }
     let n_in = seg.ins().len();
@@ -1450,14 +1484,8 @@ fn norm32_enabled() -> bool {
     std::env::var("GEB_NORM32").is_ok()
 }
 
-/// NORM32 共享标量池（Data 输入名；Clone 供 rms32 内 move 使用）
-#[derive(Clone)]
-struct N32Scalars {
-    one: String,
-    eps: String,
-    w2048: String,
-    w1024: String,
-}
+/// NORM32 常量池已内聚到 Seg（n32_c/n32_consts）——v1 的 Data 标量池
+/// （one/eps/w2048/w1024）随 ReduceSumD 假 f32 定罪一并淘汰
 
 /// host 线性层（f32 全精度；维度 1×32×3072 量级，开销可忽略）
 fn host_lin_f32(w: &LinearWeights, x: &[f32], in_d: usize) -> Vec<f32> {
@@ -2334,9 +2362,8 @@ fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e: 
         _ => rand_f16((p * PW) as usize, &mut seed, 100.0),
     };
     s.data(ctx, "x0", &[p, PW], &x0_h);
-    // GEB_NORM32 标量池（无 env 时 no-op）——⚠ 须在 x0 之后注册：
-    // replay/serve 的 x0 覆写硬编码 binds[0]
-    s.prep_n32(ctx);
+    // GEB_NORM32 v2：常量走 Const 折叠（n32_consts 懒建），无 Data 注册
+    // ——binds[0]=x0 的硬编码约束自然解除
     // bisect：x0 = cat(vision_out, 查表×√PW) 组装后即比（idx 域 [0,VT*PW)
     // = 视觉行 / 其后 = 语言行——分岔落哪个段一眼可辨）。剔除空视图时
     // golden 参考键为 x0_vis（712 行同序）
@@ -2767,9 +2794,7 @@ fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e: Op
         .map(|st| st.noise.clone())
         .unwrap_or_else(|| rand_f16((HOR * ADIM) as usize, &mut seed, 100.0));
     s.data(ctx, "state", &[HOR, ADIM], &state_h);
-    // GEB_NORM32 标量池（无 env 时 no-op）——⚠ 须在 state 之后注册：
-    // flow 的 x 换绑硬编码 binds[0]
-    s.prep_n32(ctx);
+    // GEB_NORM32 v2：常量 Const 折叠，无 Data 注册（binds[0] 约束解除）
     if let Some(st) = e2e.as_ref() {
         assert_eq!(st.kv.len(), depth * 2, "e2e: prefix 段 k/v 数与 flow 深度不符（GEB_DEPTH 须全 18）");
     }
@@ -4875,6 +4900,338 @@ fn optest(be: &AscendBackend, which: &str, real: Option<&Pi05Weights>) {
             println!("n32c lvl={lvl} 图构造完成，编译中");
             ge_builder::fini().expect("fini");
             println!("GE_N32C_COMPILE_OK lvl={lvl}");
+            return;
+        }
+        // n32v：NORM32 生产链数值验证（须配 GEB_NORM32=1）——rms32 的
+        // Sqrt 漏倒数 bug 正是"只验证编译"漏掉的（NORM32 下 parity 跳过，
+        // 2026-09-22 定罪后补的数值裁判）。三级 tap 二分一次跑全：
+        //   t1 = Cast 对（x→f32→f16 恒等）——FE 曾报 dst_type GetInt
+        //        失败，Cast 语义是头号嫌疑
+        //   t2 = 广播倒数链（xf²→ReduceSum→÷w→Rsqrt→Tile 广播）
+        //   t3 = 全链 addrms（+γ Tile + 终 Mul）
+        "n32v" => {
+            assert!(norm32_enabled(), "n32v 须配 GEB_NORM32=1");
+            let (m, w) = (576i64, 2048i64);
+            let mut seed = 0x51DEu32;
+            let host: Vec<f16> = rand_f16((m * w) as usize, &mut seed, 3.0);
+            let gamma: Vec<f16> = (0..w)
+                .map(|i| f16::from_f32(1.0 + 0.05 * ((i % 17) as f32 - 8.0)))
+                .collect();
+            // host 各级参考（eps 省略同生产；f32 域）
+            let mut inv_row = vec![0f32; m as usize];
+            let mut want_full = vec![0f32; (m * w) as usize];
+            let mut md_ref = 0f32;
+            for r in 0..m as usize {
+                let var: f32 = (0..w as usize)
+                    .map(|c| host[r * w as usize + c].to_f32().powi(2))
+                    .sum::<f32>()
+                    / w as f32;
+                let inv = 1.0 / var.sqrt();
+                inv_row[r] = inv;
+                for c in 0..w as usize {
+                    let v = host[r * w as usize + c].to_f32() * inv * gamma[c].to_f32();
+                    want_full[r * w as usize + c] = v;
+                    md_ref = md_ref.max(v.abs());
+                }
+            }
+            let want_x: Vec<f32> = host.iter().map(|v| v.to_f32()).collect();
+            let want_inv: Vec<f32> = (0..m as usize)
+                .flat_map(|r| vec![inv_row[r]; w as usize])
+                .collect();
+            // t4/5/6 子级参考：行平方和 / 均值 / rsqrt（[m]，f32 直出
+            // 防行和 75 万超 f16 域）
+            let want_ssum: Vec<f32> = (0..m as usize)
+                .map(|r| {
+                    (0..w as usize)
+                        .map(|c| host[r * w as usize + c].to_f32().powi(2))
+                        .sum::<f32>()
+                })
+                .collect();
+            let want_vare: Vec<f32> = want_ssum.iter().map(|v| v / w as f32).collect();
+            // t8 参考：inv_geom = 1/(s·sqrt(Σx²))（s=1/32 预缩放）
+            let s_n32 = 1.0f32 / 32.0;
+            let want_inv_geom: Vec<f32> = want_ssum
+                .iter()
+                .map(|v| 1.0 / (s_n32 * v.sqrt()))
+                .collect();
+            let dl_f32 = |buf: &DeviceBuffer, n: usize| -> Vec<f32> {
+                let mut back = vec![0u8; n * 4];
+                ctx.copy_d2h(buf, &mut back).expect("n32v d2h");
+                back.chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect()
+            };
+            // t10 参考：x·inv（无 γ——隔离广播链 vs γ 链）
+            let want_nx: Vec<f32> = (0..(m * w) as usize)
+                .map(|i| host[i].to_f32() * inv_row[i / w as usize])
+                .collect();
+            // t11/t12 参考：want_inv 即广播终点参考；ik 数学上 = inv（k 折回）
+            let stream = be.stream();
+            let mut rels: Vec<(u32, f32)> = vec![];
+            for tap in 1u32..=14 {
+                let mut s = Seg::new(&format!("n32v_t{tap}"));
+                s.data(ctx, "x", &[m, w], &host);
+                if matches!(tap, 2 | 5 | 6) {
+                    s.data_f32(ctx, "wv", &[1], &[w as f32]);
+                }
+                if tap == 8 {
+                    s.data(ctx, "sc", &[1], &[f16::from_f32(s_n32)]);
+                }
+                if tap == 3 {
+                    s.data(ctx, "gamma", &[w], &gamma);
+                }
+                let y = match tap {
+                    1 => {
+                        let xf = s.cast_node("t_xf", "x", &[m, w], true);
+                        s.cast_node("y", &xf, &[m, w], false)
+                    }
+                    9 => {
+                        // t9：Cast f32 直出（f32 buffer 读回——假 Cast 会露出
+                        // f16 位图被当 f32 读的 1e-7 级乱值）
+                        s.cast_node("y", "x", &[m, w], true)
+                    }
+                    7 => {
+                        // ReduceSum（非 D 变体）：axes 是张量输入（const_i32
+                        // 编译期折叠）——ReduceSumD 疑无 f32 kernel 被 FE
+                        // 混精度回退，本 tap 验证非 D 变体的真 f32 路径
+                        let xf = s.cast_node("t_xf", "x", &[m, w], true);
+                        let sq = s.mul2_f32("t_sq", &xf, &xf, &[m, w]);
+                        s.const_i32("t_ax", &[-1]);
+                        s.g.add_op("t_rs", "ReduceSum").unwrap();
+                        s.g.set_input_desc("t_rs", "x", &[m, w], Dtype::Fp32).unwrap();
+                        s.g.set_input_desc("t_rs", "axes", &[1], Dtype::Int32).unwrap();
+                        s.g.set_output_desc("t_rs", "y", &[m, 1], Dtype::Fp32).unwrap();
+                        s.wire("t_rs", "x", &sq);
+                        s.g.link("t_rs", "axes", "t_ax").unwrap();
+                        s.reg_out("t_rs", "y")
+                    }
+                    2 | 4 | 5 | 6 => {
+                        // 公共链：xf → sq → ReduceSumD [m,1]
+                        let xf = s.cast_node("t_xf", "x", &[m, w], true);
+                        let sq = s.mul2_f32("t_sq", &xf, &xf, &[m, w]);
+                        s.g.add_op("t_rs", "ReduceSumD").unwrap();
+                        s.g.set_input_desc("t_rs", "x", &[m, w], Dtype::Fp32).unwrap();
+                        s.g.set_output_desc("t_rs", "y", &[m, 1], Dtype::Fp32).unwrap();
+                        s.g.set_attr_int_list("t_rs", "axes", &[-1]).unwrap();
+                        s.wire("t_rs", "x", &sq);
+                        let ssum = s.reg_out("t_rs", "y");
+                        if tap == 4 {
+                            // 行平方和直出（f32，无 Cast——防饱和）
+                            ssum
+                        } else {
+                            let vare = s.rdiv1("t_mn", &ssum, "wv", m);
+                            if tap == 5 {
+                                vare
+                            } else {
+                                s.g.add_op("t_rt", "Rsqrt").unwrap();
+                                s.g.set_input_desc("t_rt", "x", &[m, 1], Dtype::Fp32).unwrap();
+                                s.g.set_output_desc("t_rt", "y", &[m, 1], Dtype::Fp32).unwrap();
+                                s.wire("t_rt", "x", &vare);
+                                let rt = s.reg_out("t_rt", "y");
+                                if tap == 6 {
+                                    rt
+                                } else {
+                                    // t2：1-D Tile 广播 → [m,w] → f16
+                                    let flat = m * w;
+                                    let ish1 = "t_ish1".to_string();
+                                    s.const_i32(&ish1, &[m as i32]);
+                                    let ir1 = s.reshape("t_ir1", &rt, &[m, 1], &ish1, &[m]);
+                                    s.g.add_op("t_it", "TileD").unwrap();
+                                    s.g.set_input_desc("t_it", "x", &[m], Dtype::Fp32).unwrap();
+                                    s.g.set_output_desc("t_it", "y", &[flat], Dtype::Fp32).unwrap();
+                                    s.g.set_attr_int_list("t_it", "multiples", &[w]).unwrap();
+                                    s.wire("t_it", "x", &ir1);
+                                    let itiled = s.reg_out("t_it", "y");
+                                    let ish2 = "t_ish2".to_string();
+                                    s.const_i32(&ish2, &[m as i32, w as i32]);
+                                    let invt = s.reshape("t_ir2", &itiled, &[flat], &ish2, &[m, w]);
+                                    s.cast_node("y", &invt, &[m, w], false)
+                                }
+                            }
+                        }
+                    }
+                    8 => {
+                        // MatMul 立方体累加路线（全 f16 域，无 Cast/Reduce）：
+                        // xs=x·s → sq=xs² → ssum=mm(sq, ones)[m,1]（cube 内
+                        // fp32 累加）→ inv=Rsqrt f16 直出
+                        s.g.add_op("t_xs", "Mul").unwrap();
+                        s.g.set_input_desc("t_xs", "x1", &[m, w], Dtype::Fp16).unwrap();
+                        s.g.set_input_desc("t_xs", "x2", &[1], Dtype::Fp16).unwrap();
+                        s.g.set_output_desc("t_xs", "y", &[m, w], Dtype::Fp16).unwrap();
+                        s.wire("t_xs", "x1", "x");
+                        s.g.link("t_xs", "x2", "sc").unwrap();
+                        let xs = s.reg_out("t_xs", "y");
+                        s.g.add_op("t_sq", "Mul").unwrap();
+                        s.g.set_input_desc("t_sq", "x1", &[m, w], Dtype::Fp16).unwrap();
+                        s.g.set_input_desc("t_sq", "x2", &[m, w], Dtype::Fp16).unwrap();
+                        s.g.set_output_desc("t_sq", "y", &[m, w], Dtype::Fp16).unwrap();
+                        s.wire("t_sq", "x1", &xs);
+                        s.wire("t_sq", "x2", &xs);
+                        let sq = s.reg_out("t_sq", "y");
+                        let ones: Vec<f16> = vec![f16::from_f32(1.0); (w) as usize];
+                        s.const_f16("t_ones", &[1, w], &ones);
+                        let ssum = s.mm("t_mm", &sq, &[m, w], "t_ones", &[1, w], &[m, 1]);
+                        s.g.add_op("t_inv", "Rsqrt").unwrap();
+                        s.g.set_input_desc("t_inv", "x", &[m, 1], Dtype::Fp16).unwrap();
+                        s.g.set_output_desc("t_inv", "y", &[m, 1], Dtype::Fp16).unwrap();
+                        s.wire("t_inv", "x", &ssum);
+                        s.reg_out("t_inv", "y")
+                    }
+                    10 | 11 | 12 | 13 | 14 => {
+                        // v2 生产链去 γ：t10 广播终点+nx / t11 广播终点 invt
+                        // 直出 / t12 ik [m,1] 直出——逐级隔离 ik乘k vs 广播 vs nx
+                        let (sc, kc, ones) = s.n32_consts(w);
+                        let _ = (&sc, &kc, &ones);
+                        // —— 与 rms32 v2 相同的链（手抄，尾节点换 nx）——
+                        s.g.add_op("t_xs", "Mul").unwrap();
+                        s.g.set_input_desc("t_xs", "x1", &[m, w], Dtype::Fp16).unwrap();
+                        s.g.set_input_desc("t_xs", "x2", &[1], Dtype::Fp16).unwrap();
+                        s.g.set_output_desc("t_xs", "y", &[m, w], Dtype::Fp16).unwrap();
+                        s.wire("t_xs", "x1", "x");
+                        let sc_name = sc.clone();
+                        s.g.link("t_xs", "x2", &sc_name).unwrap();
+                        let xs = s.reg_out("t_xs", "y");
+                        let sq = s.mul2_f16("t_sq", &xs, &xs, &[m, w]);
+                        let ssum = s.mm("t_mm", &sq, &[m, w], &ones, &[1, w], &[m, 1]);
+                        s.g.add_op("t_rs", "Rsqrt").unwrap();
+                        s.g.set_input_desc("t_rs", "x", &[m, 1], Dtype::Fp16).unwrap();
+                        s.g.set_output_desc("t_rs", "y", &[m, 1], Dtype::Fp16).unwrap();
+                        s.wire("t_rs", "x", &ssum);
+                        let rs = s.reg_out("t_rs", "y");
+                        s.g.add_op("t_ik", "Mul").unwrap();
+                        s.g.set_input_desc("t_ik", "x1", &[m, 1], Dtype::Fp16).unwrap();
+                        s.g.set_input_desc("t_ik", "x2", &[1], Dtype::Fp16).unwrap();
+                        s.g.set_output_desc("t_ik", "y", &[m, 1], Dtype::Fp16).unwrap();
+                        s.wire("t_ik", "x1", &rs);
+                        let kc_name = kc.clone();
+                        s.g.link("t_ik", "x2", &kc_name).unwrap();
+                        let ik = s.reg_out("t_ik", "y");
+                        if tap == 12 {
+                            ik
+                        } else if tap == 14 {
+                            // dim0 整行复制（生产 bias/γ 链同款 kernel）+
+                            // 转置桥：[m,1]→[1,m] →TileD multiples=[w,1]→
+                            // [w,m] →TransposeD(1,0)→ [m,w]
+                            s.const_i32("t_ish1c", &[1, m as i32]);
+                            let ir1 = s.reshape("t_ir1c", &ik, &[m, 1], "t_ish1c", &[1, m]);
+                            s.g.add_op("t_itc", "TileD").unwrap();
+                            s.g.set_input_desc("t_itc", "x", &[1, m], Dtype::Fp16).unwrap();
+                            s.g.set_output_desc("t_itc", "y", &[w, m], Dtype::Fp16).unwrap();
+                            s.g.set_attr_int_list("t_itc", "multiples", &[w, 1]).unwrap();
+                            s.wire("t_itc", "x", &ir1);
+                            let itiled = s.reg_out("t_itc", "y");
+                            s.g.add_op("t_tpc", "TransposeD").unwrap();
+                            s.g.set_input_desc("t_tpc", "x", &[w, m], Dtype::Fp16).unwrap();
+                            s.g.set_output_desc("t_tpc", "y", &[m, w], Dtype::Fp16).unwrap();
+                            s.g.set_attr_int_list("t_tpc", "perm", &[1, 0]).unwrap();
+                            s.wire("t_tpc", "x", &itiled);
+                            s.reg_out("t_tpc", "y")
+                        } else if tap == 13 {
+                            // [1,m] 前导 1 域（pit #35 可靠域）：连续平铺语义
+                            // = 逐行常数，正好做行广播；rank 全程 ≥2
+                            s.const_i32("t_ish1b", &[1, m as i32]);
+                            let ir1 = s.reshape("t_ir1b", &ik, &[m, 1], "t_ish1b", &[1, m]);
+                            s.g.add_op("t_itb", "TileD").unwrap();
+                            s.g.set_input_desc("t_itb", "x", &[1, m], Dtype::Fp16).unwrap();
+                            s.g.set_output_desc("t_itb", "y", &[1, m * w], Dtype::Fp16).unwrap();
+                            s.g.set_attr_int_list("t_itb", "multiples", &[1, w]).unwrap();
+                            s.wire("t_itb", "x", &ir1);
+                            let itiled = s.reg_out("t_itb", "y");
+                            s.const_i32("t_ish2b", &[m as i32, w as i32]);
+                            s.reshape("t_ir2b", &itiled, &[1, m * w], "t_ish2b", &[m, w])
+                        } else {
+                            let flat = m * w;
+                            s.const_i32("t_ish1", &[m as i32]);
+                            let ir1 = s.reshape("t_ir1", &ik, &[m, 1], "t_ish1", &[m]);
+                            s.g.add_op("t_it", "TileD").unwrap();
+                            s.g.set_input_desc("t_it", "x", &[m], Dtype::Fp16).unwrap();
+                            s.g.set_output_desc("t_it", "y", &[flat], Dtype::Fp16).unwrap();
+                            s.g.set_attr_int_list("t_it", "multiples", &[w]).unwrap();
+                            s.wire("t_it", "x", &ir1);
+                            let itiled = s.reg_out("t_it", "y");
+                            s.const_i32("t_ish2", &[m as i32, w as i32]);
+                            let invt = s.reshape("t_ir2", &itiled, &[flat], "t_ish2", &[m, w]);
+                            if tap == 11 {
+                                invt
+                            } else {
+                                s.mul2_f16("y", "x", &invt, &[m, w])
+                            }
+                        }
+                    }
+                    _ => {
+                        // NORM32 分支不消费 zeros（rms(x+0)=rms(x)）——占位名
+                        s.addrms("y", "x", "n32v_unused_zeros", "gamma", &[m, w])
+                    }
+                };
+                s.finish(&[&y]);
+                let ins: Vec<&DeviceBuffer> = s.binds.iter().collect();
+                let n_out = s.g.num_outputs().unwrap();
+                let outs: Vec<DeviceBuffer> = (0..n_out)
+                    .map(|i| ctx.malloc(s.g.output_size(i).unwrap().max(16)).unwrap())
+                    .collect();
+                let orefs: Vec<&DeviceBuffer> = outs.iter().collect();
+                s.g.run(&ins, &orefs, stream).unwrap();
+                drop(stream.synchronize());
+                let ge: Vec<f32> = match tap {
+                    4 | 5 | 6 | 7 => dl_f32(&outs[0], m as usize),
+                    8 | 12 => download_f16(ctx, &outs[0], m as usize)
+                        .iter()
+                        .map(|v| v.to_f32())
+                        .collect(),
+                    9 => dl_f32(&outs[0], (m * w) as usize),
+                    _ => download_f16(ctx, &outs[0], (m * w) as usize)
+                        .iter()
+                        .map(|v| v.to_f32())
+                        .collect(),
+                };
+                let want: &[f32] = match tap {
+                    1 => &want_x,
+                    2 => &want_inv,
+                    4 => &want_ssum,
+                    5 => &want_vare,
+                    6 => &inv_row,
+                    7 => &want_ssum,
+                    8 => &want_inv_geom,
+                    9 => &want_x,
+                    10 => &want_nx,
+                    11 => &want_inv,
+                    12 => &inv_row,
+                    13 => &want_inv,
+                    14 => &want_inv,
+                    _ => &want_full,
+                };
+                let mut md = 0f32;
+                let mut rm = 0f32;
+                let mut mdi = 0usize;
+                for (i, (a, b)) in ge.iter().zip(want).enumerate() {
+                    let d = (a - b).abs();
+                    if d > md {
+                        md = d;
+                        mdi = i;
+                    }
+                    rm = rm.max(b.abs());
+                }
+                let rel = md / rm * 100.0;
+                let loc = if matches!(tap, 3 | 10) {
+                    format!(" @r{}c{}", mdi / w as usize, mdi % w as usize)
+                } else {
+                    String::new()
+                };
+                println!("n32v[t{tap}]: max_diff={md:.6} rel={rel:.4}%{loc}");
+                rels.push((tap, rel));
+            }
+            ge_builder::fini().expect("fini");
+            // 档案数据（不断言）：t2/t4-t7 = f32 reduce 假支持；t10/t11/t13
+            // = 连续平铺 TileD 的散点腐蚀（生产已弃用该形态）。
+            // 断言生产路径：t1 Cast 对 / t3 全链 / t8 mm 路线 / t9 Cast /
+            // t12 ik / t14 广播桥
+            let bad: Vec<String> = rels
+                .iter()
+                .filter(|(t, r)| matches!(t, 1 | 3 | 8 | 9 | 12 | 14) && *r >= 0.5)
+                .map(|(t, r)| format!("t{t}={r:.3}%"))
+                .collect();
+            assert!(bad.is_empty(), "n32v 数值验证失败: {}", bad.join(" "));
+            println!("GE_N32V_OK");
             return;
         }
         // oproj: 真数据单算裁决（2026-09-21 定位收口）——norm2 级 2.82% 通道
