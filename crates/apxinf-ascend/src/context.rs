@@ -219,6 +219,32 @@ impl AscendContext {
         )
     }
 
+    /// Stream-ordered device → device copy (async, host returns immediately;
+    /// ordered against compute on the same stream). The host-synchronous
+    /// counterpart of copy_h2d/copy_d2h for inter-segment relays that must
+    /// never touch host memory.
+    pub fn copy_d2d_async(
+        &self,
+        dst: &DeviceBuffer,
+        src: &DeviceBuffer,
+        stream: &crate::AscendStream,
+    ) -> Result<()> {
+        assert_eq!(dst.len(), src.len(), "d2d length mismatch");
+        self.check(
+            unsafe {
+                ffi::aclrtMemcpyAsync(
+                    dst.as_ptr(),
+                    dst.len(),
+                    src.as_ptr(),
+                    src.len(),
+                    ffi::ACL_MEMCPY_DEVICE_TO_DEVICE,
+                    stream.handle(),
+                )
+            },
+            "aclrtMemcpyAsync d2d",
+        )
+    }
+
     /// Stream-ordered memset (capturable: used as ACLGraph payload).
     pub fn memset_async(&self, buf: &DeviceBuffer, value: u8, stream: &crate::AscendStream) -> Result<()> {
         self.check(
@@ -274,6 +300,18 @@ impl DeviceBuffer {
 
     pub fn is_empty(&self) -> bool {
         self.len == 0
+    }
+
+    /// Unowned view into `backing`'s memory at a byte offset (no free on
+    /// drop — the backing buffer owns the allocation and must outlive the
+    /// view). For device-resident constant tables shared across runs.
+    pub fn view_of(backing: &DeviceBuffer, offset_bytes: usize, len_bytes: usize) -> DeviceBuffer {
+        assert!(offset_bytes + len_bytes <= backing.len, "view_of 越界");
+        DeviceBuffer {
+            ptr: unsafe { backing.ptr.add(offset_bytes) },
+            len: len_bytes,
+            owned: false,
+        }
     }
 }
 

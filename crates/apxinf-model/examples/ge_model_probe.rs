@@ -1383,15 +1383,17 @@ struct PrefixMech {
 }
 
 impl PrefixMech {
-    /// 一帧 prefix：重组 x0（本帧 vision_out 可见行 + 真 token 查表
-    /// ×lang_scale）覆写 binds[0] 重跑，36 路 kv 下载（aux 槽不下载）
-    fn one_frame(
+    /// 一帧 prefix（设备态）：重组 x0（本帧 vision_out 可见行 + 真 token
+    /// 查表 ×lang_scale）覆写 binds[0] 重跑 + sync；36 路 kv 留在
+    /// self.routs（设备）——GEB_SERVE_FAST 下由 FlowMech 异步 d2d 直连
+    /// 消费，零 host 中转
+    fn one_frame_dev(
         &mut self,
         ctx: &AscendContext,
         stream: &AscendStream,
         vision_out: &[f16],
         token_ids: &[u32],
-    ) -> Vec<Vec<f16>> {
+    ) {
         assert_eq!(vision_out.len(), (VT * PW) as usize, "serve vision_out 尺寸不符");
         let mut x0 = vision_out[..self.vis_rows].to_vec();
         x0.reserve(token_ids.len() * self.vocab_w);
@@ -1411,6 +1413,18 @@ impl PrefixMech {
         let refs: Vec<&DeviceBuffer> = self.routs.iter().collect();
         self.s.g.run(&ins, &refs, stream).expect("ge run");
         drop(stream.synchronize());
+    }
+
+    /// 一帧 prefix（legacy host 中转）：one_frame_dev 后 36 路 kv 下载
+    /// （aux 槽不下载）
+    fn one_frame(
+        &mut self,
+        ctx: &AscendContext,
+        stream: &AscendStream,
+        vision_out: &[f16],
+        token_ids: &[u32],
+    ) -> Vec<Vec<f16>> {
+        self.one_frame_dev(ctx, stream, vision_out, token_ids);
         (0..self.nkv)
             .map(|i| download_f16(ctx, &self.routs[i], self.s.g.output_size(i).unwrap() / 2))
             .collect()
@@ -1425,6 +1439,60 @@ struct FlowMech {
     fs_idx: usize,
     pk_base: usize,
     depth: usize,
+    /// GEB_SERVE_FAST 设备驻留态：styles 10 步各占独立视图（跨帧恒定 ⇒
+    /// 一次上传后帧内零拷贝——legacy 110 槽位被 10 步复用须逐步重传）；
+    /// style_map = style bind 下标 → 段序；ins_order = 图输入装配序
+    /// （wconst 时 = data_inputs，同 Seg::ins 语义）
+    style_master: Option<DeviceBuffer>,
+    style_views: Vec<Vec<DeviceBuffer>>,
+    style_map: std::collections::HashMap<usize, usize>,
+    ins_order: Vec<usize>,
+}
+
+/// styles 设备驻留构装：10 步 × (6*depth+2) 段拼一块 master（一次 h2d），
+/// 每步每段一个 view；style_map 与 legacy h2d 循环同一 bind 映射
+fn style_residency(
+    ctx: &AscendContext,
+    style_cache: &[Vec<Vec<f16>>],
+    layer_bases: &[usize],
+    fs_idx: usize,
+    depth: usize,
+) -> (DeviceBuffer, Vec<Vec<DeviceBuffer>>, std::collections::HashMap<usize, usize>) {
+    let mut slots: Vec<usize> = Vec::with_capacity(depth * 6 + 2);
+    for i in 0..depth {
+        let b = layer_bases[i];
+        slots.extend_from_slice(&[b, b + 1, b + 10, b + 11, b + 16, b + 17]);
+    }
+    slots.push(fs_idx);
+    slots.push(fs_idx + 1);
+    let mut style_map = std::collections::HashMap::new();
+    for (j, &bi) in slots.iter().enumerate() {
+        style_map.insert(bi, j);
+    }
+    let total: usize = style_cache
+        .iter()
+        .map(|sc| sc.iter().map(|seg| seg.len() * 2).sum::<usize>())
+        .sum();
+    let mut host: Vec<u8> = Vec::with_capacity(total);
+    for sc in style_cache {
+        for seg in sc {
+            host.extend(seg.iter().flat_map(|v| v.to_bits().to_le_bytes()));
+        }
+    }
+    let master = ctx.malloc(total).expect("style master malloc");
+    ctx.copy_h2d(&master, &host).expect("style master h2d");
+    let mut views: Vec<Vec<DeviceBuffer>> = Vec::with_capacity(style_cache.len());
+    let mut off = 0usize;
+    for sc in style_cache {
+        let mut v: Vec<DeviceBuffer> = Vec::with_capacity(sc.len());
+        for seg in sc {
+            let n = seg.len() * 2;
+            v.push(DeviceBuffer::view_of(&master, off, n));
+            off += n;
+        }
+        views.push(v);
+    }
+    (master, views, style_map)
 }
 
 impl FlowMech {
@@ -1468,6 +1536,52 @@ impl FlowMech {
         }
         x
     }
+
+    /// 一帧 flow（GEB_SERVE_FAST）：36 路 pk/pv 异步 d2d（prefix routs
+    /// 设备直连）→ noise h2d → 10 步同流链（styles 视图零拷贝、x d2d
+    /// 驻留、无 per-step sync）→ 末步一次 sync + actions d2h。与
+    /// one_frame 逐位同源：同一字节流（d2d/视图都是精确字节）+ 同流
+    /// 顺序执行——sync 只挪等待点不改计算序
+    fn one_frame_fast(
+        &mut self,
+        ctx: &AscendContext,
+        stream: &AscendStream,
+        kv_dev: &[&DeviceBuffer],
+        noise: &[f16],
+    ) -> Vec<f16> {
+        assert_eq!(kv_dev.len(), self.depth * 2, "serve kv 路数不符");
+        assert!(!self.style_views.is_empty(), "fast 路径须先构装 styles 驻留");
+        for i in 0..self.depth * 2 {
+            assert_eq!(
+                kv_dev[i].len(),
+                self.s.binds[self.pk_base + i].len(),
+                "fast kv 尺寸不符（路 {i}）"
+            );
+            ctx.copy_d2d_async(&self.s.binds[self.pk_base + i], kv_dev[i], stream)
+                .expect("serve d2d kv");
+        }
+        let bytes: Vec<u8> = noise.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect();
+        ctx.copy_h2d(&self.s.binds[0], &bytes).expect("serve h2d noise");
+        let nsteps = self.style_views.len();
+        for step in 0..nsteps {
+            let ins: Vec<&DeviceBuffer> = self
+                .ins_order
+                .iter()
+                .map(|&i| match self.style_map.get(&i) {
+                    Some(&j) => &self.style_views[step][j],
+                    None => &self.s.binds[i],
+                })
+                .collect();
+            let oref: Vec<&DeviceBuffer> = vec![&self.ob];
+            self.s.g.run(&ins, &oref, stream).expect("ge run");
+            if step + 1 < nsteps {
+                // x 驻留：本步输出 → 下步 state（同流有序，免 d2h+h2d+sync）
+                ctx.copy_d2d_async(&self.s.binds[0], &self.ob, stream).expect("serve d2d x");
+            }
+        }
+        drop(stream.synchronize());
+        download_f16(ctx, &self.ob, (HOR * ADIM) as usize)
+    }
 }
 
 impl E2eStage {
@@ -1505,6 +1619,16 @@ fn silu_f32(x: f32) -> f32 {
 /// f32/f16 输出逐位同）——只能组合手搓。
 fn norm32_enabled() -> bool {
     std::env::var("GEB_NORM32").is_ok()
+}
+
+/// GEB_SERVE_FAST：serve 段间设备直连开关（2026-09-23 性能轮 A+B）——
+/// prefix 36 路 kv 异步 d2d 直连（零 host 中转）、flow x 设备驻留
+/// （逐步 d2h→h2d 换同流 d2d）、10 步去 per-step sync、styles 设备
+/// 驻留（每步独立视图一次上传）。数值 bit 级恒等：同一字节流 + 同流
+/// 顺序执行，sync 增删不改计算序。空串不算开（supervisor env 透传
+/// 里未设时不误触）
+fn serve_fast() -> bool {
+    std::env::var("GEB_SERVE_FAST").map(|v| !v.is_empty()).unwrap_or(false)
 }
 
 /// NORM32 常量池已内聚到 Seg（n32_c/n32_consts）——v1 的 Data 标量池
@@ -1851,12 +1975,27 @@ fn serve_loop(be: &AscendBackend, st: &mut E2eStage, dir: &str, tokens: usize) {
         let t0 = std::time::Instant::now();
         let vision_out = vm.one_frame(ctx, stream, &patches);
         let tv = t0.elapsed().as_secs_f64() * 1e3;
-        let t0 = std::time::Instant::now();
-        let kv = pm.one_frame(ctx, stream, &vision_out, &ids);
-        let tp = t0.elapsed().as_secs_f64() * 1e3;
-        let t0 = std::time::Instant::now();
-        let actions = fm.one_frame(ctx, stream, &kv, &noise);
-        let tf = t0.elapsed().as_secs_f64() * 1e3;
+        let actions;
+        let tp;
+        let tf;
+        if serve_fast() {
+            // GEB_SERVE_FAST：kv 设备直连 + styles 驻留 + x 驻留（tp 仍含
+            // prefix run 的 sync 等待——段计时与 legacy 可比）
+            let t1 = std::time::Instant::now();
+            pm.one_frame_dev(ctx, stream, &vision_out, &ids);
+            tp = t1.elapsed().as_secs_f64() * 1e3;
+            let kvrefs: Vec<&DeviceBuffer> = pm.routs[..pm.nkv].iter().collect();
+            let t2 = std::time::Instant::now();
+            actions = fm.one_frame_fast(ctx, stream, &kvrefs, &noise);
+            tf = t2.elapsed().as_secs_f64() * 1e3;
+        } else {
+            let t1 = std::time::Instant::now();
+            let kv = pm.one_frame(ctx, stream, &vision_out, &ids);
+            tp = t1.elapsed().as_secs_f64() * 1e3;
+            let t2 = std::time::Instant::now();
+            actions = fm.one_frame(ctx, stream, &kv, &noise);
+            tf = t2.elapsed().as_secs_f64() * 1e3;
+        }
         // actions [HOR, ADIM] → 前 7 列（LIBERO deployable 维；
         // normalized_actions = x_t 终态切片，denorm 在 torch postprocess）
         let gd = 7usize;
@@ -3479,6 +3618,24 @@ fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e: Op
         // GEB_E2E_SERVE：机械下沉（styles 缓存跨请求不变——10 步调度固定；
         // euler c1/c2 已换绑 LeRobot 语义，buffer 内容恒持）
         if std::env::var("GEB_E2E_SERVE").is_ok() {
+            let (style_master, style_views, style_map) = if serve_fast() {
+                let (m, v, mp) =
+                    style_residency(ctx, &style_cache, &layer_bases, fs_idx, depth);
+                println!(
+                    "[serve] GEB_SERVE_FAST：styles 设备驻留 {} 步 × {} 槽（master {} 字节，一次上传）",
+                    v.len(),
+                    mp.len(),
+                    m.len()
+                );
+                (Some(m), v, mp)
+            } else {
+                (None, Vec::new(), std::collections::HashMap::new())
+            };
+            let ins_order: Vec<usize> = if s.wconst {
+                s.data_inputs.clone()
+            } else {
+                (0..s.binds.len()).collect()
+            };
             st.fmech = Some(FlowMech {
                 s,
                 ob,
@@ -3487,6 +3644,10 @@ fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e: Op
                 fs_idx,
                 pk_base,
                 depth,
+                style_master,
+                style_views,
+                style_map,
+                ins_order,
             });
         }
         return;
