@@ -868,11 +868,185 @@ impl Model {
     }
 }
 
+/// GE 三段 OM in-process 引擎（昇腾 route C 直调面，feature `ascend`）。
+///
+/// 与 serve 桶进程（`ge_model_probe GEB_E2E_SERVE`）同一实现（crate 库面
+/// `GeServe`），无 spool 轮询。接口与 `npu_ge._BucketClient.request` 逐位
+/// 对齐：patches [768,588] f32 / ids [L] u32 / noise [50,32] f32 →
+/// actions 前 7 列 [50,7] f32 + 段计时。
+///
+/// ⚠ 进程级单管线（配置走全局 env）；设备选择由
+/// `ASCEND_RT_VISIBLE_DEVICES` 决定（与 spool 桶一致）。本扩展链接 9.0.1
+/// CANN——不能与 torch_npu（8.5.1）同进程加载。
+#[cfg(feature = "ascend")]
+mod ge_serve_py {
+    use super::runtime_err;
+    use apxinf_ascend::AscendBackend;
+    use apxinf_model::pi05::{GeServe, Pi05Config, Pi05Weights};
+    use half::f16;
+    use numpy::ndarray::Array2;
+    use numpy::{IntoPyArray, PyArray2, PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods};
+    use pyo3::exceptions::PyValueError;
+    use pyo3::prelude::*;
+    use std::cell::Cell;
+    use std::path::PathBuf;
+    use std::sync::OnceLock;
+
+    static GE_INIT: OnceLock<Result<(), String>> = OnceLock::new();
+
+    fn ge_init_once() -> PyResult<()> {
+        let res = GE_INIT.get_or_init(|| {
+            apxinf_ascend::ge_builder::init("Ascend310P3")
+                .map_err(|e| e.to_string())
+        });
+        match res {
+            Ok(()) => Ok(()),
+            Err(msg) => Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
+                "apxinf_py.GeServeModel: ge_builder init 失败（须先于 acl runtime）: {msg}"
+            ))),
+        }
+    }
+
+    /// A loaded in-process GE pipeline: three OM segments + weights host
+    /// consumers, owned for the lifetime of the handle.
+    #[pyclass(unsendable, name = "GeServeModel")]
+    pub struct GeServeModel {
+        backend: AscendBackend,
+        serve: GeServe,
+        last_ms: Cell<(f32, f32, f32)>,
+    }
+
+    #[pymethods]
+    impl GeServeModel {
+        /// Open a pipeline from a pre-baked bucket directory.
+        ///
+        /// * `om_dir` — bucket dir containing `{vision,prefix,flow}_real.om`
+        ///   (gate-era build; e.g. `/data/apxinf/om_cache/tl144`).
+        /// * `tokens` — the bucket's token length L (must match the OMs).
+        /// * `ckpt` — LeRobot checkpoint dir (token-embedding + styles host
+        ///   consumers; one-time ~60s load).
+        /// * `fast` — GEB_SERVE_FAST device-direct path (default true).
+        #[staticmethod]
+        #[pyo3(signature = (om_dir, tokens, ckpt, fast=true))]
+        fn open(om_dir: PathBuf, tokens: usize, ckpt: PathBuf, fast: bool) -> PyResult<Self> {
+            ge_init_once()?;
+            let real = Pi05Weights::from_safetensors(&Pi05Config::default(), &ckpt)
+                .map_err(runtime_err)?;
+            let backend = AscendBackend::new(0).map_err(runtime_err)?;
+            let om_dir = om_dir
+                .to_str()
+                .ok_or_else(|| PyValueError::new_err("om_dir must be a utf-8 path"))?
+                .to_owned();
+            let serve = GeServe::open(&backend, &real, &om_dir, tokens, fast);
+            Ok(Self {
+                backend,
+                serve,
+                last_ms: Cell::new((0.0, 0.0, 0.0)),
+            })
+        }
+
+        /// One frame. patches `[768,588]` float32 / ids `[L]` uint32 /
+        /// noise `[50,32]` float32 → `(actions [50,7] float32, (vision_ms,
+        /// prefix_ms, flow_ms))`. Actions are the normalized-domain flow
+        /// terminal state's first 7 (deployable) columns — identical bytes
+        /// to the spool protocol.
+        #[pyo3(signature = (patches, ids, noise))]
+        fn infer<'py>(
+            &mut self,
+            py: Python<'py>,
+            patches: PyReadonlyArray2<'py, f32>,
+            ids: PyReadonlyArray1<'py, u32>,
+            noise: PyReadonlyArray2<'py, f32>,
+        ) -> PyResult<(Bound<'py, PyArray2<f32>>, (f32, f32, f32))> {
+            const VT: usize = 768;
+            const VPW: usize = 588;
+            const HOR: usize = 50;
+            const ADIM: usize = 32;
+            const GD: usize = 7;
+            let ps = patches.shape();
+            if ps != [VT, VPW] {
+                return Err(PyValueError::new_err(format!(
+                    "GeServeModel.infer: patches expected [{VT}, {VPW}], got {ps:?}"
+                )));
+            }
+            let ns = noise.shape();
+            if ns != [HOR, ADIM] {
+                return Err(PyValueError::new_err(format!(
+                    "GeServeModel.infer: noise expected [{HOR}, {ADIM}], got {ns:?}"
+                )));
+            }
+            let ids = ids
+                .as_slice()
+                .map_err(|_| PyValueError::new_err("ids must be C-contiguous uint32"))?
+                .to_vec();
+            if ids.len() != self.serve.tokens {
+                return Err(PyValueError::new_err(format!(
+                    "GeServeModel.infer: ids length {} != bucket tokens {}（挑桶错）",
+                    ids.len(),
+                    self.serve.tokens
+                )));
+            }
+            let p16: Vec<f16> = patches
+                .as_slice()
+                .map_err(|_| PyValueError::new_err("patches must be C-contiguous float32"))?
+                .iter()
+                .map(|&v| f16::from_f32(v))
+                .collect();
+            let n16: Vec<f16> = noise
+                .as_slice()
+                .map_err(|_| PyValueError::new_err("noise must be C-contiguous float32"))?
+                .iter()
+                .map(|&v| f16::from_f32(v))
+                .collect();
+            let out = self.serve.infer(&self.backend, &p16, &ids, &n16);
+            let mut a7: Vec<f32> = Vec::with_capacity(HOR * GD);
+            for r in 0..HOR {
+                for c in 0..GD {
+                    a7.push(out.actions[r * ADIM + c].to_f32());
+                }
+            }
+            let ms = (out.vision_ms, out.prefix_ms, out.flow_ms);
+            self.last_ms.set(ms);
+            let arr = Array2::from_shape_vec((HOR, GD), a7).map_err(runtime_err)?;
+            Ok((arr.into_pyarray_bound(py), ms))
+        }
+
+        /// Bucket token length L.
+        #[getter]
+        fn tokens(&self) -> usize {
+            self.serve.tokens
+        }
+
+        /// Whether the GEB_SERVE_FAST device-direct path is active.
+        #[getter]
+        fn fast(&self) -> bool {
+            self.serve.fast
+        }
+
+        /// Last frame's segment timings (vision_ms, prefix_ms, flow_ms).
+        #[getter]
+        fn last_ms(&self) -> (f32, f32, f32) {
+            self.last_ms.get()
+        }
+
+        fn __repr__(&self) -> String {
+            format!(
+                "GeServeModel(tokens={}, fast={}, last_ms={:?})",
+                self.serve.tokens,
+                self.serve.fast,
+                self.last_ms.get()
+            )
+        }
+    }
+}
+
 #[pymodule]
 fn apxinf_py(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<Model>()?;
     module.add_class::<HfTokenizer>()?;
     module.add_class::<PySentencePieceTokenizer>()?;
+    #[cfg(feature = "ascend")]
+    module.add_class::<ge_serve_py::GeServeModel>()?;
     module.add("__version__", env!("CARGO_PKG_VERSION"))?;
     Ok(())
 }

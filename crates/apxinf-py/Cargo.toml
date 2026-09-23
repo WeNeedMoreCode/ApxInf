@@ -15,6 +15,8 @@ crate-type = ["cdylib", "rlib"]
 apxinf-core = { path = "../apxinf-core" }
 apxinf-model = { path = "../apxinf-model" }
 apxinf-tokenizer = { path = "../apxinf-tokenizer", features = ["sentencepiece"] }
+apxinf-ascend = { path = "../apxinf-ascend", optional = true }
+half = "2"
 # Keep pyo3 default features (incl. `macros`); `extension-module` is opt-in
 # below so `cargo test` can still link a Python interpreter for the harness.
 pyo3 = "0.22"
@@ -31,4 +33,4 @@ extension-module = ["pyo3/extension-module"]
 cuda = ["apxinf-model/cuda"]
 # Ascend NPU (310P3) via apxinf-ascend. Kernel ops live; the PI0.5
 # executor registration on Ascend devices is stage-2 work in progress.
-ascend = ["apxinf-model/ascend"]
+ascend = ["apxinf-model/ascend", "dep:apxinf-ascend"]

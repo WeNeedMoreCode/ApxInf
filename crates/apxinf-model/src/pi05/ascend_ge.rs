@@ -6215,9 +6215,10 @@ impl GeServe {
             ("GEB_QKV3", "1"),
             ("GEB_ROPEFLAT", "1"),
             ("GEB_WCONST", "1"),
-            // 拓扑一致性（Seg 构造读，须与 OM 全深构建同值；进程内场景
-            // env 不受控，一律钉死）
-            ("GEB_DEPTH", "18"),
+            // 拓扑一致性（Seg 构造读，须与 OM 构建同值；进程内场景 env
+            // 不受控，钉死生产值）。⚠ 不钉 GEB_DEPTH——分段默认
+            // vision=27 / prefix=18 / flow=18 与 OM 一致，钉 18 会把
+            // vision 砍成 18 层（n_in 187≠277 首跑教训）
             ("GEB_PREFIX_DROP_EMPTY", "256"),
             ("GEB_LAYER_OFFSET", "0"),
         ] {
