@@ -8,6 +8,8 @@
 #[cfg(feature = "ascend")]
 mod ascend_executor;
 #[cfg(feature = "ascend")]
+mod ascend_ge;
+#[cfg(feature = "ascend")]
 mod ascend_runtime;
 #[cfg(feature = "ascend")]
 mod ascend_vla;
@@ -56,6 +58,10 @@ pub use bf16_weights::{bf16_to_device, Bf16LinearWeights};
 pub use ascend_executor::{
     action_layer_ascend, language_layer_ascend, vision_layer_ascend, vision_patch_embed_ascend,
     AscendCaches, AscendRopeCache,
+};
+#[cfg(feature = "ascend")]
+pub use ascend_ge::{
+    optest, seg_e2e, seg_flow, seg_prefix, seg_vision, serve_loop, GeServe, GeServeOut,
 };
 #[cfg(feature = "ascend")]
 pub use ascend_runtime::{AscendPrefixKvCache, Pi05AscendRuntime};
