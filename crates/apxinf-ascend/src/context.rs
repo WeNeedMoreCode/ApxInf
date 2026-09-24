@@ -245,6 +245,55 @@ impl AscendContext {
         )
     }
 
+    /// Stream-ordered host → device copy (async). Caller must keep the host
+    /// slice alive until the stream is synchronized — the DMA reads host
+    /// memory after this call returns.
+    pub fn copy_h2d_async(
+        &self,
+        dst: &DeviceBuffer,
+        host: &[u8],
+        stream: &crate::AscendStream,
+    ) -> Result<()> {
+        assert_eq!(host.len(), dst.len, "h2d length mismatch");
+        self.check(
+            unsafe {
+                ffi::aclrtMemcpyAsync(
+                    dst.ptr,
+                    dst.len,
+                    host.as_ptr() as *const c_void,
+                    host.len(),
+                    ffi::ACL_MEMCPY_HOST_TO_DEVICE,
+                    stream.handle(),
+                )
+            },
+            "aclrtMemcpyAsync h2d",
+        )
+    }
+
+    /// Stream-ordered device → host copy (async). Same lifetime rule for the
+    /// host buffer: not written before the stream sync completes it.
+    pub fn copy_d2h_async(
+        &self,
+        host: &mut [u8],
+        src: &DeviceBuffer,
+        stream: &crate::AscendStream,
+    ) -> Result<()> {
+        assert_eq!(host.len(), src.len, "d2h length mismatch");
+        self.check(
+            unsafe {
+                ffi::aclrtMemcpyAsync(
+                    host.as_mut_ptr() as *mut c_void,
+                    host.len(),
+                    src.ptr,
+                    src.len,
+                    ffi::ACL_MEMCPY_DEVICE_TO_HOST,
+                    stream.handle(),
+                )
+            },
+            "aclrtMemcpyAsync d2h",
+        )
+    }
+
     /// Stream-ordered memset (capturable: used as ACLGraph payload).
     pub fn memset_async(&self, buf: &DeviceBuffer, value: u8, stream: &crate::AscendStream) -> Result<()> {
         self.check(

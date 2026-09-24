@@ -1368,39 +1368,36 @@ impl VisionMech {
     /// （replay 同式）
     fn one_frame(&mut self, ctx: &AscendContext, stream: &AscendStream, patches: &[f16]) -> Vec<f16> {
         assert_eq!(patches.len() * 2, self.s.binds[0].len(), "serve patches 尺寸不符");
-        // 五分计时：conv(f16→bytes)/h2d/run(enqueue)/sync/dl(d2h 拆转换)
+        // 流水化热路径（2026-09-24 C1）：零拷贝字节视图（LE 主机上
+        // to_le_bytes ≡ raw bytes，wbuf_t 同款 reinterpret）+ 三段全挂流
+        // （h2d → run → d2h 同 stream FIFO，host 只等最后一次 sync）。
+        // 字节流路径与逐元素转换版完全一致 ⇒ 数值 bit 恒等；E4 分解定罪
+        // 的 d2h 3.4ms + dlconv 5.1ms（1.57M 元素 chunks_exact）就此消除。
+        // 计时：enq 三段 + wait。
         let tim = serve_timing();
         let t0 = std::time::Instant::now();
-        let bytes: Vec<u8> = patches.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect();
+        let bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(patches.as_ptr() as *const u8, patches.len() * 2) };
+        ctx.copy_h2d_async(&self.s.binds[0], bytes, stream).expect("serve h2d patches");
         let t1 = std::time::Instant::now();
-        ctx.copy_h2d(&self.s.binds[0], &bytes).expect("serve h2d patches");
-        let t2 = std::time::Instant::now();
         let ins = self.s.ins();
         let refs: Vec<&DeviceBuffer> = self.routs.iter().collect();
         self.s.g.run(&ins, &refs, stream).expect("ge run");
-        let t3 = std::time::Instant::now();
-        drop(stream.synchronize());
-        let t4 = std::time::Instant::now();
-        // download_f16 内联拆分：d2h 与字节→f16 转换分开计时
         let n0 = self.s.g.output_size(0).unwrap() / 2;
-        let mut back = vec![0u8; n0 * 2];
-        ctx.copy_d2h(&self.routs[0], &mut back).expect("serve d2h vision_out");
-        let t5 = std::time::Instant::now();
-        let out: Vec<f16> = back
-            .chunks_exact(2)
-            .map(|c| f16::from_bits(u16::from_le_bytes([c[0], c[1]])))
-            .collect();
+        let mut out: Vec<f16> = vec![f16::from_bits(0); n0];
+        let obytes: &mut [u8] =
+            unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, n0 * 2) };
+        ctx.copy_d2h_async(obytes, &self.routs[0], stream).expect("serve d2h vision_out");
+        let t2 = std::time::Instant::now();
+        drop(stream.synchronize());
         if tim {
             let now = std::time::Instant::now();
             let ms = |us: u128| us as f64 / 1e3;
             println!(
-                "[vt] conv={:.2} h2d={:.2} run={:.2} sync={:.2} d2h={:.2} dlconv={:.2} total={:.2}",
+                "[vt] h2d_enq={:.2} run+d2h_enq={:.2} wait={:.2} total={:.2}",
                 ms((t1 - t0).as_micros()),
                 ms((t2 - t1).as_micros()),
-                ms((t3 - t2).as_micros()),
-                ms((t4 - t3).as_micros()),
-                ms((t5 - t4).as_micros()),
-                ms((now - t5).as_micros()),
+                ms((now - t2).as_micros()),
                 ms((now - t0).as_micros()),
             );
         }
@@ -1431,7 +1428,7 @@ impl PrefixMech {
         token_ids: &[u32],
     ) {
         assert_eq!(vision_out.len(), (VT * PW) as usize, "serve vision_out 尺寸不符");
-        // 五分计时：asm(x0 组装+查表)/conv/h2d/run(enqueue)/sync
+        // 计时：asm(x0 组装+查表)/h2d_enq(零拷贝视图上流)/run/wait
         let tim = serve_timing();
         let t0 = std::time::Instant::now();
         let mut x0 = vision_out[..self.vis_rows].to_vec();
@@ -1447,25 +1444,25 @@ impl PrefixMech {
         }
         let t1 = std::time::Instant::now();
         assert_eq!(x0.len() * 2, self.s.binds[0].len(), "serve x0 尺寸不符");
-        let bytes: Vec<u8> = x0.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect();
+        // 零拷贝字节视图（x0 活到函数尾，async h2d 借用安全）
+        let bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(x0.as_ptr() as *const u8, x0.len() * 2) };
+        ctx.copy_h2d_async(&self.s.binds[0], bytes, stream).expect("serve h2d x0");
         let t2 = std::time::Instant::now();
-        ctx.copy_h2d(&self.s.binds[0], &bytes).expect("serve h2d x0");
-        let t3 = std::time::Instant::now();
         let ins = self.s.ins();
         let refs: Vec<&DeviceBuffer> = self.routs.iter().collect();
         self.s.g.run(&ins, &refs, stream).expect("ge run");
-        let t4 = std::time::Instant::now();
+        let t3 = std::time::Instant::now();
         drop(stream.synchronize());
         if tim {
             let now = std::time::Instant::now();
             let ms = |us: u128| us as f64 / 1e3;
             println!(
-                "[pt] asm={:.2} conv={:.2} h2d={:.2} run={:.2} sync={:.2} total={:.2}",
+                "[pt] asm={:.2} h2d_enq={:.2} run={:.2} wait={:.2} total={:.2}",
                 ms((t1 - t0).as_micros()),
                 ms((t2 - t1).as_micros()),
                 ms((t3 - t2).as_micros()),
-                ms((t4 - t3).as_micros()),
-                ms((now - t4).as_micros()),
+                ms((now - t3).as_micros()),
                 ms((now - t0).as_micros()),
             );
         }
@@ -1607,7 +1604,7 @@ impl FlowMech {
     ) -> Vec<f16> {
         assert_eq!(kv_dev.len(), self.depth * 2, "serve kv 路数不符");
         assert!(!self.style_views.is_empty(), "fast 路径须先构装 styles 驻留");
-        // 分步计时：kv(d2d×36)/conv/h2d/steps(逐步 enqueue，取首/中/末)+sync/dl
+        // 分步计时：kv(d2d×36)/h2d_enq(零拷贝视图上流)/steps(逐步 enqueue)+sync/dl
         let tim = serve_timing();
         let t0 = std::time::Instant::now();
         for i in 0..self.depth * 2 {
@@ -1620,10 +1617,11 @@ impl FlowMech {
                 .expect("serve d2d kv");
         }
         let t1 = std::time::Instant::now();
-        let bytes: Vec<u8> = noise.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect();
+        // 零拷贝字节视图（noise 借用活到函数尾）
+        let bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(noise.as_ptr() as *const u8, noise.len() * 2) };
+        ctx.copy_h2d_async(&self.s.binds[0], bytes, stream).expect("serve h2d noise");
         let t2 = std::time::Instant::now();
-        ctx.copy_h2d(&self.s.binds[0], &bytes).expect("serve h2d noise");
-        let t3 = std::time::Instant::now();
         let nsteps = self.style_views.len();
         let mut enq: Vec<f64> = Vec::with_capacity(nsteps);
         for step in 0..nsteps {
@@ -1654,10 +1652,9 @@ impl FlowMech {
             let now = std::time::Instant::now();
             let ms = |us: u128| us as f64 / 1e3;
             println!(
-                "[ft] kv={:.2} conv={:.2} h2d={:.2} enq[first={:.2} mid={:.2} last={:.2} sum={:.2}] sync={:.2} dl={:.2} total={:.2}",
+                "[ft] kv={:.2} h2d_enq={:.2} enq[first={:.2} mid={:.2} last={:.2} sum={:.2}] sync={:.2} dl={:.2} total={:.2}",
                 ms((t1 - t0).as_micros()),
                 ms((t2 - t1).as_micros()),
-                ms((t3 - t2).as_micros()),
                 enq.first().copied().unwrap_or(0.0),
                 enq.get(nsteps / 2).copied().unwrap_or(0.0),
                 enq.last().copied().unwrap_or(0.0),
