@@ -6284,8 +6284,28 @@ pub fn optest(be: &AscendBackend, which: &str, real: Option<&Pi05Weights>) {
                 assert_eq!(rv.len() % PW as usize, 0, "res0 非 PW 整行");
                 let p = (rv.len() / PW as usize) as i64;
                 let x: Vec<f16> = rv.iter().map(|&v| f16::from_f32(v)).collect();
-                let lay = real.language_layers.get(7).expect("L7 权重");
-                let lw = lw_f16(&lay.mlp.gate); // [in=k, out=n] row-major（gate+up 拼接宽）
+                let lay7 = real.language_layers.get(7).expect("L7 权重");
+                // GEB_QMD_MATRIX：泛化性矩阵选择——p{n}gate=paligemma 主干
+                // layer n 的 mlp.gate（k=2048 吃 res0），a7gate=expert（flow 侧）
+                let spec = std::env::var("GEB_QMD_MATRIX").unwrap_or_else(|_| "p7gate".into());
+                let lw: Vec<f16> = match spec.as_str() {
+                    "p7gate" => lw_f16(&lay7.mlp.gate),
+                    "p0gate" => {
+                        let l = real.language_layers.get(0).expect("L0 权重");
+                        lw_f16(&l.mlp.gate)
+                    }
+                    "p17gate" => {
+                        let l = real.language_layers.get(17).expect("L17 权重");
+                        lw_f16(&l.mlp.gate)
+                    }
+                    "a7gate" => {
+                        let l = real.action_layers.get(7).expect("expert L7 权重");
+                        lw_f16(&l.mlp.gate)
+                    }
+                    other => panic!("GEB_QMD_MATRIX: p7gate|p0gate|p17gate|a7gate, got {other}"),
+                };
+                println!("[qmd] REAL: x=res0[{p},{}] golden, w={spec} mlp.gate", PW);
+                let lw = lw; // [in=k, out=n] row-major（gate+up 拼接宽）
                 assert_eq!(lw.len() % k as usize, 0, "gate 权重非 k 整行");
                 let n2 = (lw.len() / k as usize) as i64;
                 let mut w = vec![f16::from_f32(0.0); (n2 * k) as usize];
@@ -6294,7 +6314,7 @@ pub fn optest(be: &AscendBackend, which: &str, real: Option<&Pi05Weights>) {
                         w[nn * k as usize + kk] = lw[kk * n2 as usize + nn];
                     }
                 }
-                println!("[qmd] REAL: x=res0[{p},{}] golden, w=L07 mlp.gate [{k}x{n2}]", PW);
+                println!("[qmd] REAL: 矩阵 {k}x{n2}");
                 (x, w, p, n2)
             } else {
                 // rand_f16 的第三参是除数（值域 U(±100/div)）——div=1 时 y 饱和
