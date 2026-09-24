@@ -895,6 +895,17 @@ mod ge_serve_py {
     static GE_INIT: OnceLock<Result<(), String>> = OnceLock::new();
 
     fn ge_init_once() -> PyResult<()> {
+        // ⚠ python 宿主内不唤醒 GE 编译会话（默认）：aclgrphBuildInitialize
+        // 会拉起 te fusion 的进程内 python 适配层（py_decouple：向宿主
+        // 解释器动 GIL / dlopen 第二份 libpython），随后进程在 open 尾声
+        // 被 GE 库无信号杀死（strace 排除 SIGSEGV/SIGABRT，TBE 子进程 8 连
+        // "main process disappeared"——见 summary/2026-09-23_engine-integration）。
+        // load-only 管线（OM 预烤，geb_model_load → aclmdlLoadFromMem）是
+        // 纯 ACL runtime，完全不需要编译会话；真要 build（烤桶）走 rust
+        // 宿主二进制。逃生门：APXINF_GE_BUILD_INIT=1 恢复旧行为（排障用）。
+        if std::env::var("APXINF_GE_BUILD_INIT").unwrap_or_default() != "1" {
+            return Ok(());
+        }
         let res = GE_INIT.get_or_init(|| {
             apxinf_ascend::ge_builder::init("Ascend310P3")
                 .map_err(|e| e.to_string())
