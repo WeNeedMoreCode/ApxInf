@@ -895,15 +895,24 @@ mod ge_serve_py {
     static GE_INIT: OnceLock<Result<(), String>> = OnceLock::new();
 
     fn ge_init_once() -> PyResult<()> {
-        // ⚠ python 宿主内不唤醒 GE 编译会话（默认）：aclgrphBuildInitialize
-        // 会拉起 te fusion 的进程内 python 适配层（py_decouple：向宿主
-        // 解释器动 GIL / dlopen 第二份 libpython），随后进程在 open 尾声
-        // 被 GE 库无信号杀死（strace 排除 SIGSEGV/SIGABRT，TBE 子进程 8 连
-        // "main process disappeared"——见 summary/2026-09-23_engine-integration）。
-        // load-only 管线（OM 预烤，geb_model_load → aclmdlLoadFromMem）是
-        // 纯 ACL runtime，完全不需要编译会话；真要 build（烤桶）走 rust
-        // 宿主二进制。逃生门：APXINF_GE_BUILD_INIT=1 恢复旧行为（排障用）。
-        if std::env::var("APXINF_GE_BUILD_INIT").unwrap_or_default() != "1" {
+        // ⚠ 只能在 allow_threads（无 GIL）区内调用：te 的 py_decouple
+        // static path 在 PyGILState_Check()!=0 时 TE_PyEval_SaveThread()
+        // 会偷走调用者的 GIL（GIL 劫持 = open 尾 SEGV 真凶，gdb 定罪
+        // 2026-09-24）。并行编译 forkserver 默认关闭：python 宿主内它与
+        // multiprocessing 相克，是 open 中途静默死亡的必要条件（判决实验
+        // 见 summary/2026-09-24_pyhost-ge-survival-hunt）。
+        if std::env::var("MIN_COMPILE_RESOURCE_USAGE_CTRL")
+            .unwrap_or_default()
+            .is_empty()
+        {
+            std::env::set_var(
+                "MIN_COMPILE_RESOURCE_USAGE_CTRL",
+                "ub_fusion,op_compile",
+            );
+        }
+        // 排障逃生门：APXINF_GE_NO_BUILD_INIT=1 跳过编译会话（构图随后
+        // panic——OperatorFactory 依赖 FE init，仅用于隔离实验）
+        if std::env::var("APXINF_GE_NO_BUILD_INIT").unwrap_or_default() == "1" {
             return Ok(());
         }
         let res = GE_INIT.get_or_init(|| {
@@ -939,16 +948,34 @@ mod ge_serve_py {
         /// * `fast` — GEB_SERVE_FAST device-direct path (default true).
         #[staticmethod]
         #[pyo3(signature = (om_dir, tokens, ckpt, fast=true))]
-        fn open(om_dir: PathBuf, tokens: usize, ckpt: PathBuf, fast: bool) -> PyResult<Self> {
-            ge_init_once()?;
-            let real = Pi05Weights::from_safetensors(&Pi05Config::default(), &ckpt)
-                .map_err(runtime_err)?;
-            let backend = AscendBackend::new(0).map_err(runtime_err)?;
-            let om_dir = om_dir
+        fn open(
+            py: Python<'_>,
+            om_dir: PathBuf,
+            tokens: usize,
+            ckpt: PathBuf,
+            fast: bool,
+        ) -> PyResult<Self> {
+            let om_dir_s = om_dir
                 .to_str()
                 .ok_or_else(|| PyValueError::new_err("om_dir must be a utf-8 path"))?
                 .to_owned();
-            let serve = GeServe::open(&backend, &real, &om_dir, tokens, fast);
+            // ⚠ init+构图+open 主体必须跑在无 GIL 区（allow_threads）：
+            // GE te fusion 的 python 适配层（py_decouple static path——python
+            // 宿主内 dlsym 命中宿主符号）在 PyGILState_Check()!=0 时
+            // TE_PyEval_SaveThread() 会偷走 PyO3 持有的 GIL 并存走 thread
+            // state；open 完成后 into_py 分配 python 对象时 pymalloc
+            // get_state() 读烂状态直接 SEGV（gdb 栈定罪 2026-09-24，见
+            // summary/2026-09-24_pyhost-ge-survival-hunt）。无 GIL 进入 ⇒
+            // te 不触发 SaveThread，其内部 python 调用自走
+            // PyGILState_Ensure/Release，宿主线程状态全程完好。
+            let (backend, serve) = py.allow_threads(|| -> PyResult<(AscendBackend, GeServe)> {
+                ge_init_once()?;
+                let real = Pi05Weights::from_safetensors(&Pi05Config::default(), &ckpt)
+                    .map_err(runtime_err)?;
+                let backend = AscendBackend::new(0).map_err(runtime_err)?;
+                let serve = GeServe::open(&backend, &real, &om_dir_s, tokens, fast);
+                Ok((backend, serve))
+            })?;
             Ok(Self {
                 backend,
                 serve,
