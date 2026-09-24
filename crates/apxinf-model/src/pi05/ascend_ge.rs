@@ -6271,12 +6271,82 @@ pub fn optest(be: &AscendBackend, which: &str, real: Option<&Pi05Weights>) {
             let n = 8192i64;
             let tw = std::env::var("GEB_QMD_TW").unwrap_or_else(|_| "1".into()) == "1";
             let mut seed = 0xC2C2u32;
-            // rand_f16 的第三参是除数（值域 U(±100/div)）——div=1 时 y 饱和
-            // 65504（C1 探针数据教训同源），div=100 → U(±1) 健康
-            let x_h = rand_f16((m * k) as usize, &mut seed, 100.0);
-            let w_h = rand_f16((n * k) as usize, &mut seed, 100.0); // 逻辑 [n,k] 行=输出通道
+            // GEB_QMD_REAL=1：L2 真权重+真激活执行差判决——w = GEB_CKPT 的
+            // paligemma L07 mlp.gate（L1 误差谱 worst 段），x = GEB_E2E_GOLDEN
+            // 的 res0（真激活分布，Gemma outlier 在激活侧的真实考验）
+            let (x_h, w_h, m, n) = if std::env::var("GEB_QMD_REAL").is_ok() {
+                let real = real.expect("GEB_QMD_REAL 需要 GEB_CKPT");
+                let gpath =
+                    std::env::var("GEB_E2E_GOLDEN").expect("GEB_QMD_REAL 需要 GEB_E2E_GOLDEN");
+                let (t, _) = apxinf_loader::safetensors::load_native_path(std::path::Path::new(&gpath))
+                    .expect("golden load");
+                let rv = t.get("res0").expect("golden 缺 res0").to_f32_vec().unwrap();
+                assert_eq!(rv.len() % PW as usize, 0, "res0 非 PW 整行");
+                let p = (rv.len() / PW as usize) as i64;
+                let x: Vec<f16> = rv.iter().map(|&v| f16::from_f32(v)).collect();
+                let lay = real.language_layers.get(7).expect("L7 权重");
+                let lw = lw_f16(&lay.mlp.gate); // [in=k, out=n] row-major（gate+up 拼接宽）
+                assert_eq!(lw.len() % k as usize, 0, "gate 权重非 k 整行");
+                let n2 = (lw.len() / k as usize) as i64;
+                let mut w = vec![f16::from_f32(0.0); (n2 * k) as usize];
+                for nn in 0..n2 as usize {
+                    for kk in 0..k as usize {
+                        w[nn * k as usize + kk] = lw[kk * n2 as usize + nn];
+                    }
+                }
+                println!("[qmd] REAL: x=res0[{p},{}] golden, w=L07 mlp.gate [{k}x{n2}]", PW);
+                (x, w, p, n2)
+            } else {
+                // rand_f16 的第三参是除数（值域 U(±100/div)）——div=1 时 y 饱和
+                // 65504（C1 探针数据教训同源），div=100 → U(±1) 健康
+                (
+                    rand_f16((m * k) as usize, &mut seed, 100.0),
+                    rand_f16((n * k) as usize, &mut seed, 100.0), // 逻辑 [n,k] 行=输出通道
+                    m,
+                    n,
+                )
+            };
+            // GEB_QMD_SMOOTH=1：smoothquant 形态原型——s_k=(max_m|x[:,k]|
+            // max_n|w[:,k]|)^0.5，激活 outlier 通道压平后再量化（W8A8 的
+            // 标准 outlier 缓解；probe 用 host 预乘验证数学，生产可走算子
+            // 原生 smooth_scale 输入或 device 预乘）。数学恒等：
+            // y = Σ(x_k/s_k)·(w_k·s_k)
+            let smooth = std::env::var("GEB_QMD_SMOOTH").is_ok();
+            let (xq_in, wq_in) = if smooth {
+                let t0 = std::time::Instant::now();
+                let x_f: Vec<f32> = x_h.iter().map(|v| v.to_f32()).collect();
+                let w_f0: Vec<f32> = w_h.iter().map(|v| v.to_f32()).collect();
+                let mut s_k = vec![0f32; k as usize];
+                for kk in 0..k as usize {
+                    let mut xm = 0f32;
+                    for mm_ in 0..m as usize {
+                        xm = xm.max(x_f[mm_ * k as usize + kk].abs());
+                    }
+                    let mut wm = 1e-12f32;
+                    for nn in 0..n as usize {
+                        wm = wm.max(w_f0[nn * k as usize + kk].abs());
+                    }
+                    s_k[kk] = (xm / wm).max(1e-12).sqrt();
+                }
+                let x2: Vec<f16> = x_f
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &v)| f16::from_f32(v / s_k[i % k as usize]))
+                    .collect();
+                let w2: Vec<f16> = w_f0
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &v)| f16::from_f32(v * s_k[i % k as usize]))
+                    .collect();
+                let sm_max = s_k.iter().fold(0f64, |a, &v| a.max(v as f64));
+                let sm_min = s_k.iter().fold(1e30f64, |a, &v| a.min(v as f64));
+                println!("[qmd] SMOOTH: s_k ∈ [{sm_min:.3},{sm_max:.3}]，变换 {:.1}ms", t0.elapsed().as_secs_f64() * 1e3);
+                (x2, w2)
+            } else {
+                (x_h.clone(), w_h.clone())
+            };
             // per-channel int8 量化（host）：s_n = max_k|w[n,:]|/127
-            let w_f32: Vec<f32> = w_h.iter().map(|v| v.to_f32()).collect();
+            let w_f32: Vec<f32> = wq_in.iter().map(|v| v.to_f32()).collect();
             let mut scale = vec![0f32; n as usize];
             let mut w_q = vec![0i8; (n * k) as usize]; // [n,k] row-major
             for nn in 0..n as usize {
@@ -6297,7 +6367,7 @@ pub fn optest(be: &AscendBackend, which: &str, real: Option<&Pi05Weights>) {
             // transpose_weight=true（默认，linear 风格 [n,k]）——torch_npu
             // auto_generated_ge_raw_ops.py 原文）
             let mut sq = Seg::new("qmd_q");
-            sq.data(ctx, "x", &[m, k], &x_h);
+            sq.data(ctx, "x", &[m, k], &xq_in);
             let w_dims: &[i64] = if tw { &[n, k] } else { &[k, n] };
             if tw {
                 // transpose_weight=true：weight = linear 风格 [n,k]（[out,in]）
@@ -6378,7 +6448,7 @@ pub fn optest(be: &AscendBackend, which: &str, real: Option<&Pi05Weights>) {
             }
             println!("[qmd] Q-vs-F 全量: max_diff={md_qf:.4} rel={:.3}%（|y|max={nrm:.1}）", md_qf / nrm * 100.0);
             // —— 对拍 2：host 双参考（前 32 行）判激活量化语义
-            let x_f32: Vec<f32> = x_h.iter().map(|v| v.to_f32()).collect();
+            let x_f32: Vec<f32> = xq_in.iter().map(|v| v.to_f32()).collect();
             let rows_ref = 32usize;
             let mut md_w8a16 = 0f32;
             let mut md_w8a8 = 0f32;
