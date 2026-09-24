@@ -1368,13 +1368,43 @@ impl VisionMech {
     /// （replay 同式）
     fn one_frame(&mut self, ctx: &AscendContext, stream: &AscendStream, patches: &[f16]) -> Vec<f16> {
         assert_eq!(patches.len() * 2, self.s.binds[0].len(), "serve patches 尺寸不符");
+        // 五分计时：conv(f16→bytes)/h2d/run(enqueue)/sync/dl(d2h 拆转换)
+        let tim = serve_timing();
+        let t0 = std::time::Instant::now();
         let bytes: Vec<u8> = patches.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect();
+        let t1 = std::time::Instant::now();
         ctx.copy_h2d(&self.s.binds[0], &bytes).expect("serve h2d patches");
+        let t2 = std::time::Instant::now();
         let ins = self.s.ins();
         let refs: Vec<&DeviceBuffer> = self.routs.iter().collect();
         self.s.g.run(&ins, &refs, stream).expect("ge run");
+        let t3 = std::time::Instant::now();
         drop(stream.synchronize());
-        download_f16(ctx, &self.routs[0], self.s.g.output_size(0).unwrap() / 2)
+        let t4 = std::time::Instant::now();
+        // download_f16 内联拆分：d2h 与字节→f16 转换分开计时
+        let n0 = self.s.g.output_size(0).unwrap() / 2;
+        let mut back = vec![0u8; n0 * 2];
+        ctx.copy_d2h(&self.routs[0], &mut back).expect("serve d2h vision_out");
+        let t5 = std::time::Instant::now();
+        let out: Vec<f16> = back
+            .chunks_exact(2)
+            .map(|c| f16::from_bits(u16::from_le_bytes([c[0], c[1]])))
+            .collect();
+        if tim {
+            let now = std::time::Instant::now();
+            let ms = |us: u128| us as f64 / 1e3;
+            println!(
+                "[vt] conv={:.2} h2d={:.2} run={:.2} sync={:.2} d2h={:.2} dlconv={:.2} total={:.2}",
+                ms((t1 - t0).as_micros()),
+                ms((t2 - t1).as_micros()),
+                ms((t3 - t2).as_micros()),
+                ms((t4 - t3).as_micros()),
+                ms((t5 - t4).as_micros()),
+                ms((now - t5).as_micros()),
+                ms((now - t0).as_micros()),
+            );
+        }
+        out
     }
 }
 
@@ -1401,6 +1431,9 @@ impl PrefixMech {
         token_ids: &[u32],
     ) {
         assert_eq!(vision_out.len(), (VT * PW) as usize, "serve vision_out 尺寸不符");
+        // 五分计时：asm(x0 组装+查表)/conv/h2d/run(enqueue)/sync
+        let tim = serve_timing();
+        let t0 = std::time::Instant::now();
         let mut x0 = vision_out[..self.vis_rows].to_vec();
         x0.reserve(token_ids.len() * self.vocab_w);
         for &id in token_ids {
@@ -1412,13 +1445,30 @@ impl PrefixMech {
                     .map(|&v| f16::from_f32(v * self.lang_scale)),
             );
         }
+        let t1 = std::time::Instant::now();
         assert_eq!(x0.len() * 2, self.s.binds[0].len(), "serve x0 尺寸不符");
         let bytes: Vec<u8> = x0.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect();
+        let t2 = std::time::Instant::now();
         ctx.copy_h2d(&self.s.binds[0], &bytes).expect("serve h2d x0");
+        let t3 = std::time::Instant::now();
         let ins = self.s.ins();
         let refs: Vec<&DeviceBuffer> = self.routs.iter().collect();
         self.s.g.run(&ins, &refs, stream).expect("ge run");
+        let t4 = std::time::Instant::now();
         drop(stream.synchronize());
+        if tim {
+            let now = std::time::Instant::now();
+            let ms = |us: u128| us as f64 / 1e3;
+            println!(
+                "[pt] asm={:.2} conv={:.2} h2d={:.2} run={:.2} sync={:.2} total={:.2}",
+                ms((t1 - t0).as_micros()),
+                ms((t2 - t1).as_micros()),
+                ms((t3 - t2).as_micros()),
+                ms((t4 - t3).as_micros()),
+                ms((now - t4).as_micros()),
+                ms((now - t0).as_micros()),
+            );
+        }
     }
 
     /// 一帧 prefix（legacy host 中转）：one_frame_dev 后 36 路 kv 下载
@@ -1557,6 +1607,9 @@ impl FlowMech {
     ) -> Vec<f16> {
         assert_eq!(kv_dev.len(), self.depth * 2, "serve kv 路数不符");
         assert!(!self.style_views.is_empty(), "fast 路径须先构装 styles 驻留");
+        // 分步计时：kv(d2d×36)/conv/h2d/steps(逐步 enqueue，取首/中/末)+sync/dl
+        let tim = serve_timing();
+        let t0 = std::time::Instant::now();
         for i in 0..self.depth * 2 {
             assert_eq!(
                 kv_dev[i].len(),
@@ -1566,9 +1619,13 @@ impl FlowMech {
             ctx.copy_d2d_async(&self.s.binds[self.pk_base + i], kv_dev[i], stream)
                 .expect("serve d2d kv");
         }
+        let t1 = std::time::Instant::now();
         let bytes: Vec<u8> = noise.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect();
+        let t2 = std::time::Instant::now();
         ctx.copy_h2d(&self.s.binds[0], &bytes).expect("serve h2d noise");
+        let t3 = std::time::Instant::now();
         let nsteps = self.style_views.len();
+        let mut enq: Vec<f64> = Vec::with_capacity(nsteps);
         for step in 0..nsteps {
             let ins: Vec<&DeviceBuffer> = self
                 .ins_order
@@ -1579,14 +1636,38 @@ impl FlowMech {
                 })
                 .collect();
             let oref: Vec<&DeviceBuffer> = vec![&self.ob];
+            let te = std::time::Instant::now();
             self.s.g.run(&ins, &oref, stream).expect("ge run");
+            if tim {
+                enq.push(te.elapsed().as_secs_f64() * 1e3);
+            }
             if step + 1 < nsteps {
                 // x 驻留：本步输出 → 下步 state（同流有序，免 d2h+h2d+sync）
                 ctx.copy_d2d_async(&self.s.binds[0], &self.ob, stream).expect("serve d2d x");
             }
         }
+        let t4 = std::time::Instant::now();
         drop(stream.synchronize());
-        download_f16(ctx, &self.ob, (HOR * ADIM) as usize)
+        let t5 = std::time::Instant::now();
+        let out = download_f16(ctx, &self.ob, (HOR * ADIM) as usize);
+        if tim {
+            let now = std::time::Instant::now();
+            let ms = |us: u128| us as f64 / 1e3;
+            println!(
+                "[ft] kv={:.2} conv={:.2} h2d={:.2} enq[first={:.2} mid={:.2} last={:.2} sum={:.2}] sync={:.2} dl={:.2} total={:.2}",
+                ms((t1 - t0).as_micros()),
+                ms((t2 - t1).as_micros()),
+                ms((t3 - t2).as_micros()),
+                enq.first().copied().unwrap_or(0.0),
+                enq.get(nsteps / 2).copied().unwrap_or(0.0),
+                enq.last().copied().unwrap_or(0.0),
+                enq.iter().sum::<f64>(),
+                ms((t5 - t4).as_micros()),
+                ms((now - t5).as_micros()),
+                ms((now - t0).as_micros()),
+            );
+        }
+        out
     }
 }
 
@@ -1635,6 +1716,12 @@ pub fn norm32_enabled() -> bool {
 /// 里未设时不误触）
 pub fn serve_fast() -> bool {
     std::env::var("GEB_SERVE_FAST").map(|v| !v.is_empty()).unwrap_or(false)
+}
+
+/// GEB_SERVE_TIMING：serve 热路径段内分步计时（conv/h2d/run/sync/dl）——
+/// C1 段 glue 归因（2026-09-24）。只加 Instant 戳不改数据流，数值恒等。
+pub fn serve_timing() -> bool {
+    std::env::var("GEB_SERVE_TIMING").is_ok()
 }
 
 /// NORM32 常量池已内聚到 Seg（n32_c/n32_consts）——v1 的 Data 标量池
