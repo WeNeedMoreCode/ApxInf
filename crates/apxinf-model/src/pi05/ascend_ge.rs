@@ -1427,6 +1427,11 @@ pub struct PrefixMech {
     vis_rows: usize,   // (VT-drop_v)*PW——空视图剔除后的可见行
     nkv: usize,        // depth*2
     vocab_w: usize,
+    /// token 查表缓存：prompt 跨 replan 恒定（同任务 L 桶内 token_ids
+    /// 不变），查表+scale 的 f16 行缓存一次复用——asm 2.5ms 的主体。
+    /// 数值恒等：同 ids 同算式（f32 mul 确定性）产同字节
+    tok_cache_ids: Vec<u32>,
+    tok_cache_rows: Vec<f16>,
 }
 
 impl PrefixMech {
@@ -1445,17 +1450,24 @@ impl PrefixMech {
         // 计时：asm(x0 组装+查表)/h2d_enq(零拷贝视图上流)/run/wait
         let tim = serve_timing();
         let t0 = std::time::Instant::now();
-        let mut x0 = vision_out[..self.vis_rows].to_vec();
-        x0.reserve(token_ids.len() * self.vocab_w);
-        for &id in token_ids {
-            let r = id as usize * self.vocab_w;
-            assert!(r + self.vocab_w <= self.emb.len(), "token id {id} 超 vocab");
-            x0.extend(
-                self.emb[r..r + self.vocab_w]
-                    .iter()
-                    .map(|&v| f16::from_f32(v * self.lang_scale)),
-            );
+        // token 查表缓存：ids 变化才重算（prompt 跨 replan 恒定——同任务
+        // 桶内 token_ids 不变）。数值恒等：同算式（f32 mul）产同 f16 字节
+        if self.tok_cache_ids != token_ids {
+            let mut rows: Vec<f16> = Vec::with_capacity(token_ids.len() * self.vocab_w);
+            for &id in token_ids {
+                let r = id as usize * self.vocab_w;
+                assert!(r + self.vocab_w <= self.emb.len(), "token id {id} 超 vocab");
+                rows.extend(
+                    self.emb[r..r + self.vocab_w]
+                        .iter()
+                        .map(|&v| f16::from_f32(v * self.lang_scale)),
+                );
+            }
+            self.tok_cache_ids = token_ids.to_vec();
+            self.tok_cache_rows = rows;
         }
+        let mut x0 = vision_out[..self.vis_rows].to_vec();
+        x0.extend_from_slice(&self.tok_cache_rows);
         let t1 = std::time::Instant::now();
         assert_eq!(x0.len() * 2, self.s.binds[0].len(), "serve x0 尺寸不符");
         // 零拷贝字节视图（x0 活到函数尾，async h2d 借用安全）
@@ -3003,6 +3015,8 @@ pub fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e
                 nkv: depth * 2,
                 vocab_w: PW as usize,
                 emb,
+                tok_cache_ids: Vec::new(),
+                tok_cache_rows: Vec::new(),
             });
         }
         return;
