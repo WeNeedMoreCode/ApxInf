@@ -413,6 +413,20 @@ impl Seg {
         name.to_string()
     }
 
+    /// int8 Data 输入（C2 int8 probe：QuantMatmulDequant 的量化权重/scale）
+    fn data_i8(&mut self, ctx: &AscendContext, name: &str, dims: &[i64], host: &[i8]) -> String {
+        let bytes: Vec<u8> = host.iter().map(|&v| v as u8).collect();
+        let buf = upload_bytes(ctx, &bytes);
+        self.g.add_data(name, self.idx, dims, Dtype::Int8).unwrap();
+        self.idx += 1;
+        self.names.push(name.to_string());
+        self.shapes.push(dims.to_vec());
+        self.binds.push(buf);
+        self.data_inputs.push(self.binds.len() - 1);
+        self.datas.insert(name.to_string());
+        name.to_string()
+    }
+
     /// Const shape 张量（非图输入，编译期常量折叠）。⚠ shape 类输入用
     /// data_i32（Data）会让消费算子（Reshape/LayerNormV4）输出 desc 变
     /// unknown → DynamicShapePartitioner 拆子图 → unknown 部分走 host
@@ -6242,7 +6256,190 @@ pub fn optest(be: &AscendBackend, which: &str, real: Option<&Pi05Weights>) {
                 std::fs::write(format!("/tmp/wmm5_{dn}.f16"), &bytes).expect("dump");
             }
         }
-        other => panic!("GEB_OPTEST: ...|v3n|tldn|lnv4c|asc*|ma*|bc4|wgt|oproj|arm|attn|wmm|wmm2|wmm3|wmm4|wmm5, got {other}"),
+        // qmd: C2 int8/w8a8 单算 probe（2026-09-24）——310P 注册表命中
+        // QuantMatmulDequant（x f16 / quantized_weight int8 / weight_scale
+        // f32 → y f16，fused 激活量化→int8 cube→反量化）。三连判决：
+        // ① 编译过否（注册表存在 ≠ 预编译 kernel）② 数值（vs 同形 f16
+        // MatMulV2 生产链 + host W8A16/W8A8 双参考，判内部激活量化语义）
+        // ③ 性能（vs f16 MatMulV2，6× cube 算力兑现度）。形状 = prefix
+        // 主战场 m=832 k=2048 n=8192（gate_up 量级）。GEB_QMD_TW=1 翻
+        // transpose_weight 布局约定（对冲 desc 语义读错的风险）。
+        "qmd" => {
+            let stream = be.stream();
+            let m = 832i64;
+            let k = 2048i64;
+            let n = 8192i64;
+            let tw = std::env::var("GEB_QMD_TW").unwrap_or_else(|_| "1".into()) == "1";
+            let mut seed = 0xC2C2u32;
+            // rand_f16 的第三参是除数（值域 U(±100/div)）——div=1 时 y 饱和
+            // 65504（C1 探针数据教训同源），div=100 → U(±1) 健康
+            let x_h = rand_f16((m * k) as usize, &mut seed, 100.0);
+            let w_h = rand_f16((n * k) as usize, &mut seed, 100.0); // 逻辑 [n,k] 行=输出通道
+            // per-channel int8 量化（host）：s_n = max_k|w[n,:]|/127
+            let w_f32: Vec<f32> = w_h.iter().map(|v| v.to_f32()).collect();
+            let mut scale = vec![0f32; n as usize];
+            let mut w_q = vec![0i8; (n * k) as usize]; // [n,k] row-major
+            for nn in 0..n as usize {
+                let base = nn * k as usize;
+                let mut mx = 0f32;
+                for &v in &w_f32[base..base + k as usize] {
+                    mx = mx.max(v.abs());
+                }
+                let s = (mx / 127.0).max(1e-12);
+                scale[nn] = s;
+                for kk in 0..k as usize {
+                    let qv = (w_f32[base + kk] / s).round().clamp(-127.0, 127.0);
+                    w_q[base + kk] = qv as i8;
+                }
+            }
+            // —— 链 Q：QuantMatmulDequant（IR 契约：x f16 / quantized_weight
+            // int8 / weight_scale f32 → y f16；ATTR x_quant_mode="pertoken"（默认）、
+            // transpose_weight=true（默认，linear 风格 [n,k]）——torch_npu
+            // auto_generated_ge_raw_ops.py 原文）
+            let mut sq = Seg::new("qmd_q");
+            sq.data(ctx, "x", &[m, k], &x_h);
+            let w_dims: &[i64] = if tw { &[n, k] } else { &[k, n] };
+            if tw {
+                // transpose_weight=true：weight = linear 风格 [n,k]（[out,in]）
+                sq.data_i8(ctx, "wq", w_dims, &w_q);
+            } else {
+                // transpose_weight=false：数学直乘布局 [k,n] 转置存储
+                let mut wqt = vec![0i8; (n * k) as usize];
+                for nn in 0..n as usize {
+                    for kk in 0..k as usize {
+                        wqt[kk * n as usize + nn] = w_q[nn * k as usize + kk];
+                    }
+                }
+                sq.data_i8(ctx, "wq", w_dims, &wqt);
+            }
+            sq.data_f32(ctx, "ws", &[n], &scale);
+            sq.g.add_op("op", "QuantMatmulDequant").unwrap();
+            sq.g.set_input_desc("op", "x", &[m, k], Dtype::Fp16).unwrap();
+            sq.g.set_input_desc("op", "quantized_weight", w_dims, Dtype::Int8).unwrap();
+            sq.g.set_input_desc("op", "weight_scale", &[n], Dtype::Fp32).unwrap();
+            sq.g.set_output_desc("op", "y", &[m, n], Dtype::Fp16).unwrap();
+            sq.g.set_attr_bool("op", "transpose_weight", tw).unwrap();
+            sq.g.set_attr_str("op", "x_quant_mode", "pertoken").unwrap();
+            sq.g.link("op", "x", "x").unwrap();
+            sq.g.link("op", "quantized_weight", "wq").unwrap();
+            sq.g.link("op", "weight_scale", "ws").unwrap();
+            sq.reg_out("op", "y");
+            sq.finish(&["op"]);
+            // —— 链 F：f16 MatMulV2 基线（POC 验证过的无转置形态：
+            // transpose_x2=false + desc [k,n] + 字节 = w 的 [k,n] 排列——
+            // transpose_x2=true 路径要求 NzCache 转置字节，裸 [n,k] 会读错）
+            let mut w_t = vec![f16::from_f32(0.0); (n * k) as usize];
+            for nn in 0..n as usize {
+                for kk in 0..k as usize {
+                    w_t[kk * n as usize + nn] = w_h[nn * k as usize + kk];
+                }
+            }
+            let stat = |v: &[f16]| {
+                let n_ = v.len() as f64;
+                let mean = v.iter().map(|x| x.to_f32() as f64).sum::<f64>() / n_;
+                let var = v.iter().map(|x| (x.to_f32() as f64 - mean).powi(2)).sum::<f64>() / n_;
+                let mx = v.iter().fold(0f32, |a, x| a.max(x.to_f32().abs()));
+                format!("mean={mean:.3} std={:.3} |max|={mx:.2}", var.sqrt())
+            };
+            println!("[qmd] x 统计: {}", stat(&x_h));
+            println!("[qmd] w 统计: {}", stat(&w_h));
+            let mut sf = Seg::new("qmd_f");
+            sf.data(ctx, "x", &[m, k], &x_h);
+            sf.data(ctx, "wf", &[k, n], &w_t);
+            sf.g.add_op("opf", "MatMulV2").unwrap();
+            sf.g.set_input_desc("opf", "x1", &[m, k], Dtype::Fp16).unwrap();
+            sf.g.set_input_desc("opf", "x2", &[k, n], Dtype::Fp16).unwrap();
+            sf.g.set_output_desc("opf", "y", &[m, n], Dtype::Fp16).unwrap();
+            sf.g.set_attr_bool("opf", "transpose_x1", false).unwrap();
+            sf.g.set_attr_bool("opf", "transpose_x2", false).unwrap();
+            sf.wire("opf", "x1", "x");
+            sf.wire("opf", "x2", "wf");
+            sf.reg_out("opf", "y");
+            sf.finish(&["opf"]);
+            // —— 运行 + 下载
+            let run_seg = |s: &mut Seg, tag: &str| -> Vec<f16> {
+                let ins: Vec<&DeviceBuffer> = s.ins();
+                let sz = s.g.output_size(0).unwrap();
+                let ob = ctx.malloc(sz).unwrap();
+                s.g.run(&ins, &[&ob], stream).unwrap();
+                drop(stream.synchronize());
+                let y = download_f16(ctx, &ob, sz / 2);
+                println!("[qmd] {tag} y[0..4]={:?} |max|={:.2}", &y[..4.min(y.len())], y.iter().fold(0f32, |a, v| a.max(v.to_f32().abs())));
+                y
+            };
+            let y_q = run_seg(&mut sq, "Q");
+            let y_f = run_seg(&mut sf, "F");
+            // —— 对拍 1：量化执行 vs f16 执行（全量）
+            let mut md_qf = 0f32;
+            let mut nrm = 0f32;
+            for (q, f) in y_q.iter().zip(y_f.iter()) {
+                md_qf = md_qf.max((q.to_f32() - f.to_f32()).abs());
+                nrm = nrm.max(f.to_f32().abs());
+            }
+            println!("[qmd] Q-vs-F 全量: max_diff={md_qf:.4} rel={:.3}%（|y|max={nrm:.1}）", md_qf / nrm * 100.0);
+            // —— 对拍 2：host 双参考（前 32 行）判激活量化语义
+            let x_f32: Vec<f32> = x_h.iter().map(|v| v.to_f32()).collect();
+            let rows_ref = 32usize;
+            let mut md_w8a16 = 0f32;
+            let mut md_w8a8 = 0f32;
+            for mm_ in 0..rows_ref.min(m as usize) {
+                let rb = mm_ * k as usize;
+                let mut mx = 0f32;
+                for kk in 0..k as usize {
+                    mx = mx.max(x_f32[rb + kk].abs());
+                }
+                let sx = (mx / 127.0).max(1e-12);
+                for nn in 0..n as usize {
+                    let wb = nn * k as usize;
+                    let mut a16 = 0f32;
+                    let mut a8 = 0f32;
+                    for kk in 0..k as usize {
+                        let xv = x_f32[rb + kk];
+                        let wv = w_q[wb + kk] as f32;
+                        a16 += xv * wv;
+                        a8 += (xv / sx).round().clamp(-127.0, 127.0) * wv;
+                    }
+                    let y16 = a16 * scale[nn];
+                    let y8 = a8 * scale[nn] * sx;
+                    let got = y_q[mm_ * n as usize + nn].to_f32();
+                    md_w8a16 = md_w8a16.max((got - y16).abs());
+                    md_w8a8 = md_w8a8.max((got - y8).abs());
+                }
+            }
+            println!(
+                "[qmd] host 参考切片×{rows_ref}: W8A16 max_diff={md_w8a16:.4} / W8A8 max_diff={md_w8a8:.4}（小者 = 内部激活量化模式）"
+            );
+            // —— bench：两链各 rounds×per（run+sync median）
+            let bench_seg = |s: &mut Seg, tag: &str| {
+                let ins: Vec<&DeviceBuffer> = s.ins();
+                let sz = s.g.output_size(0).unwrap();
+                let ob = ctx.malloc(sz).unwrap();
+                for _ in 0..3 {
+                    s.g.run(&ins, &[&ob], stream).unwrap();
+                }
+                drop(stream.synchronize());
+                let rounds = envi("GEB_ROUNDS", 30) as usize;
+                let per = envi("GEB_PER", 5).max(1) as usize;
+                let mut ts = Vec::new();
+                for r in 0..rounds {
+                    let t0 = std::time::Instant::now();
+                    for _ in 0..per {
+                        s.g.run(&ins, &[&ob], stream).unwrap();
+                    }
+                    drop(stream.synchronize());
+                    if r >= 3 {
+                        ts.push(t0.elapsed().as_secs_f64() * 1e3 / per as f64);
+                    }
+                }
+                ts.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                println!("[qmd] {tag} bench: {:.3} ms (median/{per}, rounds={rounds})", ts[ts.len() / 2]);
+                ts[ts.len() / 2]
+            };
+            let tq = bench_seg(&mut sq, "Q");
+            let tf = bench_seg(&mut sf, "F");
+            println!("[qmd] int8/f16 = {:.2}x（{tq:.3} vs {tf:.3} ms）", tf / tq);
+        }
+        other => panic!("GEB_OPTEST: ...|v3n|tldn|lnv4c|asc*|ma*|bc4|wgt|oproj|arm|attn|wmm|wmm2|wmm3|wmm4|wmm5|qmd, got {other}"),
     }
     println!("OPTEST_{which}_OK");
     ge_builder::fini().expect("fini");

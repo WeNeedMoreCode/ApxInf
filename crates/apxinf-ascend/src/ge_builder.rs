@@ -46,6 +46,7 @@ pub enum Dtype {
     Fp32,
     Int32,
     Int64,
+    Int8,
 }
 
 impl Dtype {
@@ -55,6 +56,7 @@ impl Dtype {
             Dtype::Fp32 => "fp32",
             Dtype::Int32 => "int32",
             Dtype::Int64 => "int64",
+            Dtype::Int8 => "int8",
         })
         .expect("dtype str")
     }
