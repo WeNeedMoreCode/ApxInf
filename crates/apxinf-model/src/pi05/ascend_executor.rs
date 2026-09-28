@@ -80,6 +80,9 @@ pub struct AscendCaches {
     /// the two per-call row_replicate launches were the dominant ada-norm
     /// cost (~400 ada-norm calls x2 broadcasts per inference).
     style_mats: std::collections::HashMap<(usize, i64), (Arc<DeviceBuffer>, Arc<DeviceBuffer>)>,
+    /// Gate broadcast matrices (style 第三段 s2，_gated_residual 的分支门控)
+    /// keyed by (style ptr, rows)——与 style_mats 同生命周期（跨步恒定）。
+    gate_mats: std::collections::HashMap<(usize, i64), Arc<DeviceBuffer>>,
     /// Pre-sliced qkv bias rows, keyed by (bias pointer, start, len).
     kv_biases: std::collections::HashMap<(usize, i64, i64), Arc<DeviceBuffer>>,
     /// Pinned rope position-index rows, keyed by (tokens, heads, offset).
@@ -109,6 +112,7 @@ impl AscendCaches {
             nz: NzCache::new(),
             style_rows: Default::default(),
             style_mats: Default::default(),
+            gate_mats: Default::default(),
             kv_biases: Default::default(),
             pos_idx: Default::default(),
             rope_pos: Default::default(),
@@ -796,6 +800,42 @@ fn zeros_scale_buf(be: &AscendBackend, cache: &mut AscendCaches, cols: usize) ->
     Ok(buf)
 }
 
+/// `_gated_residual` 的 gate 广播矩阵（style 第三段 s2 → [rows, cols] 复制，
+/// 按 (style 指针, rows) 缓存，跨步恒定）。M2 期 eager 残差裸加是技术债
+/// （GE flow 的 gatew 2026-09-23 补齐时 eager 未跟）——2026-09-28 对齐：
+/// residual + branch·gate（与 GE flow 段 agate/mgate 同源）。
+fn style_gate_mat(
+    be: &AscendBackend,
+    cache: &mut AscendCaches,
+    style: &Tensor,
+    rows: i64,
+    cols: i64,
+) -> Result<Arc<DeviceBuffer>> {
+    let key = (tensor_buf(style)?.as_ptr() as usize, rows);
+    if let Some(v) = cache.gate_mats.get(&key) {
+        return Ok(v.clone());
+    }
+    let c = cols as usize;
+    let style_h = host_f16_row(be, style, 3 * c)?;
+    let mut gate_row = vec![0u16; c];
+    for i in 0..c {
+        gate_row[i] = style_h[2 * c + i];
+    }
+    let buf = acl(be.ctx().malloc(c * 2))?;
+    let bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(gate_row.as_ptr() as *const u8, c * 2) };
+    acl(be.ctx().copy_h2d(&buf, bytes))?;
+    let mat = Arc::new(acl(aops::row_replicate_fp16(
+        be.ctx(),
+        be.stream(),
+        &buf,
+        rows,
+        cols,
+    ))?);
+    cache.gate_mats.insert(key, mat.clone());
+    Ok(mat)
+}
+
 fn host_f16_row(be: &AscendBackend, t: &Tensor, len: usize) -> Result<Vec<u16>> {
     let b = tensor_buf(t)?;
     // `t` may be the async product of a matmul on our stream (e.g. the
@@ -920,8 +960,12 @@ pub fn action_layer_ascend(
     let proj = bias_add(be, &proj, weights.output.bias.as_ref(), tokens, width)?;
     // 残差基 = input 本体（cuda bf16_executor 语义：fused::
     // adaptive_gate_residual_rms_bf16(projection, input)）——曾误用
-    // normalized 作残差基，2026-09-23 与 ge_model_probe flow 段同源定罪
-    let res = aq::add(be, &proj, input_b, &[tokens, width])?;
+    // normalized 作残差基，2026-09-23 与 ge_model_probe flow 段同源定罪。
+    // 分支 ×gate（attention style 第三段；_gated_residual 全语义）
+    let agate = style_gate_mat(be, cache, attention_style, tokens, width)?;
+    let gated = aq::mul(be, &proj, &agate, &[tokens, width])?;
+    mark!("attn gated-res");
+    let res = aq::add(be, &gated, input_b, &[tokens, width])?;
     let normed = adaptive_rms(be, cache, &res, mlp_style, tokens, width, rms_eps)?;
     mark!("mlp ada-norm");
 
@@ -942,7 +986,11 @@ pub fn action_layer_ascend(
     let proj2 = aq::matmul(be, &mut cache.nz, &act, [tokens, inter], tensor_buf(&weights.down.weight)?, [inter, width])?;
     mark!("down matmul");
     let proj2 = bias_add(be, &proj2, weights.down.bias.as_ref(), tokens, width)?;
-    let hidden = aq::add(be, &proj2, &res, &[tokens, width])?;
+    // mlp 分支 ×gate（mlp style 第三段；GE flow 的 mgate 同源）
+    let mgate = style_gate_mat(be, cache, mlp_style, tokens, width)?;
+    let gated2 = aq::mul(be, &proj2, &mgate, &[tokens, width])?;
+    mark!("mlp gated-res");
+    let hidden = aq::add(be, &gated2, &res, &[tokens, width])?;
     let next_normalized = adaptive_rms(be, cache, &hidden, next_norm_style, tokens, width, rms_eps)?;
     Ok(ActionLayerOutput {
         hidden: be.wrap_fp16(hidden, vec![tokens as usize, width as usize]),
