@@ -194,6 +194,108 @@ pub fn wbuf_t(ctx: &AscendContext, host: &[f16], rows: i64, cols: i64) -> Device
     upload_bytes(ctx, &t)
 }
 
+// ---------------------------------------------------------------------------
+// C2 生产化：prefix int8（GEB_PREFIX_INT8）——7 投影 mm → QuantMatmulDequant
+// ---------------------------------------------------------------------------
+
+/// GEB_PREFIX_INT8：prefix 7 投影换 QuantMatmulDequant（int8 ND [n,k] +
+/// per-row scale + smooth，算子契约实证见 GEB_OPTEST=qmd / GEB_QMD_NSM）。
+/// f16 回退 = 不设此 env。需真权重 + GEB_QKV3 + GEB_INT8_SMOOTH 因子文件。
+pub fn prefix_int8() -> bool {
+    std::env::var("GEB_PREFIX_INT8").map(|v| !v.is_empty()).unwrap_or(false)
+}
+
+/// 引擎域 smooth 因子（GEB_INT8_SMOOTH safetensors，键 prefix/L{nn}/{proj}）。
+/// 由 smooth_calib_v1.npz（torch 域）经 convert_smooth_engine.py v2 转换
+/// （g 回图方案）：int8 层 AddRmsNorm gamma 用 (1+g) 真值（loader fold 的
+/// 原值替代源），激活侧回 torch 域——纯引擎域 s_eff 会因 L00 近零 fold
+/// 爆到 ±e7（f16 行不可表示，2026-09-28 取证）。
+pub struct Int8Smooth {
+    /// 权重侧吸收因子 f32[k]（= s_npz/(1+g)，仅 f32 权重量化用）
+    pub s_eff: Vec<f32>,
+    /// 算子原生 smooth_scale 输入值 f32[k]（= s_npz，torch 域，f16 安全）
+    pub smooth: Vec<f32>,
+    /// 1/s_npz（GEB_INT8_NATIVE=0 回退路径的行广播值）
+    pub inv: Vec<f32>,
+}
+
+/// smooth 因子文件加载：矩阵因子（s_eff/smooth/inv 三键一组）+ 组 norm
+/// 真值（prefix/L{nn}/g1、g2 = 1+norm_scale，int8 层回 torch 域用）
+pub fn load_int8_smooth(
+    path: &str,
+) -> (
+    std::collections::HashMap<String, Int8Smooth>,
+    std::collections::HashMap<String, [Vec<f32>; 2]>,
+) {
+    let (t, _) = apxinf_loader::safetensors::load_native_path(std::path::Path::new(path))
+        .unwrap_or_else(|e| panic!("GEB_INT8_SMOOTH 加载失败 {path}: {e}"));
+    let mut out = std::collections::HashMap::new();
+    let bases: Vec<String> = t
+        .keys()
+        .filter_map(|k| k.strip_suffix("/s_eff").map(|b| b.to_string()))
+        .collect();
+    assert!(!bases.is_empty(), "{path} 无 */s_eff 键（须为转换后的因子文件）");
+    for base in bases {
+        let get = |suf: &str| -> Vec<f32> {
+            t.get(&format!("{base}{suf}"))
+                .unwrap_or_else(|| panic!("int8 smooth 缺 {base}{suf}"))
+                .to_f32_vec()
+                .unwrap()
+        };
+        out.insert(
+            base.clone(),
+            Int8Smooth { s_eff: get("/s_eff"), smooth: get("/smooth"), inv: get("/inv") },
+        );
+    }
+    let mut norms = std::collections::HashMap::new();
+    for key in t.keys() {
+        for (suf, slot) in [("/g1", 0usize), ("/g2", 1)] {
+            if let Some(base) = key.strip_suffix(suf) {
+                let e = norms.entry(base.to_string()).or_insert([Vec::new(), Vec::new()]);
+                e[slot] = t.get(key).expect("g norm").to_f32_vec().unwrap();
+            }
+        }
+    }
+    (out, norms)
+}
+
+/// W8 行量化（smooth 吸收后）：host w32 [k,n]（in-major，loader f32 权重）
+/// → int8 [n,k] 物理 + per-row scale [n]。与 int8_bake_weights.py 同数学
+/// （f32 域乘、max().max(1e-12)/127、ties-even round、±127 clip）——
+/// GEB_INT8_DUMP 落盘对拍 npz 金标准，期望 bit 级一致（fold 结合律 ulp 除外）。
+/// 转置分块：朴素逐元素在 [2048,16384] 全 cache miss（~130s/18 层量级）。
+pub fn quant_w8(w32: &[f32], k: usize, s_eff: &[f32]) -> (Vec<i8>, Vec<f32>) {
+    let n = w32.len() / k;
+    assert_eq!(w32.len(), n * k, "int8 权重非 k 整行");
+    assert_eq!(s_eff.len(), k, "smooth 因子长度 ≠ k");
+    let mut ws = vec![0f32; n * k]; // [n,k] 物理（转置 + s_eff 吸收一遍完成）
+    for nn0 in (0..n).step_by(64) {
+        let ne = (nn0 + 64).min(n);
+        for kk0 in (0..k).step_by(64) {
+            let ke = (kk0 + 64).min(k);
+            for kk in kk0..ke {
+                let src = kk * n;
+                let sv = s_eff[kk];
+                for nn in nn0..ne {
+                    ws[nn * k + kk] = w32[src + nn] * sv;
+                }
+            }
+        }
+    }
+    let mut scale = vec![0f32; n];
+    let mut wq = vec![0i8; n * k];
+    for nn in 0..n {
+        let row = &ws[nn * k..(nn + 1) * k];
+        let mx = row.iter().fold(0f32, |m, &v| m.max(v.abs()));
+        let s = mx.max(1e-12) / 127.0;
+        scale[nn] = s;
+        for (kk, &v) in row.iter().enumerate() {
+            wq[nn * k + kk] = (v / s).round_ties_even().clamp(-127.0, 127.0) as i8;
+        }
+    }
+    (wq, scale)
+}
+
 /// host LayerNorm 参考（f32 计算）：aclnnAddLayerNorm 在 [768,1152] 有
 /// kernel 级放大（2026-09-19），eager 参考路径的 LN 用 host 计算。
 /// ⚠ 入参 stream 先同步——同步 d2h（aclrtMemcpy）不等待 compute 流上的
@@ -481,6 +583,41 @@ impl Seg {
         self.g.set_attr_bool(name, "transpose_x2", true).unwrap();
         self.wire(name, "x1", a);
         self.g.link(name, "x2", w).unwrap();
+        self.reg_out(name, "y")
+    }
+
+    /// QuantMatmulDequant：a [m,k] × int8 wq [n,k]（transpose_weight=true，
+    /// linear 风格）→ y [m,n]；weight_scale f32 [n]；smooth_scale f16 [k]
+    /// / bias int32 [n] 可选（None = 无该输入）。契约实证 GEB_OPTEST=qmd
+    /// （310P legacy 单算；attr 必须显式设——裸 op 默认值不生效，rc=-7）。
+    /// bias 折入 = 砍层内 TileD+Add 对（Gemma bias=0 → int32 零恒等；
+    /// ⚠ 非零 bias 须按 weight_scale 预量化，v1 只支持零）
+    fn qmd(
+        &mut self, name: &str, a: &str, a_dims: &[i64], wq: &str, w_dims: &[i64],
+        ws: &str, sm: Option<&str>, zb: Option<&str>, n: i64, o: &[i64],
+    ) -> String {
+        self.g.add_op(name, "QuantMatmulDequant").unwrap();
+        self.g.set_input_desc(name, "x", a_dims, Dtype::Fp16).unwrap();
+        self.g.set_input_desc(name, "quantized_weight", w_dims, Dtype::Int8).unwrap();
+        self.g.set_input_desc(name, "weight_scale", &[n], Dtype::Fp32).unwrap();
+        if let Some(sm_name) = sm {
+            self.g.set_input_desc(name, "smooth_scale", &[a_dims[1]], Dtype::Fp16).unwrap();
+        }
+        if let Some(zb_name) = zb {
+            self.g.set_input_desc(name, "bias", &[n], Dtype::Int32).unwrap();
+        }
+        self.g.set_output_desc(name, "y", o, Dtype::Fp16).unwrap();
+        self.g.set_attr_bool(name, "transpose_weight", true).unwrap();
+        self.g.set_attr_str(name, "x_quant_mode", "pertoken").unwrap();
+        self.wire(name, "x", a);
+        self.g.link(name, "quantized_weight", wq).unwrap();
+        self.g.link(name, "weight_scale", ws).unwrap();
+        if let Some(sm_name) = sm {
+            self.g.link(name, "smooth_scale", sm_name).unwrap();
+        }
+        if let Some(zb_name) = zb {
+            self.g.link(name, "bias", zb_name).unwrap();
+        }
         self.reg_out(name, "y")
     }
 
@@ -2550,6 +2687,94 @@ pub fn seg_vision(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e
 // compute_tail=false 语义）
 // ---------------------------------------------------------------------------
 
+/// int8 权重注册：s_eff 吸收量化 → wq int8 [n,k]（Data 或 Const）+ scale
+/// f32 [n] + smooth/inv f16 行 Data（native 开关二选一）。GEB_INT8_DUMP
+/// 同步落盘（L{nn}_{proj}.wq/.scale，对拍 int8_weights_v1.npz 金标准）。
+/// 返回 (wq, ws, smooth|inv) 三名。
+#[allow(clippy::type_complexity)]
+fn reg_i8(
+    s: &mut Seg, ctx: &AscendContext, facs: &std::collections::HashMap<String, Int8Smooth>,
+    key: &str, dump_tag: &str, w32: &[f32], k: i64, n: i64, native: bool, dump: Option<&str>,
+) -> (String, String, String) {
+    let f = facs.get(key).unwrap_or_else(|| panic!("int8 smooth 缺 {key}"));
+    assert_eq!(f.s_eff.len(), k as usize, "{key} 因子长度 {} ≠ k={k}", f.s_eff.len());
+    let (wq, scale) = quant_w8(w32, k as usize, &f.s_eff);
+    if let Some(dir) = dump {
+        let _ = std::fs::create_dir_all(dir);
+        let wqb: Vec<u8> = wq.iter().map(|&v| v as u8).collect();
+        std::fs::write(format!("{dir}/{dump_tag}.wq"), &wqb).expect("dump wq");
+        let sb: Vec<u8> = scale.iter().flat_map(|v| v.to_le_bytes()).collect();
+        std::fs::write(format!("{dir}/{dump_tag}.scale"), &sb).expect("dump scale");
+    }
+    // GEB_INT8_WCONST=1（默认随 GEB_WCONST）：wq/ws 烤 Const——int8 Data
+    // 权重每执行付 ND→NZ TransData 税（实测 prefix 129.5ms 反比 f16 105 慢
+    // ~25ms ≈ 2GB/63GB/s，2026-09-28 serve 实测；Const 编译期定型免税，
+    // f16 wt() 同理）。smooth 行体量小（[k] f16），保持 Data 无妨
+    let wconst8 = envi("GEB_INT8_WCONST", envi("GEB_WCONST", 0)) == 1;
+    let (wq_n, ws_n) = if wconst8 {
+        let wqb: Vec<u8> = wq.iter().map(|&v| v as u8).collect();
+        s.g.add_const_raw(&format!("{dump_tag}wq"), &[n, k], Dtype::Int8, &wqb).unwrap();
+        let sb: Vec<u8> = scale.iter().flat_map(|v| v.to_le_bytes()).collect();
+        s.g.add_const_raw(&format!("{dump_tag}ws"), &[n], Dtype::Fp32, &sb).unwrap();
+        s.datas.insert(format!("{dump_tag}wq"));
+        s.datas.insert(format!("{dump_tag}ws"));
+        (format!("{dump_tag}wq"), format!("{dump_tag}ws"))
+    } else {
+        (
+            s.data_i8(ctx, &format!("{dump_tag}wq"), &[n, k], &wq),
+            s.data_f32(ctx, &format!("{dump_tag}ws"), &[n], &scale),
+        )
+    };
+    let sm_n = if native {
+        let smf: Vec<f16> = f.smooth.iter().map(|&v| f16::from_f32(v)).collect();
+        s.data(ctx, &format!("{dump_tag}sm"), &[k], &smf)
+    } else {
+        let invf: Vec<f16> = f.inv.iter().map(|&v| f16::from_f32(v)).collect();
+        s.data(ctx, &format!("{dump_tag}inv"), &[1, k], &invf)
+    };
+    // bias 折入算子实验已毙：int32 Const 输入 aclgrphBuildModel rc=-7
+    // （legacy 算子 bias 分支不可用，2026-09-28）。改为调用方直接砍 bias op
+    //（Gemma 投影 bias≡0 + int8 已 assert 真权重——语义零损失）
+    (wq_n, ws_n, sm_n)
+}
+
+/// 统一 int8/f16 投影：int8 = QuantMatmulDequant（native smooth 直入算子，
+/// GEB_INT8_NATIVE=0 回退 gatew 行预乘）；f16 = MatMulV2（w16 = 原权重段
+/// 名）。两路 w dims 同 [n,k]。bias 均由调用方处理（int8 路径 Gemma
+/// bias≡0 直接砍 op）。
+#[allow(clippy::type_complexity)]
+fn mm_or_qmd(
+    s: &mut Seg, name: &str, a: &str, a_dims: &[i64], i8w: Option<&(String, String, String)>,
+    w16: &str, n: i64, o: &[i64], native: bool,
+) -> String {
+    let w_dims = [n, a_dims[1]];
+    match (i8w, native) {
+        (Some((wn, sn, mn)), true) => s.qmd(name, a, a_dims, wn, &w_dims, sn, Some(mn), None, n, o),
+        (Some((wn, sn, mn)), false) => {
+            let xs = s.gatew(&format!("{name}xs"), a, a_dims, mn);
+            s.qmd(name, &xs, a_dims, wn, &w_dims, sn, None, None, n, o)
+        }
+        (None, _) => s.mm(name, a, a_dims, w16, &w_dims, o),
+    }
+}
+
+/// int8 层内 f16 成员权重 host：组 norm 回 torch 域（g1/g2 = 1+g）后，
+/// 引擎 fold 权重（w·(1+g)）须除回 fold 再进 f16——否则 fold 双计。
+/// unfold=false（组未切 int8）时保持引擎原样（= lw_f16 语义）。
+fn lin_f16_unfold(l: &LinearWeights, out_dim: usize, unfold: bool, g: &[f32]) -> Vec<f16> {
+    let w32 = l.weight.to_f32_vec().unwrap();
+    let w = if unfold {
+        assert_eq!(g.len(), w32.len() / out_dim, "unfold 因子长度不符");
+        w32.into_iter()
+            .enumerate()
+            .map(|(i, v)| v / g[i / out_dim])
+            .collect::<Vec<f32>>()
+    } else {
+        w32
+    };
+    w.into_iter().map(f16::from_f32).collect()
+}
+
 pub fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e: Option<&mut E2eStage>) {
     let ctx = be.ctx();
     let stream = be.stream();
@@ -2576,6 +2801,34 @@ pub fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e
     let attn_manual = std::env::var("GEB_ATTN_PREFIX").or_else(|_| std::env::var("GEB_ATTN"))
         .map(|v| v == "manual").unwrap_or(false);
     let pscale = if attn_manual { 1.0f32 / (HD as f32).sqrt() } else { 1.0 };
+    // GEB_PREFIX_INT8（C2 生产化）：7 投影 → QuantMatmulDequant。因子文件
+    // = GEB_INT8_SMOOTH（默认 pyo3_check/smooth_calib_v1_engine.safetensors，
+    // torch 域 npz 经 Gemma 1+g fold 校正转换）。GEB_INT8_PROJS 子集分阶段
+    // bring-up（默认全 7）；GEB_INT8_NATIVE=0 回退 TileD+Mul 行预乘。
+    // GEB_INT8_DUMP=<dir> 落盘量化产物对拍 int8_weights_v1.npz 金标准。
+    let int8 = prefix_int8();
+    let (facs, i8norms): (
+        std::collections::HashMap<String, Int8Smooth>,
+        std::collections::HashMap<String, [Vec<f32>; 2]>,
+    ) = if int8 {
+        assert!(real.is_some(), "GEB_PREFIX_INT8 需要 GEB_CKPT 真权重");
+        assert!(qkv3, "GEB_PREFIX_INT8 需要 GEB_QKV3=1（fused qkv 无法 per-matrix smooth）");
+        let path = std::env::var("GEB_INT8_SMOOTH")
+            .unwrap_or_else(|_| "/data/apxinf/pyo3_check/smooth_calib_v1_engine.safetensors".into());
+        println!("[int8] prefix int8 开启：smooth={path}");
+        load_int8_smooth(&path)
+    } else {
+        (std::collections::HashMap::new(), std::collections::HashMap::new())
+    };
+    let int8_projs: std::collections::HashSet<String> = std::env::var("GEB_INT8_PROJS")
+        .unwrap_or_else(|_| "q,k,v,o,gate,up,down".into())
+        .split(',')
+        .map(|x| x.trim().to_string())
+        .collect();
+    let int8_native = envi("GEB_INT8_NATIVE", 1) == 1;
+    let dump_dir_s = std::env::var("GEB_INT8_DUMP").ok();
+    let dump_dir = dump_dir_s.as_deref();
+    let i8sel = |p: &str| int8 && int8_projs.contains(p);
     let mut s = Seg::new("ge_prefix");
 
     // ---- 段级输入 ----
@@ -2697,20 +2950,78 @@ pub fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e
         let lay = real.and_then(|w| {
             w.language_layers.get(i + envi("GEB_LAYER_OFFSET", 0) as usize)
         });
-        let g1_h = lay
-            .map(|l| t_f16(&l.input_norm_scale))
-            .unwrap_or_else(|| norm_f16(PW as usize, &mut seed, 1.0));
+        let lay_i = i + envi("GEB_LAYER_OFFSET", 0) as usize; // smooth 因子键层号同权重层
+        // int8 q/k/v 注册（f32 直取，不过 f16；manual-attn 的 pscale 折 q——
+        // 行量化对整体常数不变，仅 scale 同比缩小）
+        let (iq8, ik8, iv8) = if int8 {
+            let l = lay.expect("GEB_PREFIX_INT8 需真权重");
+            let fk = |proj: &str| format!("prefix/L{:02}/{proj}", lay_i);
+            let dt = |proj: &str| format!("L{:02}_{proj}", lay_i);
+            let mut q32 = l.attention.q.weight.to_f32_vec().unwrap();
+            if attn_manual {
+                for v in q32.iter_mut() {
+                    *v *= pscale;
+                }
+            }
+            (
+                if i8sel("q") {
+                    Some(reg_i8(&mut s, ctx, &facs, &fk("q"), &dt("q"), &q32, PW, QD, int8_native, dump_dir))
+                } else {
+                    None
+                },
+                if i8sel("k") {
+                    Some(reg_i8(&mut s, ctx, &facs, &fk("k"), &dt("k"),
+                        &l.attention.k.weight.to_f32_vec().unwrap(), PW, KVD, int8_native, dump_dir))
+                } else {
+                    None
+                },
+                if i8sel("v") {
+                    Some(reg_i8(&mut s, ctx, &facs, &fk("v"), &dt("v"),
+                        &l.attention.v.weight.to_f32_vec().unwrap(), PW, KVD, int8_native, dump_dir))
+                } else {
+                    None
+                },
+            )
+        } else {
+            (None, None, None)
+        };
+        let qkv_i8 = i8sel("q") || i8sel("k") || i8sel("v");
+        let (g1_h, g1_t): (Vec<f16>, &[f32]) = if qkv_i8 {
+            // int8 组：norm 回 torch 域（gamma = (1+g) 真值，loader fold 的
+            // 替代源）——smooth 行 = s_npz 与 npz 权重面同锚（纯引擎域 s_eff
+            // 因 L00 近零 fold 会爆 f16，2026-09-28 取证）
+            let g = &i8norms[&format!("prefix/L{:02}", lay_i)][0];
+            assert_eq!(g.len(), PW as usize, "g1 长度不符");
+            (g.iter().map(|&v| f16::from_f32(v)).collect(), g)
+        } else {
+            (
+                lay.map(|l| t_f16(&l.input_norm_scale))
+                    .unwrap_or_else(|| norm_f16(PW as usize, &mut seed, 1.0)),
+                &[],
+            )
+        };
         s.data(ctx, &format!("{}g1", tag), &[PW], &g1_h);
         {
-            let wq = lay
-                .map(|l| lw_f16(&l.attention.q))
-                .unwrap_or_else(|| rand_f16((PW * QD) as usize, &mut seed, 8000.0));
-            let wk = lay
-                .map(|l| lw_f16(&l.attention.k))
-                .unwrap_or_else(|| rand_f16((PW * KVD) as usize, &mut seed, 8000.0));
-            let wv = lay
-                .map(|l| lw_f16(&l.attention.v))
-                .unwrap_or_else(|| rand_f16((PW * KVD) as usize, &mut seed, 8000.0));
+            // f16 host 仅在对应投影未转 int8 时构造（int8 段已在上一块注册；
+            // 组切 torch 域后 f16 成员除回 fold——见 lin_f16_unfold）
+            let wq = if iq8.is_none() {
+                lay.map(|l| lin_f16_unfold(&l.attention.q, QD as usize, qkv_i8, g1_t))
+                    .unwrap_or_else(|| rand_f16((PW * QD) as usize, &mut seed, 8000.0))
+            } else {
+                Vec::new()
+            };
+            let wk = if ik8.is_none() {
+                lay.map(|l| lin_f16_unfold(&l.attention.k, KVD as usize, qkv_i8, g1_t))
+                    .unwrap_or_else(|| rand_f16((PW * KVD) as usize, &mut seed, 8000.0))
+            } else {
+                Vec::new()
+            };
+            let wv = if iv8.is_none() {
+                lay.map(|l| lin_f16_unfold(&l.attention.v, KVD as usize, qkv_i8, g1_t))
+                    .unwrap_or_else(|| rand_f16((PW * KVD) as usize, &mut seed, 8000.0))
+            } else {
+                Vec::new()
+            };
             // Gemma 投影无 bias（真权重 = zeros）
             let bias = lay
                 .map(|_| vec![f16::from_f32(0.0); QKVW as usize])
@@ -2730,9 +3041,15 @@ pub fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e
             }
             if qkv3 {
                 // qkv3 层内输入位次 1..7（g1 之后）；eager 按 qkv3 偏移读
-                s.wt(ctx, &format!("{}qw", tag), &[QD, PW], &wq_s, PW, QD);
-                s.wt(ctx, &format!("{}kw", tag), &[KVD, PW], &wk, PW, KVD);
-                s.wt(ctx, &format!("{}vw", tag), &[KVD, PW], &wv, PW, KVD);
+                if iq8.is_none() {
+                    s.wt(ctx, &format!("{}qw", tag), &[QD, PW], &wq_s, PW, QD);
+                }
+                if ik8.is_none() {
+                    s.wt(ctx, &format!("{}kw", tag), &[KVD, PW], &wk, PW, KVD);
+                }
+                if iv8.is_none() {
+                    s.wt(ctx, &format!("{}vw", tag), &[KVD, PW], &wv, PW, KVD);
+                }
                 s.data(ctx, &format!("{}qb", tag), &[1, QD], &bias_s[..QD as usize]);
                 s.data(ctx, &format!("{}kb", tag), &[1, KVD], &bias_s[QD as usize..(QD + KVD) as usize]);
                 s.data(ctx, &format!("{}vb", tag), &[1, KVD], &bias_s[(QD + KVD) as usize..]);
@@ -2748,15 +3065,20 @@ pub fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e
                 s.wt(ctx, &format!("{}qkvwt", tag), &[QKVW, PW], &fused, PW, QKVW);
                 s.data(ctx, &format!("{}qkvb", tag), &[1, QKVW], &bias_s);
             }
-            let bq = upload(ctx, &bias[0..QD as usize]);
-            let bk = upload(ctx, &bias[QD as usize..(QD + KVD) as usize]);
-            let bv = upload(ctx, &bias[(QD + KVD) as usize..]);
-            let ebq = wbuf_t(ctx, &wq, PW, QD);
-            let ebk = wbuf_t(ctx, &wk, PW, KVD);
-            let ebv = wbuf_t(ctx, &wv, PW, KVD);
-            eager_qkv.push((ebq, ebk, ebv, bq, bk, bv));
+            // eager 缓冲（f16 参考镜像）——int8 模式对拍走 e2e golden，跳过
+            if !int8 {
+                let bq = upload(ctx, &bias[0..QD as usize]);
+                let bk = upload(ctx, &bias[QD as usize..(QD + KVD) as usize]);
+                let bv = upload(ctx, &bias[(QD + KVD) as usize..]);
+                let ebq = wbuf_t(ctx, &wq, PW, QD);
+                let ebk = wbuf_t(ctx, &wk, PW, KVD);
+                let ebv = wbuf_t(ctx, &wv, PW, KVD);
+                eager_qkv.push((ebq, ebk, ebv, bq, bk, bv));
+            }
         }
-        {
+        // o/gate/up/down：int8 选中者在使用点注册（末层 break 前不触达），
+        // 此处 f16 wt 段按需保留
+        if !i8sel("o") {
             let host = lay
                 .map(|l| lw_f16(&l.attention.output))
                 .unwrap_or_else(|| rand_f16((QD * PW) as usize, &mut seed, 8000.0));
@@ -2766,23 +3088,32 @@ pub fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e
             .map(|_| vec![f16::from_f32(0.0); PW as usize])
             .unwrap_or_else(|| rand_f16(PW as usize, &mut seed, 4000.0));
         s.data(ctx, &format!("{}outb", tag), &[1, PW], &outb_h);
-        let g2_h = lay
-            .map(|l| t_f16(&l.post_attention_norm_scale))
-            .unwrap_or_else(|| norm_f16(PW as usize, &mut seed, 1.0));
+        let mlp_i8 = i8sel("gate") || i8sel("up");
+        let (g2_h, g2_t): (Vec<f16>, &[f32]) = if mlp_i8 {
+            let g = &i8norms[&format!("prefix/L{:02}", lay_i)][1];
+            assert_eq!(g.len(), PW as usize, "g2 长度不符");
+            (g.iter().map(|&v| f16::from_f32(v)).collect(), g)
+        } else {
+            (
+                lay.map(|l| t_f16(&l.post_attention_norm_scale))
+                    .unwrap_or_else(|| norm_f16(PW as usize, &mut seed, 1.0)),
+                &[],
+            )
+        };
         s.data(ctx, &format!("{}g2", tag), &[PW], &g2_h);
-        {
+        if !i8sel("gate") {
             let host = lay
-                .map(|l| lw_f16(&l.mlp.gate))
+                .map(|l| lin_f16_unfold(&l.mlp.gate, INTER as usize, mlp_i8, g2_t))
                 .unwrap_or_else(|| rand_f16((PW * INTER) as usize, &mut seed, 8000.0));
             s.wt(ctx, &format!("{}gatewt", tag), &[INTER, PW], &host, PW, INTER);
         }
-        {
+        if !i8sel("up") {
             let host = lay
-                .map(|l| lw_f16(&l.mlp.up))
+                .map(|l| lin_f16_unfold(&l.mlp.up, INTER as usize, mlp_i8, g2_t))
                 .unwrap_or_else(|| rand_f16((PW * INTER) as usize, &mut seed, 8000.0));
             s.wt(ctx, &format!("{}upwt", tag), &[INTER, PW], &host, PW, INTER);
         }
-        {
+        if !i8sel("down") {
             let host = lay
                 .map(|l| lw_f16(&l.mlp.down))
                 .unwrap_or_else(|| rand_f16((INTER * PW) as usize, &mut seed, 8000.0));
@@ -2798,12 +3129,25 @@ pub fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e
         // ⚠ 图输出绑 rank-2（rope 的 ad / slice 的 v）——Reshape 输出绑图
         // 输出时 desc 是动态 [-1,-1,-1]（shape 张量驱动），size 无效
         let (q2, k2, v2) = if qkv3 {
-            let qm = s.mm(&format!("{}qm", tag), &norm1, &[p, PW], &format!("{}qw", tag), &[QD, PW], &[p, QD]);
-            let km = s.mm(&format!("{}km", tag), &norm1, &[p, PW], &format!("{}kw", tag), &[KVD, PW], &[p, KVD]);
-            let vm = s.mm(&format!("{}vm", tag), &norm1, &[p, PW], &format!("{}vw", tag), &[KVD, PW], &[p, KVD]);
-            let qb = s.bias(&format!("{}qb_", tag), &qm, &[p, QD], &format!("{}qb", tag));
-            let kb = s.bias(&format!("{}kb_", tag), &km, &[p, KVD], &format!("{}kb", tag));
-            let vb = s.bias(&format!("{}vb_", tag), &vm, &[p, KVD], &format!("{}vb", tag));
+            let qm = mm_or_qmd(&mut s, &format!("{}qm", tag), &norm1, &[p, PW], iq8.as_ref(), &format!("{}qw", tag), QD, &[p, QD], int8_native);
+            let km = mm_or_qmd(&mut s, &format!("{}km", tag), &norm1, &[p, PW], ik8.as_ref(), &format!("{}kw", tag), KVD, &[p, KVD], int8_native);
+            let vm = mm_or_qmd(&mut s, &format!("{}vm", tag), &norm1, &[p, PW], iv8.as_ref(), &format!("{}vw", tag), KVD, &[p, KVD], int8_native);
+            // int8：bias 已折入算子（int32 零）——跳过 TileD+Add 对
+            let qb = if iq8.is_some() {
+                qm
+            } else {
+                s.bias(&format!("{}qb_", tag), &qm, &[p, QD], &format!("{}qb", tag))
+            };
+            let kb = if ik8.is_some() {
+                km
+            } else {
+                s.bias(&format!("{}kb_", tag), &km, &[p, KVD], &format!("{}kb", tag))
+            };
+            let vb = if iv8.is_some() {
+                vm
+            } else {
+                s.bias(&format!("{}vb_", tag), &vm, &[p, KVD], &format!("{}vb", tag))
+            };
             (qb, kb, vb)
         } else {
             let qkv = s.mm(&format!("{}qkv", tag), &norm1, &[p, PW], &format!("{}qkvwt", tag), &[QKVW, PW], &[p, QKVW]);
@@ -2840,20 +3184,56 @@ pub fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e
             let pfa = s.pfa(&format!("{}pfa", tag), &qr3, &kr3, &v3, &[1, p, QD], &[1, p, KVD], HEADS, KV_HEADS, HD);
             s.squeeze(&format!("{}sq", tag), &pfa, &[1, p, QD], &[p, QD])
         };
-        let proj = s.mm(&format!("{}proj", tag), &sq, &[p, QD], &format!("{}outwt", tag), &[PW, QD], &[p, PW]);
-        let projb = s.bias(&format!("{}projb", tag), &proj, &[p, PW], &format!("{}outb", tag));
+        let io8 = if i8sel("o") {
+            let l = lay.expect("GEB_PREFIX_INT8 需真权重");
+            Some(reg_i8(&mut s, ctx, &facs, &format!("prefix/L{:02}/o", lay_i), &format!("L{:02}_o", lay_i),
+                &l.attention.output.weight.to_f32_vec().unwrap(), QD, PW, int8_native, dump_dir))
+        } else {
+            None
+        };
+        let proj = mm_or_qmd(&mut s, &format!("{}proj", tag), &sq, &[p, QD], io8.as_ref(), &format!("{}outwt", tag), PW, &[p, PW], int8_native);
+        let projb = if io8.is_some() {
+            proj.clone() // int8：bias 已折入算子
+        } else {
+            s.bias(&format!("{}projb", tag), &proj, &[p, PW], &format!("{}outb", tag))
+        };
         let res = s.add2(&format!("{}res", tag), &projb, &cur, &[p, PW]);
         if dbg_mid && i == 0 {
             dbg_outs.push(sq.clone());
             dbg_outs.push(res.clone());
         }
         let norm2 = s.addrms(&format!("{}n2", tag), &res, "zeros", &format!("{}g2", tag), &[p, PW]);
-        let gate = s.mm(&format!("{}gate", tag), &norm2, &[p, PW], &format!("{}gatewt", tag), &[INTER, PW], &[p, INTER]);
-        let up = s.mm(&format!("{}up", tag), &norm2, &[p, PW], &format!("{}upwt", tag), &[INTER, PW], &[p, INTER]);
+        let ig8 = if i8sel("gate") {
+            let l = lay.expect("GEB_PREFIX_INT8 需真权重");
+            Some(reg_i8(&mut s, ctx, &facs, &format!("prefix/L{:02}/gate", lay_i), &format!("L{:02}_gate", lay_i),
+                &l.mlp.gate.weight.to_f32_vec().unwrap(), PW, INTER, int8_native, dump_dir))
+        } else {
+            None
+        };
+        let iu8 = if i8sel("up") {
+            let l = lay.expect("GEB_PREFIX_INT8 需真权重");
+            Some(reg_i8(&mut s, ctx, &facs, &format!("prefix/L{:02}/up", lay_i), &format!("L{:02}_up", lay_i),
+                &l.mlp.up.weight.to_f32_vec().unwrap(), PW, INTER, int8_native, dump_dir))
+        } else {
+            None
+        };
+        let gate = mm_or_qmd(&mut s, &format!("{}gate", tag), &norm2, &[p, PW], ig8.as_ref(), &format!("{}gatewt", tag), INTER, &[p, INTER], int8_native);
+        let up = mm_or_qmd(&mut s, &format!("{}up", tag), &norm2, &[p, PW], iu8.as_ref(), &format!("{}upwt", tag), INTER, &[p, INTER], int8_native);
         let gact = s.gelu(&format!("{}gact", tag), &gate, &[p, INTER], true);
         let act = s.mul2(&format!("{}act", tag), &gact, &up, &[p, INTER]);
-        let down = s.mm(&format!("{}down", tag), &act, &[p, INTER], &format!("{}downwt", tag), &[PW, INTER], &[p, PW]);
-        let downb = s.bias(&format!("{}downb", tag), &down, &[p, PW], &format!("{}downb", tag));
+        let id8 = if i8sel("down") {
+            let l = lay.expect("GEB_PREFIX_INT8 需真权重");
+            Some(reg_i8(&mut s, ctx, &facs, &format!("prefix/L{:02}/down", lay_i), &format!("L{:02}_down", lay_i),
+                &l.mlp.down.weight.to_f32_vec().unwrap(), INTER, PW, int8_native, dump_dir))
+        } else {
+            None
+        };
+        let down = mm_or_qmd(&mut s, &format!("{}down", tag), &act, &[p, INTER], id8.as_ref(), &format!("{}downwt", tag), PW, &[p, PW], int8_native);
+        let downb = if id8.is_some() {
+            down.clone() // int8：bias 已折入算子
+        } else {
+            s.bias(&format!("{}downb", tag), &down, &[p, PW], &format!("{}downb", tag))
+        };
         cur = s.add2(&format!("{}out", tag), &downb, &res, &[p, PW]);
         if dbg_mid && i == 0 && std::env::var("GEB_DBG_FULL").is_ok() {
             // 全级导出（GEB_DBG_FULL）：逐级与教科书对拍钉 GE 图坏点。
@@ -3019,6 +3399,72 @@ pub fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e
                 tok_cache_rows: Vec::new(),
             });
         }
+        return;
+    }
+    if int8 {
+        // eager/parity 跳过：f16 eager 参考对 int8 图无裁判意义（量化执行差
+        // 的裁判 = e2e golden 对拍 + task0 行为）。烤桶 OM 落盘照常（save
+        // 只需 build 产物，同 GEB_NORM32 先例）。
+        let mut save_path = None;
+        if let Ok(p) = std::env::var("GEB_SAVE") {
+            s.g.save(&p).expect("save om (int8)");
+            println!("OM saved: {p}");
+            save_path = Some(p);
+        }
+        // GEB_INT8_RUN=1：活图直跑 vs 存后重载跑（同 binds）——OM 序列化
+        // desc（int8/f32 Data 输入）疑点隔离：probe 活图干净而 e2e 重载
+        // 后全炸（2026-09-28 ladder 定位：gate/down 单投影同炸、布局桥
+        // N2/N3 干净 ⇒ 嫌疑集中 save/load 往返）
+        if std::env::var("GEB_INT8_RUN").is_ok() {
+            let run_once = |s: &mut Seg, tag: &str| {
+                let ins: Vec<&DeviceBuffer> = s.ins();
+                let n_out = s.g.num_outputs().unwrap();
+                let outs: Vec<DeviceBuffer> = (0..n_out)
+                    .map(|i| ctx.malloc(s.g.output_size(i).unwrap().max(16)).expect("out malloc"))
+                    .collect();
+                let refs: Vec<&DeviceBuffer> = outs.iter().collect();
+                s.g.run(&ins, &refs, stream).expect("ge run");
+                drop(stream.synchronize());
+                let full = download_f16(ctx, &outs[0], s.g.output_size(0).unwrap() / 2);
+                let m = full.iter().fold(0f32, |a, v| a.max(v.to_f32().abs()));
+                let head: Vec<f32> = full[..8.min(full.len())].iter().map(|v| v.to_f32()).collect();
+                println!("[int8] {tag} out0 head={head:?} |max|={m:.2}");
+            };
+            run_once(&mut s, "活图");
+            let live_sizes: Vec<(usize, usize)> = (0..s.g.num_inputs().unwrap())
+                .map(|i| (s.g.input_size(i).unwrap_or(0), s.binds[i].len()))
+                .collect();
+            let bad_live: Vec<usize> = live_sizes
+                .iter()
+                .enumerate()
+                .filter(|(_, (sz, bl))| sz != bl)
+                .map(|(i, _)| i)
+                .collect();
+            println!("[int8] 活图输入 {} 个，binds 长度不符的 idx：{:?}", live_sizes.len(), bad_live);
+            if let Some(p) = save_path {
+                s.g = ge_builder::load(&p).expect("reload om");
+                let n2 = s.g.num_inputs().unwrap();
+                let mut mism = Vec::new();
+                for i in 0..n2.min(live_sizes.len()) {
+                    let sz = s.g.input_size(i).unwrap_or(0);
+                    if sz != live_sizes[i].0 {
+                        mism.push((i, live_sizes[i].0, sz, s.g.input_dims(i).unwrap_or_default()));
+                    }
+                }
+                println!("[int8] 重载输入 {n2} 个（活图 {}）；size 不符：{:?}（前 8 项）", live_sizes.len(), mism.iter().take(8).collect::<Vec<_>>());
+                run_once(&mut s, "重载");
+            }
+        }
+        ge_builder::fini().expect("fini");
+        let projs: Vec<&str> = ["q", "k", "v", "o", "gate", "up", "down"]
+            .into_iter()
+            .filter(|p| int8_projs.contains(*p))
+            .collect();
+        println!(
+            "GE_PREFIX_PROBE_OK (int8: 投影 {} ×{} 层, native_smooth={int8_native})",
+            projs.join(","),
+            depth
+        );
         return;
     }
     let elems = [(p * KVD) as usize];
@@ -6282,7 +6728,9 @@ pub fn optest(be: &AscendBackend, which: &str, real: Option<&Pi05Weights>) {
             let stream = be.stream();
             let m = 832i64;
             let k = 2048i64;
-            let n = 8192i64;
+            // GEB_QMD_N：输出维覆盖（合成链）——n=256（KVD，k/v 投影）的
+            // legacy kernel 分支疑点（2026-09-28：生产 k-only 复现 1300×）
+            let n = envi("GEB_QMD_N", 8192);
             let tw = std::env::var("GEB_QMD_TW").unwrap_or_else(|_| "1".into()) == "1";
             let mut seed = 0xC2C2u32;
             // GEB_QMD_REAL=1：L2 真权重+真激活执行差判决——w = GEB_CKPT 的
@@ -6346,6 +6794,7 @@ pub fn optest(be: &AscendBackend, which: &str, real: Option<&Pi05Weights>) {
             // 原生 smooth_scale 输入或 device 预乘）。数学恒等：
             // y = Σ(x_k/s_k)·(w_k·s_k)
             let smooth = std::env::var("GEB_QMD_SMOOTH").is_ok();
+            let mut s_k_out: Vec<f32> = Vec::new(); // 逃逸供链 N（native smooth）
             let (xq_in, wq_in) = if smooth {
                 let t0 = std::time::Instant::now();
                 let x_f: Vec<f32> = x_h.iter().map(|v| v.to_f32()).collect();
@@ -6375,6 +6824,7 @@ pub fn optest(be: &AscendBackend, which: &str, real: Option<&Pi05Weights>) {
                 let sm_max = s_k.iter().fold(0f64, |a, &v| a.max(v as f64));
                 let sm_min = s_k.iter().fold(1e30f64, |a, &v| a.min(v as f64));
                 println!("[qmd] SMOOTH: s_k ∈ [{sm_min:.3},{sm_max:.3}]，变换 {:.1}ms", t0.elapsed().as_secs_f64() * 1e3);
+                s_k_out = s_k;
                 (x2, w2)
             } else {
                 (x_h.clone(), w_h.clone())
@@ -6460,6 +6910,88 @@ pub fn optest(be: &AscendBackend, which: &str, real: Option<&Pi05Weights>) {
             sf.wire("opf", "x2", "wf");
             sf.reg_out("opf", "y");
             sf.finish(&["opf"]);
+            // —— 链 N：native smooth_scale 输入实证（生产形态——x 原样进图，
+            // 零额外算子）。权重 = 链 Q 同款（w·s_k 已折入 int8），x = 原始
+            // 未平滑值。GEB_QMD_NSM=1 → smooth desc [k]；=2 → [1,k]。
+            // 判据：y_N ≈ y_Q（算子内部做 x/smooth 的除法约定成立）；漂到
+            // 朴素量级 = 方向反（乘非除）→ 生产走 GEB_INT8_NATIVE=0 回退
+            let mut sn = None;
+            let mut sn2 = None; // N2：x 经 Mul 桥（op-to-op 布局疑点）
+            let mut sn3 = None; // N3：y 经 Add 桥
+            if let Ok(nsm) = std::env::var("GEB_QMD_NSM") {
+                assert!(smooth, "GEB_QMD_NSM 需要 GEB_QMD_SMOOTH（s_k 须已计算）");
+                // 1/2 = s_k 直入（除法假设），3/4 = 1/s_k（乘法假设）；
+                // 奇数 desc [k]，偶数 desc [1,k]；5 = 1/s_k + N2/N3 布局桥；
+                // 6 = 1/s_k + 单算 OM save/load 往返对拍
+                let inv_mode = nsm == "3" || nsm == "4" || nsm == "5" || nsm == "6";
+                let sm_dims: Vec<i64> = if nsm == "2" || nsm == "4" { vec![1, k] } else { vec![k] };
+                println!("[qmd] NSM 模式 {nsm}（{}，desc {:?}）", if inv_mode { "1/s_k" } else { "s_k" }, sm_dims);
+                let mut sg = Seg::new("qmd_n");
+                sg.data(ctx, "x", &[m, k], &x_h);
+                sg.data_i8(ctx, "wq", &[n, k], &w_q);
+                sg.data_f32(ctx, "ws", &[n], &scale);
+                let smf: Vec<f16> = s_k_out
+                    .iter()
+                    .map(|&v| f16::from_f32(if inv_mode { 1.0 / v } else { v }))
+                    .collect();
+                sg.data(ctx, "sm", &sm_dims, &smf);
+                sg.g.add_op("opn", "QuantMatmulDequant").unwrap();
+                sg.g.set_input_desc("opn", "x", &[m, k], Dtype::Fp16).unwrap();
+                sg.g.set_input_desc("opn", "quantized_weight", &[n, k], Dtype::Int8).unwrap();
+                sg.g.set_input_desc("opn", "weight_scale", &[n], Dtype::Fp32).unwrap();
+                sg.g.set_input_desc("opn", "smooth_scale", &sm_dims, Dtype::Fp16).unwrap();
+                sg.g.set_output_desc("opn", "y", &[m, n], Dtype::Fp16).unwrap();
+                sg.g.set_attr_bool("opn", "transpose_weight", true).unwrap();
+                sg.g.set_attr_str("opn", "x_quant_mode", "pertoken").unwrap();
+                sg.g.link("opn", "x", "x").unwrap();
+                sg.g.link("opn", "quantized_weight", "wq").unwrap();
+                sg.g.link("opn", "weight_scale", "ws").unwrap();
+                sg.g.link("opn", "smooth_scale", "sm").unwrap();
+                sg.reg_out("opn", "y");
+                sg.finish(&["opn"]);
+                sn = Some(sg);
+                // N2/N3（GEB_QMD_NSM=5）：图内 op-to-op 布局疑点复现——生产
+                // int8 OM 中 qmd 的 x 来自算子输出（全炸），probe 的 Data x
+                // 干净。N2 = x 经 Mul(ones) 桥再进 qmd（模拟算子上游）；
+                // N3 = y 经 Add(zeros) 桥（模拟下游消费者）。哪条炸 = 哪侧
+                // 布局/接线问题实锤
+                if nsm == "5" {
+                    let ones = vec![f16::from_f32(1.0); (m * k) as usize];
+                    let zerosv = vec![f16::from_f32(0.0); (m * n) as usize];
+                    let mut s2 = Seg::new("qmd_n2");
+                    s2.data(ctx, "x", &[m, k], &x_h);
+                    s2.data(ctx, "one", &[m, k], &ones);
+                    s2.data_i8(ctx, "wq", &[n, k], &w_q);
+                    s2.data_f32(ctx, "ws", &[n], &scale);
+                    s2.data(ctx, "sm", &[k], &smf);
+                    s2.g.add_op("mulx", "Mul").unwrap();
+                    s2.g.set_input_desc("mulx", "x1", &[m, k], Dtype::Fp16).unwrap();
+                    s2.g.set_input_desc("mulx", "x2", &[m, k], Dtype::Fp16).unwrap();
+                    s2.g.set_output_desc("mulx", "y", &[m, k], Dtype::Fp16).unwrap();
+                    s2.g.link("mulx", "x1", "x").unwrap();
+                    s2.g.link("mulx", "x2", "one").unwrap();
+                    s2.reg_out("mulx", "y");
+                    let y2 = s2.qmd("opn", "mulx", &[m, k], "wq", &[n, k], "ws", Some("sm"), None, n, &[m, n]);
+                    s2.finish(&[&y2]);
+                    let mut s3 = Seg::new("qmd_n3");
+                    s3.data(ctx, "x", &[m, k], &x_h);
+                    s3.data_i8(ctx, "wq", &[n, k], &w_q);
+                    s3.data_f32(ctx, "ws", &[n], &scale);
+                    s3.data(ctx, "sm", &[k], &smf);
+                    let yq3 = s3.qmd("opn", "x", &[m, k], "wq", &[n, k], "ws", Some("sm"), None, n, &[m, n]);
+                    s3.data(ctx, "zer", &[m, n], &zerosv);
+                    s3.g.add_op("addz", "Add").unwrap();
+                    s3.g.set_input_desc("addz", "x1", &[m, n], Dtype::Fp16).unwrap();
+                    s3.g.set_input_desc("addz", "x2", &[m, n], Dtype::Fp16).unwrap();
+                    s3.g.set_output_desc("addz", "y", &[m, n], Dtype::Fp16).unwrap();
+                    s3.wire("addz", "x1", &yq3);
+                    s3.g.link("addz", "x2", "zer").unwrap();
+                    s3.reg_out("addz", "y");
+                    s3.finish(&["addz"]);
+                    sn2 = Some(s2);
+                    sn3 = Some(s3);
+                }
+            }
             // —— 运行 + 下载
             let run_seg = |s: &mut Seg, tag: &str| -> Vec<f16> {
                 let ins: Vec<&DeviceBuffer> = s.ins();
@@ -6473,6 +7005,44 @@ pub fn optest(be: &AscendBackend, which: &str, real: Option<&Pi05Weights>) {
             };
             let y_q = run_seg(&mut sq, "Q");
             let y_f = run_seg(&mut sf, "F");
+            let y_n = sn.as_mut().map(|sg| run_seg(sg, "N"));
+            // N6：单算 OM save/load 复现（GEB_QMD_NSM=6）——legacy 算子
+            // （ops_legacy 预编译 binary）离线 OM task 序列化疑点：生产 int8
+            // OM 重载后全饱和而活图干净，输入表 size/dims 全同。单算 OM
+            // 同炸 = legacy 算子离线 OM 不支持实锤
+            if std::env::var("GEB_QMD_NSM").as_deref() == Ok("6") {
+                let sg = sn.as_mut().expect("NSM=6 须有 N 链");
+                let om = "/tmp/qmd_n.om";
+                sg.g.save(om).expect("save qmd om");
+                let n_in = sg.g.num_inputs().unwrap();
+                let sizes: Vec<usize> = (0..n_in).map(|i| sg.g.input_size(i).unwrap()).collect();
+                sg.g = ge_builder::load(om).expect("reload qmd om");
+                for i in 0..n_in.min(sg.g.num_inputs().unwrap()) {
+                    assert_eq!(sg.g.input_size(i).unwrap(), sizes[i], "单算 OM 输入 {i} size 变");
+                }
+                let y_r = run_seg(sg, "N-reload");
+                if let Some(yn) = &y_n {
+                    let mut md = 0f32;
+                    for (a, b) in y_r.iter().zip(yn.iter()) {
+                        md = md.max((a.to_f32() - b.to_f32()).abs());
+                    }
+                    println!("[qmd] N6 单算 OM 重载 vs 活图: max_diff={md:.4}（≈0 = OM 往返无损）");
+                }
+            }
+            // N2/N3 执行 + 对拍 Q 链（x/y 布局桥隔离）
+            for (tag, ys) in [
+                ("N2(x经Mul桥)", sn2.as_mut()),
+                ("N3(y经Add桥)", sn3.as_mut()),
+            ] {
+                if let Some(sg) = ys {
+                    let yn = run_seg(sg, tag);
+                    let mut md = 0f32;
+                    for (a, b) in yn.iter().zip(y_q.iter()) {
+                        md = md.max((a.to_f32() - b.to_f32()).abs());
+                    }
+                    println!("[qmd] {tag} vs Q: max_diff={md:.4}（|y|max≈{:.1}）", y_f.iter().fold(0f32, |a, v| a.max(v.to_f32().abs())));
+                }
+            }
             // —— 对拍 1：量化执行 vs f16 执行（全量）
             let mut md_qf = 0f32;
             let mut nrm = 0f32;
@@ -6481,6 +7051,21 @@ pub fn optest(be: &AscendBackend, which: &str, real: Option<&Pi05Weights>) {
                 nrm = nrm.max(f.to_f32().abs());
             }
             println!("[qmd] Q-vs-F 全量: max_diff={md_qf:.4} rel={:.3}%（|y|max={nrm:.1}）", md_qf / nrm * 100.0);
+            // —— 对拍 1b：native smooth 链 vs host 预乘链（同数学 ⇒ ≈0）
+            if let Some(yn) = &y_n {
+                let mut md_nq = 0f32;
+                for (a, b) in yn.iter().zip(y_q.iter()) {
+                    md_nq = md_nq.max((a.to_f32() - b.to_f32()).abs());
+                }
+                let mut md_nf = 0f32;
+                for (a, b) in yn.iter().zip(y_f.iter()) {
+                    md_nf = md_nf.max((a.to_f32() - b.to_f32()).abs());
+                }
+                println!(
+                    "[qmd] N-vs-Q max_diff={md_nq:.4}（≈0 = native smooth 除法约定成立）/ N-vs-F rel={:.3}%",
+                    md_nf / nrm * 100.0
+                );
+            }
             // —— 对拍 2：host 双参考（前 32 行）判激活量化语义
             let x_f32: Vec<f32> = xq_in.iter().map(|v| v.to_f32()).collect();
             let rows_ref = 32usize;
