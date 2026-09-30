@@ -205,6 +205,16 @@ pub fn prefix_int8() -> bool {
     std::env::var("GEB_PREFIX_INT8").map(|v| !v.is_empty()).unwrap_or(false)
 }
 
+/// GEB_FLOW_INT8：flow 段 7 投影换 QuantMatmulDequant（GEB_FLOW_SMOOTH
+/// 因子文件，键 flow/L{nn}/{proj}）。与 prefix 的关键差异：action 层
+/// loader 无 Gemma (1+g) fold（weights.rs 只 take 不 fold）——图内激活
+/// 天然 torch 域，s_eff = s_npz 直取、无 g 表（prefix 的两域回图不适用）。
+/// 动机：flow 步 M=50 无法摊销权重读，每步全量流式 f16 权重 ~622MB
+/// （带宽下限 ~9.9ms/步 vs 实测 7.9）——int8 权重字节减半是正杠杆。
+pub fn flow_int8() -> bool {
+    std::env::var("GEB_FLOW_INT8").map(|v| !v.is_empty()).unwrap_or(false)
+}
+
 /// 引擎域 smooth 因子（GEB_INT8_SMOOTH safetensors，键 prefix/L{nn}/{proj}）。
 /// 由 smooth_calib_v1.npz（torch 域）经 convert_smooth_engine.py v2 转换
 /// （g 回图方案）：int8 层 AddRmsNorm gamma 用 (1+g) 真值（loader fold 的
@@ -3597,6 +3607,82 @@ pub fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e
         s.data(ctx, &format!("pk{i}"), &[p, KVD], &pk_h);
         s.data(ctx, &format!("pv{i}"), &[p, KVD], &pv_h);
     }
+    // ---- flow int8（GEB_FLOW_INT8）：7 投影/层 → QuantMatmulDequant ----
+    // 注册区在层区之前（sm Data 落此，pk_base 不动）；层内 int8 权重槽以
+    // 16B dummy bind 占位——18 槽布局与 f16 恒同（serve/e2e 的 style 硬编码
+    // 偏移 b+0/+1/+10/+11/+16/+17 依赖布局，FlowMech/style_residency 免改）
+    let int8 = flow_int8();
+    if int8 {
+        assert!(qkv3, "GEB_FLOW_INT8 需要 GEB_QKV3=1（fused qkv 无法 per-matrix smooth）");
+    }
+    let facs: std::collections::HashMap<String, Int8Smooth> = if int8 {
+        assert!(real.is_some(), "GEB_FLOW_INT8 需要 GEB_CKPT 真权重");
+        let path = std::env::var("GEB_FLOW_SMOOTH")
+            .unwrap_or_else(|_| "/data/apxinf/pyo3_check/smooth_calib_v2_flow_engine.safetensors".into());
+        println!("[int8] flow int8 开启：smooth={path}");
+        load_int8_smooth(&path).0
+    } else {
+        std::collections::HashMap::new()
+    };
+    // GEB_FLOW_PROJS：flow 段独立子集（缺省回落 GEB_INT8_PROJS——两段共享
+    // 同名 env 会在子集实验时把 prefix 段一起切掉，OM 输入数不匹配 rc=-2
+    // 取证 2026-09-30）
+    let int8_projs: std::collections::HashSet<String> = std::env::var("GEB_FLOW_PROJS")
+        .or_else(|_| std::env::var("GEB_INT8_PROJS"))
+        .unwrap_or_else(|_| "q,k,v,o,gate,up,down".into())
+        .split(',')
+        .map(|x| x.trim().to_string())
+        .collect();
+    let int8_native = envi("GEB_INT8_NATIVE", 1) == 1;
+    let dump_dir = std::env::var("GEB_INT8_DUMP").ok();
+    let fi8sel = |pr: &str| int8 && int8_projs.contains(pr);
+    // (名, k, n)：k/v 的 n=256 与 down 的 k=4096 是小/宽 shape——qmd 在
+    // M=50 的编译/性能未验，GEB_INT8_PROJS 子集可退
+    const FPROJS: [(&str, i64, i64); 7] = [
+        ("q", AW, QD),
+        ("k", AW, KVD),
+        ("v", AW, KVD),
+        ("o", QD, AW),
+        ("gate", AW, AINTER),
+        ("up", AW, AINTER),
+        ("down", AINTER, AW),
+    ];
+    let mut fi8: Vec<Vec<Option<(String, String, String)>>> = vec![vec![None; 7]; depth];
+    if int8 {
+        for i in 0..depth {
+            let lay = real
+                .and_then(|w| w.action_layers.get(i))
+                .unwrap_or_else(|| panic!("GEB_FLOW_INT8 需真权重（层 {i} 缺）"));
+            for (slot, &(pn, kk, nn)) in FPROJS.iter().enumerate() {
+                if !fi8sel(pn) {
+                    continue;
+                }
+                let w32: Vec<f32> = match pn {
+                    "q" => {
+                        let mut v = lay.attention.q.weight.to_f32_vec().unwrap();
+                        if attn_manual {
+                            for x in v.iter_mut() {
+                                *x *= fscale;
+                            }
+                        }
+                        v
+                    }
+                    "k" => lay.attention.k.weight.to_f32_vec().unwrap(),
+                    "v" => lay.attention.v.weight.to_f32_vec().unwrap(),
+                    "o" => lay.attention.output.weight.to_f32_vec().unwrap(),
+                    "gate" => lay.mlp.gate.weight.to_f32_vec().unwrap(),
+                    "up" => lay.mlp.up.weight.to_f32_vec().unwrap(),
+                    "down" => lay.mlp.down.weight.to_f32_vec().unwrap(),
+                    _ => unreachable!(),
+                };
+                fi8[i][slot] = Some(reg_i8(
+                    &mut s, ctx, &facs, &format!("flow/L{i:02}/{pn}"), &format!("F{i:02}_{pn}"),
+                    &w32, kk, nn, int8_native, dump_dir.as_deref(),
+                ));
+            }
+        }
+        println!("[int8] flow int8 预注册完成：{} 层 × {} 投影（native={}）", depth, fi8[0].iter().filter(|x| x.is_some()).count(), int8_native);
+    }
     // 层权重 12 项（GEB_QKV3: 16 项）+ 尾部 agate/mgate 两项（2026-09-23
     // gate 通路补全）：ascl ash [qkvwt qkvb | qw kw vw qb kb vb] outwt outb
     // mscl msh gatewt upwt downwt downb agate mgate（eager qkv 独立投影）
@@ -3612,15 +3698,29 @@ pub fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e
         s.data(ctx, &format!("{}ascl", tag), &[AW], &norm_f16(AW as usize, &mut seed, 1.0));
         s.data(ctx, &format!("{}ash", tag), &[AW], &norm_f16(AW as usize, &mut seed, 0.0));
         {
-            let wq = lay
-                .map(|l| lw_f16(&l.attention.q))
-                .unwrap_or_else(|| rand_f16((AW * QD) as usize, &mut seed, 8000.0));
-            let wk = lay
-                .map(|l| lw_f16(&l.attention.k))
-                .unwrap_or_else(|| rand_f16((AW * KVD) as usize, &mut seed, 8000.0));
-            let wv = lay
-                .map(|l| lw_f16(&l.attention.v))
-                .unwrap_or_else(|| rand_f16((AW * KVD) as usize, &mut seed, 8000.0));
+            // int8 槽：f16 host 不构造、wt 槽 16B dummy 占位（布局纪律见
+            // 预注册注记）；eager 缓冲整块免建（int8 模式 eager 跳过）
+            let wq = if fi8[i][0].is_none() {
+                lay
+                    .map(|l| lw_f16(&l.attention.q))
+                    .unwrap_or_else(|| rand_f16((AW * QD) as usize, &mut seed, 8000.0))
+            } else {
+                Vec::new()
+            };
+            let wk = if fi8[i][1].is_none() {
+                lay
+                    .map(|l| lw_f16(&l.attention.k))
+                    .unwrap_or_else(|| rand_f16((AW * KVD) as usize, &mut seed, 8000.0))
+            } else {
+                Vec::new()
+            };
+            let wv = if fi8[i][2].is_none() {
+                lay
+                    .map(|l| lw_f16(&l.attention.v))
+                    .unwrap_or_else(|| rand_f16((AW * KVD) as usize, &mut seed, 8000.0))
+            } else {
+                Vec::new()
+            };
             // Gemma 投影无 bias（真权重 = zeros）
             let bias = lay
                 .map(|_| vec![f16::from_f32(0.0); QKVW as usize])
@@ -3639,9 +3739,22 @@ pub fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e
             }
             if qkv3 {
                 // qkv3 层内输入位次 2..8（ascl/ash 之后）；eager 按 qkv3 偏移读
-                s.wt(ctx, &format!("{}qw", tag), &[QD, AW], &wq_s, AW, QD);
-                s.wt(ctx, &format!("{}kw", tag), &[KVD, AW], &wk, AW, KVD);
-                s.wt(ctx, &format!("{}vw", tag), &[KVD, AW], &wv, AW, KVD);
+                let i8_slot = |s: &mut Seg| s.binds.push(ctx.malloc(16).expect("i8 wt 槽占位"));
+                if fi8[i][0].is_some() {
+                    i8_slot(&mut s);
+                } else {
+                    s.wt(ctx, &format!("{}qw", tag), &[QD, AW], &wq_s, AW, QD);
+                }
+                if fi8[i][1].is_some() {
+                    i8_slot(&mut s);
+                } else {
+                    s.wt(ctx, &format!("{}kw", tag), &[KVD, AW], &wk, AW, KVD);
+                }
+                if fi8[i][2].is_some() {
+                    i8_slot(&mut s);
+                } else {
+                    s.wt(ctx, &format!("{}vw", tag), &[KVD, AW], &wv, AW, KVD);
+                }
                 s.data(ctx, &format!("{}qb", tag), &[1, QD], &bias_s[..QD as usize]);
                 s.data(ctx, &format!("{}kb", tag), &[1, KVD], &bias_s[QD as usize..(QD + KVD) as usize]);
                 s.data(ctx, &format!("{}vb", tag), &[1, KVD], &bias_s[(QD + KVD) as usize..]);
@@ -3657,15 +3770,19 @@ pub fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e
                 s.wt(ctx, &format!("{}qkvwt", tag), &[QKVW, AW], &fused, AW, QKVW);
                 s.data(ctx, &format!("{}qkvb", tag), &[1, QKVW], &bias_s);
             }
-            let bq = upload(ctx, &bias[0..QD as usize]);
-            let bk = upload(ctx, &bias[QD as usize..(QD + KVD) as usize]);
-            let bv = upload(ctx, &bias[(QD + KVD) as usize..]);
-            let ebq = wbuf_t(ctx, &wq, AW, QD);
-            let ebk = wbuf_t(ctx, &wk, AW, KVD);
-            let ebv = wbuf_t(ctx, &wv, AW, KVD);
-            eager_qkv.push((ebq, ebk, ebv, bq, bk, bv));
+            if !int8 {
+                let bq = upload(ctx, &bias[0..QD as usize]);
+                let bk = upload(ctx, &bias[QD as usize..(QD + KVD) as usize]);
+                let bv = upload(ctx, &bias[(QD + KVD) as usize..]);
+                let ebq = wbuf_t(ctx, &wq, AW, QD);
+                let ebk = wbuf_t(ctx, &wk, AW, KVD);
+                let ebv = wbuf_t(ctx, &wv, AW, KVD);
+                eager_qkv.push((ebq, ebk, ebv, bq, bk, bv));
+            }
         }
-        {
+        if fi8[i][3].is_some() {
+            s.binds.push(ctx.malloc(16).expect("i8 wt 槽占位"));
+        } else {
             let host = lay
                 .map(|l| lw_f16(&l.attention.output))
                 .unwrap_or_else(|| rand_f16((QD * AW) as usize, &mut seed, 8000.0));
@@ -3677,19 +3794,25 @@ pub fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e
         s.data(ctx, &format!("{}outb", tag), &[1, AW], &outb_h);
         s.data(ctx, &format!("{}mscl", tag), &[AW], &norm_f16(AW as usize, &mut seed, 1.0));
         s.data(ctx, &format!("{}msh", tag), &[AW], &norm_f16(AW as usize, &mut seed, 0.0));
-        {
+        if fi8[i][4].is_some() {
+            s.binds.push(ctx.malloc(16).expect("i8 wt 槽占位"));
+        } else {
             let host = lay
                 .map(|l| lw_f16(&l.mlp.gate))
                 .unwrap_or_else(|| rand_f16((AW * AINTER) as usize, &mut seed, 8000.0));
             s.wt(ctx, &format!("{}gatewt", tag), &[AINTER, AW], &host, AW, AINTER);
         }
-        {
+        if fi8[i][5].is_some() {
+            s.binds.push(ctx.malloc(16).expect("i8 wt 槽占位"));
+        } else {
             let host = lay
                 .map(|l| lw_f16(&l.mlp.up))
                 .unwrap_or_else(|| rand_f16((AW * AINTER) as usize, &mut seed, 8000.0));
             s.wt(ctx, &format!("{}upwt", tag), &[AINTER, AW], &host, AW, AINTER);
         }
-        {
+        if fi8[i][6].is_some() {
+            s.binds.push(ctx.malloc(16).expect("i8 wt 槽占位"));
+        } else {
             let host = lay
                 .map(|l| lw_f16(&l.mlp.down))
                 .unwrap_or_else(|| rand_f16((AINTER * AW) as usize, &mut seed, 8000.0));
@@ -3744,12 +3867,26 @@ pub fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e
         let tag = format!("l{i}_");
         // attention（normed 已是本层 ada-norm 输出；q1/r1 验证链）
         let (q2, k2, v2) = if qkv3 {
-            let qm = s.mm(&format!("{}qm", tag), &normed, &[HOR, AW], &format!("{}qw", tag), &[QD, AW], &[HOR, QD]);
-            let km = s.mm(&format!("{}km", tag), &normed, &[HOR, AW], &format!("{}kw", tag), &[KVD, AW], &[HOR, KVD]);
-            let vm = s.mm(&format!("{}vm", tag), &normed, &[HOR, AW], &format!("{}vw", tag), &[KVD, AW], &[HOR, KVD]);
-            let qb = s.bias(&format!("{}qb_", tag), &qm, &[HOR, QD], &format!("{}qb", tag));
-            let kb = s.bias(&format!("{}kb_", tag), &km, &[HOR, KVD], &format!("{}kb", tag));
-            let vb = s.bias(&format!("{}vb_", tag), &vm, &[HOR, KVD], &format!("{}vb", tag));
+            let qm = mm_or_qmd(&mut s, &format!("{}qm", tag), &normed, &[HOR, AW], fi8[i][0].as_ref(), &format!("{}qw", tag), QD, &[HOR, QD], int8_native);
+            let km = mm_or_qmd(&mut s, &format!("{}km", tag), &normed, &[HOR, AW], fi8[i][1].as_ref(), &format!("{}kw", tag), KVD, &[HOR, KVD], int8_native);
+            let vm = mm_or_qmd(&mut s, &format!("{}vm", tag), &normed, &[HOR, AW], fi8[i][2].as_ref(), &format!("{}vw", tag), KVD, &[HOR, KVD], int8_native);
+            // int8：Gemma bias≡0 砍 TileD+Add 对（同 prefix 先例；bias Data
+            // 保留注册占图输入槽——布局稳定）
+            let qb = if fi8[i][0].is_some() {
+                qm
+            } else {
+                s.bias(&format!("{}qb_", tag), &qm, &[HOR, QD], &format!("{}qb", tag))
+            };
+            let kb = if fi8[i][1].is_some() {
+                km
+            } else {
+                s.bias(&format!("{}kb_", tag), &km, &[HOR, KVD], &format!("{}kb", tag))
+            };
+            let vb = if fi8[i][2].is_some() {
+                vm
+            } else {
+                s.bias(&format!("{}vb_", tag), &vm, &[HOR, KVD], &format!("{}vb", tag))
+            };
             (qb, kb, vb)
         } else {
             let qkv = s.mm(&format!("{}qkv", tag), &normed, &[HOR, AW], &format!("{}qkvwt", tag), &[QKVW, AW], &[HOR, QKVW]);
@@ -3805,20 +3942,28 @@ pub fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e
             let pfa = s.pfa(&format!("{}pfa", tag), &qr3, &kall3, &vall3, &[1, HOR, QD], &[1, total, KVD], HEADS, KV_HEADS, HD);
             s.squeeze(&format!("{}sq", tag), &pfa, &[1, HOR, QD], &[HOR, QD])
         };
-        let proj = s.mm(&format!("{}proj", tag), &sq, &[HOR, QD], &format!("{}outwt", tag), &[AW, QD], &[HOR, AW]);
-        let projb = s.bias(&format!("{}projb", tag), &proj, &[HOR, AW], &format!("{}outb", tag));
+        let proj = mm_or_qmd(&mut s, &format!("{}proj", tag), &sq, &[HOR, QD], fi8[i][3].as_ref(), &format!("{}outwt", tag), AW, &[HOR, AW], int8_native);
+        let projb = if fi8[i][3].is_some() {
+            proj
+        } else {
+            s.bias(&format!("{}projb", tag), &proj, &[HOR, AW], &format!("{}outb", tag))
+        };
         // 分支 ×gate 进残差（torch _gated_residual：residual + branch·gate）
         let gated = s.gatew(&format!("{}ag", tag), &projb, &[HOR, AW], &format!("{}agate", tag));
         let res = s.add2(&format!("{}res", tag), &gated, &xstream, &[HOR, AW]);
 
         // mlp
         let mnorm = s.ada(&format!("{}mn", tag), &res, "zeros", &format!("{}mscl", tag), &format!("{}msh", tag), &[HOR, AW]);
-        let gate = s.mm(&format!("{}gate", tag), &mnorm, &[HOR, AW], &format!("{}gatewt", tag), &[AINTER, AW], &[HOR, AINTER]);
-        let up = s.mm(&format!("{}up", tag), &mnorm, &[HOR, AW], &format!("{}upwt", tag), &[AINTER, AW], &[HOR, AINTER]);
+        let gate = mm_or_qmd(&mut s, &format!("{}gate", tag), &mnorm, &[HOR, AW], fi8[i][4].as_ref(), &format!("{}gatewt", tag), AINTER, &[HOR, AINTER], int8_native);
+        let up = mm_or_qmd(&mut s, &format!("{}up", tag), &mnorm, &[HOR, AW], fi8[i][5].as_ref(), &format!("{}upwt", tag), AINTER, &[HOR, AINTER], int8_native);
         let gact = s.gelu(&format!("{}gact", tag), &gate, &[HOR, AINTER], true);
         let act = s.mul2(&format!("{}act", tag), &gact, &up, &[HOR, AINTER]);
-        let down = s.mm(&format!("{}down", tag), &act, &[HOR, AINTER], &format!("{}downwt", tag), &[AW, AINTER], &[HOR, AW]);
-        let downb = s.bias(&format!("{}downb", tag), &down, &[HOR, AW], &format!("{}downb", tag));
+        let down = mm_or_qmd(&mut s, &format!("{}down", tag), &act, &[HOR, AINTER], fi8[i][6].as_ref(), &format!("{}downwt", tag), AW, &[HOR, AW], int8_native);
+        let downb = if fi8[i][6].is_some() {
+            down
+        } else {
+            s.bias(&format!("{}downb", tag), &down, &[HOR, AW], &format!("{}downb", tag))
+        };
         let gated2 = s.gatew(&format!("{}mg", tag), &downb, &[HOR, AW], &format!("{}mgate", tag));
         let hidden = s.add2(&format!("{}h", tag), &gated2, &res, &[HOR, AW]);
 
@@ -4200,7 +4345,16 @@ pub fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e
         }
         return;
     }
-    parity_and_bench(ctx, stream, &mut s, "flow", &[(HOR * ADIM) as usize], &eager, bench);
+    if int8 {
+        // eager/parity 跳过（同 prefix int8 先例）：f16 eager 参考对 int8 图
+        // 无裁判意义——法官 = e2e golden 对拍 + task0 行为。烤桶 OM 落盘照常
+        if let Ok(p) = std::env::var("GEB_SAVE") {
+            s.g.save(&p).expect("save om (flow int8)");
+            println!("OM saved: {p}");
+        }
+    } else {
+        parity_and_bench(ctx, stream, &mut s, "flow", &[(HOR * ADIM) as usize], &eager, bench);
+    }
     ge_builder::fini().expect("fini");
     println!("GE_FLOW_PROBE_OK");
 }
@@ -6726,8 +6880,10 @@ pub fn optest(be: &AscendBackend, which: &str, real: Option<&Pi05Weights>) {
         // transpose_weight 布局约定（对冲 desc 语义读错的风险）。
         "qmd" => {
             let stream = be.stream();
-            let m = 832i64;
-            let k = 2048i64;
+            // GEB_QMD_M/K：形状旋钮（flow 段 M=50/K=1024-4096 单算定罪用；
+            // REAL 分支的 k 须配权重真值——a7gate 是 1024）
+            let m = envi("GEB_QMD_M", 832);
+            let k = envi("GEB_QMD_K", 2048);
             // GEB_QMD_N：输出维覆盖（合成链）——n=256（KVD，k/v 投影）的
             // legacy kernel 分支疑点（2026-09-28：生产 k-only 复现 1300×）
             let n = envi("GEB_QMD_N", 8192);
