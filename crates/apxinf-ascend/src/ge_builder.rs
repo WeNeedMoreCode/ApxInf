@@ -47,6 +47,8 @@ pub enum Dtype {
     Int32,
     Int64,
     Int8,
+    /// QuantBatchMatmulV3 packed scale（TransQuantParamV2 产物 uint64）
+    Uint64,
 }
 
 impl Dtype {
@@ -57,6 +59,7 @@ impl Dtype {
             Dtype::Int32 => "int32",
             Dtype::Int64 => "int64",
             Dtype::Int8 => "int8",
+            Dtype::Uint64 => "uint64",
         })
         .expect("dtype str")
     }

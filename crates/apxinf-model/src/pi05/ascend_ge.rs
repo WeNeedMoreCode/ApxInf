@@ -7148,6 +7148,223 @@ pub fn optest(be: &AscendBackend, which: &str, real: Option<&Pi05Weights>) {
                     sn3 = Some(s3);
                 }
             }
+            // —— 链 X：x_scale 静态化（GEB_QMD_XS=perchannel|pertensor|pertokenscale）
+            // 注册表实证（cann-9.0.1 opp ops_legacy/quant_matmul_dequant.json）：
+            // x_scale idx4 / x_offset idx5 为可选输入（bin1 f32 / bin2 f16+int64
+            // weight_scale）；x_quant_mode 默认 "pertoken"，libopapi strings 枚举
+            // {pertoken, pertensor, perchannel, pertokenScale}（后者报错原文要求
+            // x_scale 首维 = x 的 MDim）。本链 = 静态 x_scale（oracle：当前 x 的
+            // 包络 amax/127）+ 对应 mode，探明三件事：① 310P 编译面支持哪个
+            // 静态模式；② 数值约定（dequant 是否回乘 x_scale）；③ 单算下动态
+            // amax 流水 vs 静态 scale 的执行差（qmd 小 M per-op quant 开销的
+            // 执行面对策）。GEB_QMD_XSO=1 附加 x_offset=0（对称量化试金石）。
+            let mut sx_seg: Option<Seg> = None;
+            let mut sx_meta: Option<(String, Vec<i64>, Vec<f32>)> = None;
+            if let Ok(xmode) = std::env::var("GEB_QMD_XS") {
+                let xm = xmode.to_ascii_lowercase();
+                // 值透传 GE（垃圾值也放行 = proto 校验对照实验：垃圾能编 =
+                // attr 未被校验，"编译过"不构成静态路径存在证据）。
+                // GEB_QMD_XSD=2：perchannel 的 desc 改 [1,k]（形状变体）。
+                let xsd2 = std::env::var("GEB_QMD_XSD").as_deref() == Ok("2");
+                let (mode, dims, vals): (&str, Vec<i64>, Vec<f32>) = match xm.as_str() {
+                    "perchannel" => {
+                        let mut v = vec![0f32; k as usize];
+                        for kk in 0..k as usize {
+                            let mut mx = 0f32;
+                            for mm_ in 0..m as usize {
+                                mx = mx.max(xq_in[mm_ * k as usize + kk].to_f32().abs());
+                            }
+                            v[kk] = (mx / 127.0).max(1e-12);
+                        }
+                        ("perchannel", if xsd2 { vec![1, k] } else { vec![k] }, v)
+                    }
+                    "pertensor" => {
+                        let mut mx = 0f32;
+                        for xv in &xq_in {
+                            mx = mx.max(xv.to_f32().abs());
+                        }
+                        ("pertensor", vec![1], vec![(mx / 127.0).max(1e-12)])
+                    }
+                    "pertokenscale" => {
+                        let mut v = vec![0f32; m as usize];
+                        for mm_ in 0..m as usize {
+                            let mut mx = 0f32;
+                            for kk in 0..k as usize {
+                                mx = mx.max(xq_in[mm_ * k as usize + kk].to_f32().abs());
+                            }
+                            v[mm_] = (mx / 127.0).max(1e-12);
+                        }
+                        // 注册名驼峰（libopapi strings 原文）
+                        ("pertokenScale", vec![m], v)
+                    }
+                    // 垃圾/未知值：pertensor 式标量 scale 直达 GE 校验面
+                    other => {
+                        let mut mx = 0f32;
+                        for xv in &xq_in {
+                            mx = mx.max(xv.to_f32().abs());
+                        }
+                        (Box::leak(xmode.clone().into_boxed_str()), vec![1], vec![(mx / 127.0).max(1e-12)])
+                    }
+                };
+                println!(
+                    "[qmd] X 链 mode={mode} x_scale dims={dims:?} val[0]={:.6} |max|xs|={:.4}",
+                    vals[0],
+                    vals.iter().fold(0f32, |a, v| a.max(*v))
+                );
+                let mut sg = Seg::new("qmd_x");
+                sg.data(ctx, "x", &[m, k], &xq_in);
+                sg.data_i8(ctx, "wq", &[n, k], &w_q);
+                sg.data_f32(ctx, "ws", &[n], &scale);
+                sg.data_f32(ctx, "xs", &dims, &vals);
+                let has_off = std::env::var("GEB_QMD_XSO").is_ok();
+                if has_off {
+                    let z = vec![0f32; dims.iter().product::<i64>() as usize];
+                    sg.data_f32(ctx, "xo", &dims, &z);
+                }
+                sg.g.add_op("opx", "QuantMatmulDequant").unwrap();
+                sg.g.set_input_desc("opx", "x", &[m, k], Dtype::Fp16).unwrap();
+                sg.g.set_input_desc("opx", "quantized_weight", &[n, k], Dtype::Int8).unwrap();
+                sg.g.set_input_desc("opx", "weight_scale", &[n], Dtype::Fp32).unwrap();
+                sg.g.set_input_desc("opx", "x_scale", &dims, Dtype::Fp32).unwrap();
+                if has_off {
+                    sg.g.set_input_desc("opx", "x_offset", &dims, Dtype::Fp32).unwrap();
+                    sg.g.link("opx", "x_offset", "xo").unwrap();
+                }
+                sg.g.set_output_desc("opx", "y", &[m, n], Dtype::Fp16).unwrap();
+                sg.g.set_attr_bool("opx", "transpose_weight", true).unwrap();
+                sg.g.set_attr_str("opx", "x_quant_mode", mode).unwrap();
+                sg.g.link("opx", "x", "x").unwrap();
+                sg.g.link("opx", "quantized_weight", "wq").unwrap();
+                sg.g.link("opx", "weight_scale", "ws").unwrap();
+                sg.g.link("opx", "x_scale", "xs").unwrap();
+                sg.reg_out("opx", "y");
+                sg.finish(&["opx"]);
+                sx_meta = Some((mode.to_string(), dims, vals));
+                sx_seg = Some(sg);
+            }
+            // —— 链 W：WeightQuantBatchMatmulV2（w8a16——weight-only int8，
+            // x 全程 f16，零激活量化流水/零激活量化误差）。ops_nn 注册表契约：
+            // x f16 / weight int8 / antiquant_scale f16 / bias f16（可选）；
+            // attrs transpose_x/transpose_weight/antiquant_group_size(0)/
+            // dtype(-1)/inner_precise(0)。权重/scale 复用链 Q（per-out-channel
+            // [n]，f16 化直入）。探明：① 310P 编译+数值（vs host W8A16 参考
+            // 与 F f16——期望 ≈W8A16 线：纯权重量化误差 ~1%）；② 计时 vs
+            // Q(qmd w8a8)/F——M=50 带宽域无 quant 流水能否兑现带宽减半。
+            // GEB_QMD_WQ=2 → antiquant_scale desc [n,1] 变体。
+            let mut sw_seg: Option<Seg> = None;
+            if let Ok(wqmode) = std::env::var("GEB_QMD_WQ") {
+                // WQ=3 = eager 判决契约（pyo3_check/wq_eager_test.py）：weight
+                // [k,n] 连续 + scale [n] + 不转置；[n,k]+tw=true 被 host check
+                // 拒（weight_k_dim 读 shape[0]："The k of x and weight should
+                // be equal"）。
+                let aq_dims: Vec<i64> = if wqmode == "2" { vec![n, 1] } else { vec![n] };
+                let aq: Vec<f16> = scale.iter().map(|&v| f16::from_f32(v)).collect();
+                let (w_dims_w, tw_flag): (Vec<i64>, bool) = if wqmode == "3" {
+                    (vec![k, n], false)
+                } else {
+                    (vec![n, k], true)
+                };
+                println!(
+                    "[qmd] W 链 w8a16 w={:?} tw={tw_flag} antiquant_scale dims={aq_dims:?}",
+                    w_dims_w
+                );
+                let mut sg = Seg::new("qmd_w");
+                sg.data(ctx, "x", &[m, k], &xq_in);
+                if wqmode == "3" {
+                    let mut wqt = vec![0i8; (n * k) as usize];
+                    for nn in 0..n as usize {
+                        for kk in 0..k as usize {
+                            wqt[kk * n as usize + nn] = w_q[nn * k as usize + kk];
+                        }
+                    }
+                    sg.data_i8(ctx, "wq", &w_dims_w, &wqt);
+                } else {
+                    sg.data_i8(ctx, "wq", &w_dims_w, &w_q);
+                }
+                sg.data(ctx, "aq", &aq_dims, &aq);
+                sg.g.add_op("opw", "WeightQuantBatchMatmulV2").unwrap();
+                sg.g.set_input_desc("opw", "x", &[m, k], Dtype::Fp16).unwrap();
+                sg.g.set_input_desc("opw", "weight", &w_dims_w, Dtype::Int8).unwrap();
+                sg.g.set_input_desc("opw", "antiquant_scale", &aq_dims, Dtype::Fp16).unwrap();
+                sg.g.set_output_desc("opw", "y", &[m, n], Dtype::Fp16).unwrap();
+                sg.g.set_attr_bool("opw", "transpose_x", false).unwrap();
+                sg.g.set_attr_bool("opw", "transpose_weight", tw_flag).unwrap();
+                // GEB_QMD_WA：注册表 dtype 默认 -1（未设）——离线图疑须显式给。
+                // =1 dtype=1(DT_FLOAT16)；=2 再加 antiquant_group_size=0。
+                if let Ok(wa) = std::env::var("GEB_QMD_WA") {
+                    if wa == "1" || wa == "2" {
+                        sg.g.set_attr_int("opw", "dtype", 1).unwrap();
+                    }
+                    if wa == "2" {
+                        sg.g.set_attr_int("opw", "antiquant_group_size", 0).unwrap();
+                    }
+                    println!("[qmd] W 链 attr 附加 wa={wa}");
+                }
+                sg.g.link("opw", "x", "x").unwrap();
+                sg.g.link("opw", "weight", "wq").unwrap();
+                sg.g.link("opw", "antiquant_scale", "aq").unwrap();
+                sg.reg_out("opw", "y");
+                sg.finish(&["opw"]);
+                sw_seg = Some(sg);
+            }
+            // —— 链 Z：ops_nn/dynamic 类别墙判决（GEB_QMD_Z=<OpName>，build-only）
+            // WQBMV2 实测 "Do op tiling failed, no valid template"（ascendc
+            // arch35 模板族——310P 无模板项，plog 取证）。本链冒烟同类
+            // DynamicQuantV2（vllm-ascend w8a8 分解主力：per-token 量化独立
+            // 化 + smooth_scales 可选输入，输出 y int8 + scale/offset f32）：
+            // 过/拒直接判决整个 ops_nn/dynamic 家族在 310P GE 离线的存废。
+            // attrs 不设（注册表无默认 → GE 填 is_default_value）。
+            if let Ok(zop) = std::env::var("GEB_QMD_Z") {
+                let mut zg = Seg::new("qmd_z");
+                zg.data(ctx, "x", &[m, k], &xq_in);
+                zg.g.add_op("opz", &zop).unwrap();
+                zg.g.set_input_desc("opz", "x", &[m, k], Dtype::Fp16).unwrap();
+                zg.g.set_output_desc("opz", "y", &[m, k], Dtype::Int8).unwrap();
+                zg.g.link("opz", "x", "x").unwrap();
+                zg.reg_out("opz", "y");
+                zg.finish(&["opz"]);
+                println!("[qmd] Z 链 {zop} BUILD OK（ops_nn/dynamic 类别墙未拦）");
+            }
+            // —— 链 Z2：分解式 w8a8 生产拓扑 build 冒烟（GEB_QMD_Z2=1）——
+            // DynamicQuantV2(x f16 → x_q int8) → QuantBatchMatmulV3(x_q,
+            // w_q int8, packed_scale) → y f16；packed scale 由
+            // TransQuantParamV2(f32 [n] → u64) 图内生成（u64 走 op-to-op，
+            // 免 u64 Data——FFI dtype 表已加 uint64）。全 ops_nn/dynamic：
+            // 过/拒 = 分解路线存废（WQBMV2 已被 arch35 模板墙挡）。
+            if std::env::var("GEB_QMD_Z2").is_ok() {
+                let mut zg = Seg::new("qmd_z2");
+                zg.data(ctx, "x", &[m, k], &xq_in);
+                zg.data_i8(ctx, "wq", &[n, k], &w_q);
+                let wsf = vec![0.005f32; n as usize]; // 任意正 scale 占位（build 冒烟）
+                zg.data_f32(ctx, "ws", &[n], &wsf);
+                zg.g.add_op("dq", "DynamicQuantV2").unwrap();
+                zg.g.set_input_desc("dq", "x", &[m, k], Dtype::Fp16).unwrap();
+                zg.g.set_output_desc("dq", "y", &[m, k], Dtype::Int8).unwrap();
+                zg.wire("dq", "x", "x");
+                zg.reg_out("dq", "y");
+                zg.g.add_op("tqp", "TransQuantParamV2").unwrap();
+                zg.g.set_input_desc("tqp", "scale", &[n], Dtype::Fp32).unwrap();
+                // 输出 desc 不设（u64 打包 shape 由算子推断——显式 [n] 会
+                // rc=-3 冲突）
+                zg.wire("tqp", "scale", "ws");
+                zg.reg_out("tqp", "y");
+                zg.g.add_op("qb3", "QuantBatchMatmulV3").unwrap();
+                zg.g.set_input_desc("qb3", "x1", &[m, k], Dtype::Int8).unwrap();
+                zg.g.set_input_desc("qb3", "x2", &[n, k], Dtype::Int8).unwrap();
+                zg.g.set_input_desc("qb3", "scale", &[n], Dtype::Uint64).unwrap();
+                zg.g.set_output_desc("qb3", "y", &[m, n], Dtype::Fp16).unwrap();
+                zg.g.set_attr_bool("qb3", "transpose_x1", false).unwrap();
+                zg.g.set_attr_bool("qb3", "transpose_x2", true).unwrap();
+                // infer 函数硬要求（OP_PROTO QuantBmmInferShape 报
+                // "GetOpAttr out_dtype failed!"）；1 = DT_FLOAT16
+                zg.g.set_attr_int("qb3", "dtype", 1).unwrap();
+                zg.wire("qb3", "x1", "dq");
+                zg.wire("qb3", "x2", "wq");
+                zg.wire("qb3", "scale", "tqp");
+                zg.reg_out("qb3", "y");
+                zg.finish(&["qb3"]);
+                println!("[qmd] Z2 链 DQ+TQP+QBMV3 BUILD OK（分解路线存续）");
+            }
             // —— 运行 + 下载
             let run_seg = |s: &mut Seg, tag: &str| -> Vec<f16> {
                 let ins: Vec<&DeviceBuffer> = s.ins();
@@ -7162,6 +7379,8 @@ pub fn optest(be: &AscendBackend, which: &str, real: Option<&Pi05Weights>) {
             let y_q = run_seg(&mut sq, "Q");
             let y_f = run_seg(&mut sf, "F");
             let y_n = sn.as_mut().map(|sg| run_seg(sg, "N"));
+            let y_x = sx_seg.as_mut().map(|sg| run_seg(sg, "X"));
+            let y_w = sw_seg.as_mut().map(|sg| run_seg(sg, "W"));
             // N6：单算 OM save/load 复现（GEB_QMD_NSM=6）——legacy 算子
             // （ops_legacy 预编译 binary）离线 OM task 序列化疑点：生产 int8
             // OM 重载后全饱和而活图干净，输入表 size/dims 全同。单算 OM
@@ -7254,6 +7473,75 @@ pub fn optest(be: &AscendBackend, which: &str, real: Option<&Pi05Weights>) {
             println!(
                 "[qmd] host 参考切片×{rows_ref}: W8A16 max_diff={md_w8a16:.4} / W8A8 max_diff={md_w8a8:.4}（小者 = 内部激活量化模式）"
             );
+            // —— 对拍 2b：链 X vs Q/F + host 静态量化参考（x_scale 数学约定：
+            // y = scale[n]·Σ round(x/xs)·clamp·wq·xs——匹配 = 静态约定成立；
+            // 与 Q 同 = 算子忽略 x_scale 仍跑 pertoken；全炸 = desc/形状拒）
+            if let (Some(yx), Some((mode, dims, vals))) = (&y_x, &sx_meta) {
+                let mut md_xq = 0f32;
+                let mut md_xf = 0f32;
+                for ((xv, q), f) in yx.iter().zip(y_q.iter()).zip(y_f.iter()) {
+                    md_xq = md_xq.max((xv.to_f32() - q.to_f32()).abs());
+                    md_xf = md_xf.max((xv.to_f32() - f.to_f32()).abs());
+                }
+                println!(
+                    "[qmd] X({mode} dims={dims:?}) vs Q: max_diff={md_xq:.4} / vs F: rel={:.3}%",
+                    md_xf / nrm * 100.0
+                );
+                let xs_at = |mm_: usize, kk: usize| -> f32 {
+                    if dims.len() == 2 || mode == "perchannel" {
+                        vals[kk]
+                    } else if dims.len() == 1 && dims[0] == 1 {
+                        vals[0]
+                    } else {
+                        vals[mm_.min(vals.len() - 1)] // pertokenScale [m]
+                    }
+                };
+                let mut md_xr = 0f32;
+                for mm_ in 0..rows_ref.min(m as usize) {
+                    let rb = mm_ * k as usize;
+                    for nn in 0..n as usize {
+                        let wb = nn * k as usize;
+                        let mut acc = 0f32;
+                        for kk in 0..k as usize {
+                            let xs = xs_at(mm_, kk);
+                            acc += (x_f32[rb + kk] / xs)
+                                .round()
+                                .clamp(-127.0, 127.0)
+                                * xs
+                                * w_q[wb + kk] as f32;
+                        }
+                        let yr = acc * scale[nn];
+                        md_xr = md_xr.max((yx[mm_ * n as usize + nn].to_f32() - yr).abs());
+                    }
+                }
+                println!(
+                    "[qmd] X vs host 静态参考: max_diff={md_xr:.4}（≈W8A8 量级 = 静态 x_scale 约定成立）"
+                );
+            }
+            // —— 对拍 2c：链 W（w8a16）vs F + host W8A16 参考（纯权重量化误差）
+            if let Some(yw) = &y_w {
+                let mut md_wf = 0f32;
+                for (a, b) in yw.iter().zip(y_f.iter()) {
+                    md_wf = md_wf.max((a.to_f32() - b.to_f32()).abs());
+                }
+                let mut md_wr = 0f32;
+                for mm_ in 0..rows_ref.min(m as usize) {
+                    let rb = mm_ * k as usize;
+                    for nn in 0..n as usize {
+                        let wb = nn * k as usize;
+                        let mut a16 = 0f32;
+                        for kk in 0..k as usize {
+                            a16 += x_f32[rb + kk] * w_q[wb + kk] as f32;
+                        }
+                        let yr = a16 * scale[nn];
+                        md_wr = md_wr.max((yw[mm_ * n as usize + nn].to_f32() - yr).abs());
+                    }
+                }
+                println!(
+                    "[qmd] W(w8a16) vs F: rel={:.3}% / vs host W8A16 参考: max_diff={md_wr:.4}（≈0 = antiquant per-channel [n] 约定成立）",
+                    md_wf / nrm * 100.0
+                );
+            }
             // —— bench：两链各 rounds×per（run+sync median）
             let bench_seg = |s: &mut Seg, tag: &str| {
                 let ins: Vec<&DeviceBuffer> = s.ins();
@@ -7283,6 +7571,18 @@ pub fn optest(be: &AscendBackend, which: &str, real: Option<&Pi05Weights>) {
             let tq = bench_seg(&mut sq, "Q");
             let tf = bench_seg(&mut sf, "F");
             println!("[qmd] int8/f16 = {:.2}x（{tq:.3} vs {tf:.3} ms）", tf / tq);
+            if let Some(sg) = sx_seg.as_mut() {
+                let tx = bench_seg(sg, "X");
+                println!("[qmd] X/Q = {:.2}x（X={tx:.3} vs Q={tq:.3} ms）", tq / tx);
+            }
+            if let Some(sg) = sw_seg.as_mut() {
+                let tw16 = bench_seg(sg, "W");
+                println!(
+                    "[qmd] W/F = {:.2}x / W/Q = {:.2}x（W={tw16:.3} vs F={tf:.3} / Q={tq:.3} ms）",
+                    tf / tw16,
+                    tq / tw16
+                );
+            }
         }
         other => panic!("GEB_OPTEST: ...|v3n|tldn|lnv4c|asc*|ma*|bc4|wgt|oproj|arm|attn|wmm|wmm2|wmm3|wmm4|wmm5|qmd, got {other}"),
     }

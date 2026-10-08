@@ -110,8 +110,11 @@ bool ParseDtype(const char *s, ge::DataType &dt) {
         dt = ge::DT_INT8;
     } else if (v == "bool") {
         dt = ge::DT_BOOL;
+    } else if (v == "uint64") {
+        // QuantBatchMatmulV3 的 packed scale 输入（TransQuantParamV2 产物）
+        dt = ge::DT_UINT64;
     } else {
-        std::cerr << "[geb] unknown dtype '" << v << "' (fp16/fp32/int32/int64/int8/bool)" << std::endl;
+        std::cerr << "[geb] unknown dtype '" << v << "' (fp16/fp32/int32/int64/int8/bool/uint64)" << std::endl;
         return false;
     }
     return true;
