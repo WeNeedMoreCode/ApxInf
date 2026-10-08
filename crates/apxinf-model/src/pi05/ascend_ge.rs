@@ -7365,6 +7365,80 @@ pub fn optest(be: &AscendBackend, which: &str, real: Option<&Pi05Weights>) {
                 zg.finish(&["qb3"]);
                 println!("[qmd] Z2 链 DQ+TQP+QBMV3 BUILD OK（分解路线存续）");
             }
+            // —— 链 Z3：分解式 w8a8 run 对拍 + packed scale 位型解码
+            // （GEB_QMD_Z3=1 全链对拍 / =2 DQ 单算 bench）——Z2 只证 build；
+            // 本链跑真值，探明三件事：① DQ 量化语义（scale vs amax/127、
+            // offset 分布、y vs round(x/sx)——attrs 未显式设，语义从读回
+            // 输出反推）；② TQP u64 打包位型（host 无法先验，读位型对照
+            // f32 bits）；③ QBMV3 反量化公式（host 自洽参考：读回的
+            // dq_y/dq_scale 直接重组）+ vs Q(qmd 同数学)。
+            // 生产拓扑关键新增：qb3.pertoken_scale ← dq.scale（Z2 未接的
+            // 那根线）。多输出图输出绕过 Seg::finish（outports 单端口/
+            // 单输出假设），graph_outputs_idx 手绑。
+            let mut sz_seg: Option<Seg> = None;
+            if let Ok(z3m) = std::env::var("GEB_QMD_Z3") {
+                let mut zg = Seg::new("qmd_z3");
+                zg.data(ctx, "x", &[m, k], &xq_in);
+                zg.g.add_op("dq", "DynamicQuantV2").unwrap();
+                zg.g.set_input_desc("dq", "x", &[m, k], Dtype::Fp16).unwrap();
+                zg.g.set_output_desc("dq", "y", &[m, k], Dtype::Int8).unwrap();
+                // scale/offset 输出 desc 显式设 [m] f32（确定性形状；避免
+                // #14/#25 无 desc 图输出 → 动态 size 陷阱）
+                zg.g.set_output_desc("dq", "scale", &[m], Dtype::Fp32).unwrap();
+                zg.g.set_output_desc("dq", "offset", &[m], Dtype::Fp32).unwrap();
+                zg.g.link("dq", "x", "x").unwrap();
+                let mut out_names: Vec<&str> = Vec::new();
+                let mut out_idxs: Vec<i32> = Vec::new();
+                if z3m != "2" {
+                    zg.data_i8(ctx, "wq", &[n, k], &w_q);
+                    zg.data_f32(ctx, "ws", &[n], &scale);
+                    zg.g.add_op("tqp", "TransQuantParamV2").unwrap();
+                    zg.g.set_input_desc("tqp", "scale", &[n], Dtype::Fp32).unwrap();
+                    // tqp 输出 desc 不设（u64 打包 shape 由算子推断——显式
+                    // [n] 会 rc=-3 冲突，Z2 教训）
+                    zg.g.link("tqp", "scale", "ws").unwrap();
+                    zg.g.add_op("qb3", "QuantBatchMatmulV3").unwrap();
+                    zg.g.set_input_desc("qb3", "x1", &[m, k], Dtype::Int8).unwrap();
+                    zg.g.set_input_desc("qb3", "x2", &[n, k], Dtype::Int8).unwrap();
+                    zg.g.set_input_desc("qb3", "scale", &[n], Dtype::Uint64).unwrap();
+                    // mode 3 = 不接 pertoken_scale（core200 模板清单唯一形态：
+                    // u64-scale+B_TRANS+TBE+NOT_PERTOKEN——探 no-pertoken 语义，
+                    // 静态 x scale 折叠路径的可行性判据）
+                    if z3m != "3" {
+                        zg.g.set_input_desc("qb3", "pertoken_scale", &[m], Dtype::Fp32).unwrap();
+                    }
+                    zg.g.set_output_desc("qb3", "y", &[m, n], Dtype::Fp16).unwrap();
+                    zg.g.set_attr_bool("qb3", "transpose_x1", false).unwrap();
+                    zg.g.set_attr_bool("qb3", "transpose_x2", true).unwrap();
+                    zg.g.set_attr_int("qb3", "dtype", 1).unwrap();
+                    // dq 双输出 op-to-op：y→x1 / scale→pertoken_scale
+                    // （wire() 的 outports 单端口映射不够，直连 link_out）
+                    zg.g.link_out("qb3", "x1", "dq", "y").unwrap();
+                    if z3m != "3" {
+                        zg.g.link_out("qb3", "pertoken_scale", "dq", "scale").unwrap();
+                    }
+                    zg.g.link("qb3", "x2", "wq").unwrap();
+                    zg.g.link_out("qb3", "scale", "tqp", "y").unwrap();
+                    out_names = vec!["qb3", "tqp"];
+                    out_idxs = vec![0, 0];
+                }
+                out_names.extend(["dq", "dq", "dq"]);
+                out_idxs.extend([0, 1, 2]);
+                // 手动 finish：多输出绑定（graph_outputs_idx）
+                let names: Vec<&str> = zg.names.iter().map(|s| s.as_str()).collect();
+                let shape_refs: Vec<(&str, &[i64])> = zg
+                    .names
+                    .iter()
+                    .zip(&zg.shapes)
+                    .map(|(nm, d)| (nm.as_str(), d.as_slice()))
+                    .collect();
+                zg.g.graph_inputs(&names).unwrap();
+                zg.g.graph_outputs_idx(&out_names, &out_idxs).unwrap();
+                zg.g.set_nd_input_shape(&shape_refs).unwrap();
+                zg.g.build().expect("build z3");
+                println!("[qmd] Z3 mode={z3m} BUILD OK（DQ+TQP+QBMV3+pertoken_scale 接线）");
+                sz_seg = Some(zg);
+            }
             // —— 运行 + 下载
             let run_seg = |s: &mut Seg, tag: &str| -> Vec<f16> {
                 let ins: Vec<&DeviceBuffer> = s.ins();
@@ -7381,6 +7455,181 @@ pub fn optest(be: &AscendBackend, which: &str, real: Option<&Pi05Weights>) {
             let y_n = sn.as_mut().map(|sg| run_seg(sg, "N"));
             let y_x = sx_seg.as_mut().map(|sg| run_seg(sg, "X"));
             let y_w = sw_seg.as_mut().map(|sg| run_seg(sg, "W"));
+            // —— Z3 run + 语义解码（GEB_QMD_Z3）——
+            if let Some(sg) = sz_seg.as_mut() {
+                let ins: Vec<&DeviceBuffer> = sg.ins();
+                let nout = sg.g.num_outputs().unwrap();
+                let sizes: Vec<usize> = (0..nout).map(|i| sg.g.output_size(i).unwrap()).collect();
+                let dims: Vec<Vec<i64>> = (0..nout).map(|i| sg.g.output_dims(i).unwrap()).collect();
+                println!(
+                    "[qmd] Z3 模型输出 {nout} 个（期望 qb3 m*n*2={}/ dq.y m*k={}/ scale,offset m*4={}/ tqp n*8={}）sizes={sizes:?} dims={dims:?}",
+                    (m * n * 2) as usize,
+                    (m * k) as usize,
+                    (m * 4) as usize,
+                    (n * 8) as usize
+                );
+                for &s in &sizes {
+                    assert!(s < (1 << 30), "Z3 输出 size 异常 {s}（图输出动态 desc 陷阱）");
+                }
+                let obs: Vec<DeviceBuffer> = sizes.iter().map(|&s| ctx.malloc(s).unwrap()).collect();
+                let orefs: Vec<&DeviceBuffer> = obs.iter().collect();
+                sg.g.run(&ins, &orefs, stream).unwrap();
+                drop(stream.synchronize());
+                let dl = |b: &DeviceBuffer, n: usize| -> Vec<u8> {
+                    let mut v = vec![0u8; n];
+                    ctx.copy_d2h(b, &mut v).expect("d2h z3");
+                    v
+                };
+                // 按 size 对号入座（陷阱 #32：多输出算子绑图输出时兄弟输出
+                // 可能被自动补绑、顺序不保证——按值不按槽）
+                let mut y_z3: Vec<f16> = Vec::new();
+                let mut dq_y: Vec<i8> = Vec::new();
+                let mut f32_outs: Vec<Vec<f32>> = Vec::new();
+                let mut tqp_y: Vec<u64> = Vec::new();
+                for (i, &s) in sizes.iter().enumerate() {
+                    if s == (m * n * 2) as usize && y_z3.is_empty() {
+                        y_z3 = dl(&obs[i], s)
+                            .chunks_exact(2)
+                            .map(|c| f16::from_bits(u16::from_le_bytes([c[0], c[1]])))
+                            .collect();
+                    } else if s == (m * k) as usize && dq_y.is_empty() {
+                        dq_y = dl(&obs[i], s).iter().map(|&b| b as i8).collect();
+                    } else if s == (m * 4) as usize {
+                        let v: Vec<f32> = dl(&obs[i], s)
+                            .chunks_exact(4)
+                            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                            .collect();
+                        f32_outs.push(v);
+                    } else if s == (n * 8) as usize && tqp_y.is_empty() {
+                        tqp_y = dl(&obs[i], s)
+                            .chunks_exact(8)
+                            .map(|c| u64::from_le_bytes([c[0], c[1], c[2], c[3], c[4], c[5], c[6], c[7]]))
+                            .collect();
+                    }
+                }
+                // —— DQ 语义解码 ①：scale vs amax/127、offset 分布 ——
+                let x_f32z: Vec<f32> = xq_in.iter().map(|v| v.to_f32()).collect();
+                let mut sx_ref = vec![0f32; m as usize];
+                for mm_ in 0..m as usize {
+                    let mut mx = 0f32;
+                    for kk in 0..k as usize {
+                        mx = mx.max(x_f32z[mm_ * k as usize + kk].abs());
+                    }
+                    sx_ref[mm_] = (mx / 127.0).max(1e-12);
+                }
+                // scale/offset 按值区分（scale ≈ sx_ref 正值量级）
+                let (dq_scale, dq_off) = {
+                    let a = f32_outs.get(0).cloned().unwrap_or_default();
+                    let b = f32_outs.get(1).cloned().unwrap_or_default();
+                    if a.len() == m as usize && b.len() == m as usize {
+                        let err_a = a
+                            .iter()
+                            .zip(&sx_ref)
+                            .map(|(g, r)| ((g - r) / r).abs())
+                            .fold(0f32, |x, v| x.max(v));
+                        let err_b = b
+                            .iter()
+                            .zip(&sx_ref)
+                            .map(|(g, r)| ((g - r) / r).abs())
+                            .fold(0f32, |x, v| x.max(v));
+                        if err_a <= err_b { (a, b) } else { (b, a) }
+                    } else {
+                        (a, b)
+                    }
+                };
+                let sx_err = if dq_scale.len() == m as usize {
+                    dq_scale
+                        .iter()
+                        .zip(&sx_ref)
+                        .map(|(g, r)| ((g - r) / r).abs())
+                        .fold(0f32, |x, v| x.max(v))
+                } else {
+                    f32::INFINITY
+                };
+                let off_max = dq_off.iter().fold(0f32, |a, v| a.max(v.abs()));
+                println!(
+                    "[qmd] Z3 DQ.scale vs amax/127: max_rel={sx_err:.3e} / DQ.offset |max|={off_max:.3e}（≈0 = 对称量化）/ scale[0..4]={:?}",
+                    &dq_scale[..4.min(dq_scale.len())]
+                );
+                // —— DQ 语义解码 ②：y vs round(x/sx)（前 4 行）——
+                if dq_y.len() == (m * k) as usize {
+                    let sx_of = |i: usize| if sx_err < 0.01 { sx_ref[i] } else { dq_scale[i] };
+                    let mut y_mm = 0usize;
+                    let mut y_md = 0f32;
+                    for mm_ in 0..4.min(m as usize) {
+                        let sx = sx_of(mm_);
+                        for kk in 0..k as usize {
+                            let r = (x_f32z[mm_ * k as usize + kk] / sx).round().clamp(-127.0, 127.0);
+                            let d = (dq_y[mm_ * k as usize + kk] as f32 - r).abs();
+                            y_md = y_md.max(d);
+                            if d > 0.5 {
+                                y_mm += 1;
+                            }
+                        }
+                    }
+                    println!(
+                        "[qmd] Z3 DQ.y vs round(x/scale)（前 4 行）: max_diff={y_md} mismatch(>0.5)={y_mm}/{}（≈0 = 对称 round 语义）",
+                        4.min(m as usize) * k as usize
+                    );
+                }
+                // —— TQP 位型解码：u64 vs f32 bits ——
+                if tqp_y.len() == n as usize {
+                    let mut lo32_eq = 0usize;
+                    let mut hi32_eq = 0usize;
+                    let show_n = 4.min(n as usize);
+                    let mut show = String::new();
+                    for nn in 0..n as usize {
+                        let fb = scale[nn].to_bits() as u64;
+                        if tqp_y[nn] & 0xFFFFFFFF == fb {
+                            lo32_eq += 1;
+                        }
+                        if tqp_y[nn] >> 32 == fb {
+                            hi32_eq += 1;
+                        }
+                        if nn < show_n {
+                            show.push_str(&format!(
+                                "\n      ws[{nn}]={:e} f32bits={:08x} → u64={:016x}",
+                                scale[nn],
+                                scale[nn].to_bits(),
+                                tqp_y[nn]
+                            ));
+                        }
+                    }
+                    println!(
+                        "[qmd] Z3 TQP 打包: low32==f32bits ×{lo32_eq}/{} / high32==f32bits ×{hi32_eq}/{} 样例:{show}",
+                        n as usize,
+                        n as usize
+                    );
+                }
+                // —— QBMV3 公式解码：host 自洽参考 + vs Q ——
+                if !y_z3.is_empty() && dq_y.len() == (m * k) as usize {
+                    let sx_of = |i: usize| if sx_err < 0.01 { sx_ref[i] } else { dq_scale[i] };
+                    let mut md_self = 0f32;
+                    let mut md_nosx = 0f32;
+                    for mm_ in 0..8.min(m as usize) {
+                        let sx = sx_of(mm_);
+                        for nn in 0..n as usize {
+                            let mut acc = 0f32;
+                            for kk in 0..k as usize {
+                                acc += dq_y[mm_ * k as usize + kk] as f32 * w_q[nn * k as usize + kk] as f32;
+                            }
+                            let yr = acc * sx * scale[nn];
+                            md_self = md_self.max((y_z3[mm_ * n as usize + nn].to_f32() - yr).abs());
+                            // no-pertoken 语义假设：y = sw[n]·Σ xq·wq（x scale
+                            // 须静态折进 packed scale——本参考不乘 sx）
+                            let yr_no = acc * scale[nn];
+                            md_nosx = md_nosx.max((y_z3[mm_ * n as usize + nn].to_f32() - yr_no).abs());
+                        }
+                    }
+                    let mut md_q = 0f32;
+                    for (a, b) in y_z3.iter().zip(y_q.iter()) {
+                        md_q = md_q.max((a.to_f32() - b.to_f32()).abs());
+                    }
+                    println!(
+                        "[qmd] Z3 qb3.y vs host 参考（前 8 行）: sx[m]·sw[n]·Σ max_diff={md_self:.4} / sw[n]·Σ（no-pertoken 假设）max_diff={md_nosx:.4} / vs Q(qmd): max_diff={md_q:.4}"
+                    );
+                }
+            }
             // N6：单算 OM save/load 复现（GEB_QMD_NSM=6）——legacy 算子
             // （ops_legacy 预编译 binary）离线 OM task 序列化疑点：生产 int8
             // OM 重载后全饱和而活图干净，输入表 size/dims 全同。单算 OM
@@ -7581,6 +7830,39 @@ pub fn optest(be: &AscendBackend, which: &str, real: Option<&Pi05Weights>) {
                     "[qmd] W/F = {:.2}x / W/Q = {:.2}x（W={tw16:.3} vs F={tf:.3} / Q={tq:.3} ms）",
                     tf / tw16,
                     tq / tw16
+                );
+            }
+            // Z3 bench：多输出图（bench_seg 单输出假设不够，内联版本）
+            if let Some(sg) = sz_seg.as_mut() {
+                let ins: Vec<&DeviceBuffer> = sg.ins();
+                let nout = sg.g.num_outputs().unwrap();
+                let obs: Vec<DeviceBuffer> = (0..nout)
+                    .map(|i| ctx.malloc(sg.g.output_size(i).unwrap()).unwrap())
+                    .collect();
+                let orefs: Vec<&DeviceBuffer> = obs.iter().collect();
+                for _ in 0..3 {
+                    sg.g.run(&ins, &orefs, stream).unwrap();
+                }
+                drop(stream.synchronize());
+                let rounds = envi("GEB_ROUNDS", 30) as usize;
+                let per = envi("GEB_PER", 5).max(1) as usize;
+                let mut ts = Vec::new();
+                for r in 0..rounds {
+                    let t0 = std::time::Instant::now();
+                    for _ in 0..per {
+                        sg.g.run(&ins, &orefs, stream).unwrap();
+                    }
+                    drop(stream.synchronize());
+                    if r >= 3 {
+                        ts.push(t0.elapsed().as_secs_f64() * 1e3 / per as f64);
+                    }
+                }
+                ts.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let tz = ts[ts.len() / 2];
+                println!(
+                    "[qmd] Z3 chain bench: {tz:.3} ms (median/{per}) / Q(qmd)={tq:.3} → Q/Z3={:.2}x / Δ={:.3} ms",
+                    tq / tz,
+                    tq - tz
                 );
             }
         }
