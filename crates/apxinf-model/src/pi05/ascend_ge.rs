@@ -763,7 +763,9 @@ impl Seg {
     /// 行广播输入注册（bias 行）：静态 = [1,cols] 原行（消费端 TileD 广播）；
     /// gear = [gdyn,cols] 行重复 rows 份——TileD multiples 含 p 时全档共享
     /// 不可用（attr 不随档变），改内容即广播（逐行相同，前缀截断语义）。
-    /// int8 折叠路径不消费 bias：传 rows=1 注册原行省内存
+    /// int8 折叠路径不消费 bias：gear 模式下干脆不注册（静态 Data 混入
+    /// 动态集 = SetDims 145012——未消费的静态输入也占图输入位）；静态模式
+    /// 传 rows=1 注册原行省内存
     fn row_bcast(
         &mut self,
         ctx: &AscendContext,
@@ -772,12 +774,17 @@ impl Seg {
         cols: i64,
         row: &[f16],
     ) -> String {
-        if gear_mode() && rows > 1 {
-            let mut rep = Vec::with_capacity((rows * cols) as usize);
-            for _ in 0..rows {
-                rep.extend_from_slice(row);
+        if gear_mode() {
+            if rows > 1 {
+                let mut rep = Vec::with_capacity((rows * cols) as usize);
+                for _ in 0..rows {
+                    rep.extend_from_slice(row);
+                }
+                self.data(ctx, name, &[gdyn(rows), cols], &rep)
+            } else {
+                // 折叠未消费：不注册（名字占位，永不连线）
+                format!("{name}_folded")
             }
-            self.data(ctx, name, &[gdyn(rows), cols], &rep)
         } else {
             self.data(ctx, name, &[1, cols], row)
         }
@@ -1895,6 +1902,9 @@ pub struct FlowMech {
     gear_of_l: std::collections::HashMap<i64, usize>,
     rope_binds: Vec<usize>,
     last_l: i64,
+    /// HYBRID：per-L 静态 flow OM 池（非空 = 按请求换句柄执行，flow 不
+    /// 走 gear——styles 静态 Data 之故，见 seg_flow 注记）
+    flows: std::collections::HashMap<i64, GeGraph>,
 }
 
 /// styles 设备驻留构装：10 步 × (6*depth+2) 段拼一块 master（一次 h2d），
@@ -1955,6 +1965,16 @@ impl FlowMech {
             .unwrap_or_else(|| panic!("flow 档表缺 L={l}（GEB_DYN_LLIST 未含）"))
     }
 
+    /// HYBRID：按 L 换 flow 静态 OM 句柄（池空 = 单 OM 原样）
+    fn swap_flow(&mut self, l: i64) {
+        if !self.flows.is_empty() {
+            self.s.g = *self
+                .flows
+                .get(&l)
+                .unwrap_or_else(|| panic!("flow OM 池缺 L={l}"));
+        }
+    }
+
     /// L 变更换装 rope 表（flat 四件 + rank-2 四件；内容 pos_offset=p——
     /// 表 HOR 定形与 p 无关，内容随 p 平移。L 不变零动作）
     fn set_rope_for(&mut self, ctx: &AscendContext, l: i64) {
@@ -1990,6 +2010,7 @@ impl FlowMech {
         };
         assert_eq!(kv.len(), self.depth * 2, "serve kv 路数不符");
         let gi = self.gear_idx(token_ids.len() as i64);
+        self.swap_flow(token_ids.len() as i64);
         self.set_rope_for(ctx, token_ids.len() as i64);
         for i in 0..self.depth {
             h2d(&self.s.binds[self.pk_base + 2 * i], &kv[2 * i]);
@@ -2033,6 +2054,7 @@ impl FlowMech {
         assert_eq!(kv_dev.len(), self.depth * 2, "serve kv 路数不符");
         assert!(!self.style_views.is_empty(), "fast 路径须先构装 styles 驻留");
         let gi = self.gear_idx(token_ids.len() as i64);
+        self.swap_flow(token_ids.len() as i64);
         self.set_rope_for(ctx, token_ids.len() as i64);
         // 分步计时：kv(d2d×36)/h2d_enq(零拷贝视图上流)/steps(逐步 enqueue)+sync/dl
         let tim = serve_timing();
@@ -3085,10 +3107,20 @@ fn reg_i8(
     };
     let sm_n = if native {
         let smf: Vec<f16> = f.smooth.iter().map(|&v| f16::from_f32(v)).collect();
-        s.data(ctx, &format!("{dump_tag}sm"), &[k], &smf)
+        // gear 模式 Const 化：静态 Data 混入动态输入集会让运行期
+        // SetInputDynamicDims 档位匹配失败（145012，spike v3 最小复现）
+        if gear_mode() {
+            s.const_f16(&format!("{dump_tag}sm"), &[k], &smf)
+        } else {
+            s.data(ctx, &format!("{dump_tag}sm"), &[k], &smf)
+        }
     } else {
         let invf: Vec<f16> = f.inv.iter().map(|&v| f16::from_f32(v)).collect();
-        s.data(ctx, &format!("{dump_tag}inv"), &[1, k], &invf)
+        if gear_mode() {
+            s.const_f16(&format!("{dump_tag}inv"), &[1, k], &invf)
+        } else {
+            s.data(ctx, &format!("{dump_tag}inv"), &[1, k], &invf)
+        }
     };
     // bias 折入算子实验已毙：int32 Const 输入 aclgrphBuildModel rc=-7
     // （legacy 算子 bias 分支不可用，2026-09-28）。改为调用方直接砍 bias op
@@ -3408,7 +3440,12 @@ pub fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e
                 &[],
             )
         };
-        s.data(ctx, &format!("{}g1", tag), &[PW], &g1_h);
+        // gear 模式 Const 化（静态 Data 混入动态集 = SetDims 145012，同 reg_i8 注记）
+        if gear_mode() {
+            s.const_f16(&format!("{}g1", tag), &[PW], &g1_h);
+        } else {
+            s.data(ctx, &format!("{}g1", tag), &[PW], &g1_h);
+        }
         {
             // f16 host 仅在对应投影未转 int8 时构造（int8 段已在上一块注册；
             // 组切 torch 域后 f16 成员除回 fold——见 lin_f16_unfold）
@@ -3509,7 +3546,11 @@ pub fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e
                 &[],
             )
         };
-        s.data(ctx, &format!("{}g2", tag), &[PW], &g2_h);
+        if gear_mode() {
+            s.const_f16(&format!("{}g2", tag), &[PW], &g2_h);
+        } else {
+            s.data(ctx, &format!("{}g2", tag), &[PW], &g2_h);
+        }
         if !i8sel("gate") {
             let host = lay
                 .map(|l| lin_f16_unfold(&l.mlp.gate, INTER as usize, mlp_i8, g2_t))
@@ -3911,9 +3952,13 @@ pub fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e
     let attn_manual = std::env::var("GEB_ATTN").map(|v| v == "manual").unwrap_or(false);
     let fscale = if attn_manual { 1.0f32 / (HD as f32).sqrt() } else { 1.0 };
     let mut s = Seg::new("ge_flow");
-    // 动态分档：与 prefix 段同源（pk/pv 36 路 [-1,KVD]；rope 表 HOR 定形
-    // 内容随 pos_offset=p 变——mech 按 L 换装；shp_kall 内容 -1 化）
-    let gear_ll = dyn_llist();
+    // 动态分档：与 prefix 段同源（pk/pv 36 路 [-1,KVD]）——但生产 HYBRID
+    // 拓扑下 flow 不走 gear（styles 是运行期内容的静态 Data 输入，无法
+    // Const 化，而静态 Data 混入动态集会让 SetInputDynamicDims 档位匹配
+    // 失败——spike v3 定罪）：flow 用 per-L 静态 OM 池（GEB_FLOW_POOL，
+    // 现存 tl{L}_i8 资产），图按 p_max 构造 binds。GEB_DYN_LLIST_FLOW 仅供
+    // gear 化 flow 的隔离实验
+    let gear_ll = std::env::var("GEB_DYN_LLIST_FLOW").ok().and_then(|_| dyn_llist());
     let mut gear_ps_hold: Option<Vec<i64>> = None;
     let gd = |v: i64| if gear_ll.is_some() { -1 } else { v };
     if let Some(g) = &gear_ll {
@@ -4488,8 +4533,24 @@ pub fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e
         let rw = real.expect("e2e 需要 GEB_CKPT（time_mlp/style 投影）");
         let cfg = Pi05Config::default();
         let dir = std::env::var("GEB_OM_DIR").unwrap_or_else(|_| "/data/apxinf/om_cache".into());
-        println!("[e2e] loading {dir}/flow_real.om");
-        s.g = ge_builder::load(&format!("{dir}/flow_real.om")).expect("load om");
+        // HYBRID：GEB_FLOW_POOL=<om 根>（配 GEB_DYN_LLIST 的 L 表）——
+        // 装载 per-L 静态 flow OM 池（binds 一次 max 物化，图句柄按请求换）。
+        // bring-up 用首档句柄跑（内容 warmup 无所谓）
+        let mut flow_pool: std::collections::HashMap<i64, GeGraph> = std::collections::HashMap::new();
+        if let Ok(pool_root) = std::env::var("GEB_FLOW_POOL") {
+            let ls = dyn_llist().unwrap_or_else(|| panic!("GEB_FLOW_POOL 需 GEB_DYN_LLIST 档表"));
+            for &l in &ls {
+                let p = format!("{pool_root}/tl{l}_i8/flow_real.om");
+                println!("[flow-pool] loading {p}");
+                let g = ge_builder::load(&p).unwrap_or_else(|e| panic!("flow pool {p}: {e:?}"));
+                flow_pool.insert(l, g);
+            }
+            let first = *ls.first().expect("档表非空");
+            s.g = flow_pool[&first];
+        } else {
+            println!("[e2e] loading {dir}/flow_real.om");
+            s.g = ge_builder::load(&format!("{dir}/flow_real.om")).expect("load om");
+        }
         assert_eq!(s.g.num_outputs().unwrap(), 1);
         let ob = ctx.malloc(s.g.output_size(0).unwrap().max(16)).expect("out malloc");
         let h2d_f16 = |buf: &DeviceBuffer, vals: &[f16]| {
@@ -4778,6 +4839,7 @@ pub fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e
                 gear_of_l,
                 rope_binds,
                 last_l: -1,
+                flows: flow_pool,
             });
         }
         return;
