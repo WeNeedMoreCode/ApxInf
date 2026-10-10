@@ -856,6 +856,128 @@ impl GeGraph {
         Ok(())
     }
 
+    // ---- 动态分档（ge.dynamicDims OM；spike v1/v2 实证配方）----
+
+    /// 档数（静态 OM = 0）。
+    pub fn gear_count(&self) -> Result<usize> {
+        type F = unsafe extern "C" fn(i64) -> i32;
+        let l = lib().map_err(|e| {
+            eprintln!("[ge_builder] {e}");
+            AclError { code: -1, op: "ge load" }
+        })?;
+        let f: Symbol<F> = unsafe { l.get(b"geb_gear_count") }.map_err(|e| {
+            eprintln!("[ge_builder] dlsym geb_gear_count: {e}");
+            AclError { code: -1, op: "ge dlsym" }
+        })?;
+        let v = unsafe { f(self.handle) };
+        if v < 0 {
+            return Err(cerr("geb_gear_count", v));
+        }
+        Ok(v as usize)
+    }
+
+    /// 某档的全部动态输入维（拼接序 = 输入注册序——S2 payload 同源）。
+    pub fn gear_dims(&self, gear: usize) -> Result<Vec<i64>> {
+        type F = unsafe extern "C" fn(i64, i32, *mut i64, i32) -> i32;
+        let l = lib().map_err(|e| {
+            eprintln!("[ge_builder] {e}");
+            AclError { code: -1, op: "ge load" }
+        })?;
+        let f: Symbol<F> = unsafe { l.get(b"geb_gear_dims") }.map_err(|e| {
+            eprintln!("[ge_builder] dlsym geb_gear_dims: {e}");
+            AclError { code: -1, op: "ge dlsym" }
+        })?;
+        // 容量探测（返回 dimCount）→ 复调
+        let n = unsafe { f(self.handle, gear as i32, std::ptr::null_mut(), 0) };
+        if n <= 0 {
+            return Err(cerr("geb_gear_dims", n));
+        }
+        let mut buf = vec![0i64; n as usize];
+        let rc = unsafe { f(self.handle, gear as i32, buf.as_mut_ptr(), n) };
+        if rc < 0 {
+            return Err(cerr("geb_gear_dims", rc));
+        }
+        buf.truncate(rc as usize);
+        Ok(buf)
+    }
+
+    /// 档位执行：dyn_dims = 全部动态输入的维（拼接序；多动态输入必须一次
+    /// 调用带全维——单输入单独调会 145012，spike v2 S2 定式）。静态 OM
+    /// （档数 0）等价 run（dyn_dims 忽略）——调用方可无分支切换。
+    pub fn run_gear(
+        &self,
+        inputs: &[&DeviceBuffer],
+        outputs: &[&DeviceBuffer],
+        stream: &AscendStream,
+        dyn_dims: &[i64],
+    ) -> Result<()> {
+        let ins: Vec<*mut c_void> = inputs.iter().map(|b| b.as_ptr()).collect();
+        let outs: Vec<*mut c_void> = outputs.iter().map(|b| b.as_ptr()).collect();
+        type F = unsafe extern "C" fn(
+            i64,
+            *const *mut c_void,
+            i32,
+            *const *mut c_void,
+            i32,
+            *mut c_void,
+            *const i64,
+            i32,
+        ) -> i32;
+        let l = lib().map_err(|e| {
+            eprintln!("[ge_builder] {e}");
+            AclError { code: -1, op: "ge load" }
+        })?;
+        let f: Symbol<F> = unsafe { l.get(b"geb_run_gear") }.map_err(|e| {
+            eprintln!("[ge_builder] dlsym geb_run_gear: {e}");
+            AclError { code: -1, op: "ge dlsym" }
+        })?;
+        let rc = unsafe {
+            f(
+                self.handle,
+                ins.as_ptr(),
+                ins.len() as i32,
+                outs.as_ptr(),
+                outs.len() as i32,
+                stream.handle() as *mut c_void,
+                if dyn_dims.is_empty() {
+                    std::ptr::null()
+                } else {
+                    dyn_dims.as_ptr()
+                },
+                dyn_dims.len() as i32,
+            )
+        };
+        if rc != 0 {
+            return Err(cerr("geb_run_gear", rc));
+        }
+        Ok(())
+    }
+
+    /// 最近一次执行档的输出维（rank≥3 且非末维动态时消费按最大档 stride，
+    /// spike v2 实证）。
+    pub fn cur_output_dims(&self, idx: usize) -> Result<Vec<i64>> {
+        type F = unsafe extern "C" fn(i64, i32, *mut i64, i32) -> i32;
+        let l = lib().map_err(|e| {
+            eprintln!("[ge_builder] {e}");
+            AclError { code: -1, op: "ge load" }
+        })?;
+        let f: Symbol<F> = unsafe { l.get(b"geb_cur_output_dims") }.map_err(|e| {
+            eprintln!("[ge_builder] dlsym geb_cur_output_dims: {e}");
+            AclError { code: -1, op: "ge dlsym" }
+        })?;
+        let n = unsafe { f(self.handle, idx as i32, std::ptr::null_mut(), 0) };
+        if n <= 0 {
+            return Err(cerr("geb_cur_output_dims", n));
+        }
+        let mut buf = vec![0i64; n as usize];
+        let rc = unsafe { f(self.handle, idx as i32, buf.as_mut_ptr(), n) };
+        if rc < 0 {
+            return Err(cerr("geb_cur_output_dims", rc));
+        }
+        buf.truncate(rc as usize);
+        Ok(buf)
+    }
+
     pub fn unload(&self) -> Result<()> {
         type F = unsafe extern "C" fn(i64) -> i32;
         let l = lib().map_err(|e| {

@@ -89,6 +89,51 @@ pub fn envi(k: &str, d: i64) -> i64 {
     std::env::var(k).ok().and_then(|v| v.parse().ok()).unwrap_or(d)
 }
 
+// ---------------------------------------------------------------------------
+// 动态分档（ge.dynamicDims；spike v1/v2 实证配方，2026-10-10）：
+//   GEB_DYN_LLIST="137,138,...,157,200" = L 档表。构图期所有含 p 的 desc
+//   维与 Reshape shape Const 内容一律写 -1（Const 全档共享，内容必须 gear
+//   不变；-1 由分支推理按档解析——spike v2 HF 链 0.6% 三档验证）；rope
+//   表/swap 索引等 L 长度张量注册为 Data[-1]（内容逐行 p 无关，p_max 全
+//   量上流即前缀截断语义）；L 相关 Const（qswap_c）转 Data。运行期按请求
+//   选档：aclmdlSetInputDynamicDims 一次调用带全部动态输入的维（S2 定式）。
+// ---------------------------------------------------------------------------
+
+/// GEB_DYN_LLIST 解析（正整数逗号表）；None = 静态单 L 模式（行为不变）。
+pub fn dyn_llist() -> Option<Vec<i64>> {
+    std::env::var("GEB_DYN_LLIST")
+        .ok()
+        .map(|s| {
+            s.split(',')
+                .filter_map(|x| x.trim().parse::<i64>().ok())
+                .filter(|&v| v > 0)
+                .collect::<Vec<i64>>()
+        })
+        .filter(|v| !v.is_empty())
+}
+
+static GEAR_MODE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// 进程级 gear 模式开关（env 读一次；构图/执行两侧共用）。
+pub fn gear_mode() -> bool {
+    *GEAR_MODE.get_or_init(|| dyn_llist().is_some())
+}
+
+/// desc 维度的动态位替换：gear 模式一律 -1（MultiBatchClone 逐档特化；
+// 静态模式原值返回——辅助函数内统一走这里可无分支适配两模式）。
+pub fn gdyn(v: i64) -> i64 {
+    if gear_mode() {
+        -1
+    } else {
+        v
+    }
+}
+
+/// L → p（prefix 可见长度；drop 与段内公式同源）。
+pub fn lp_to_p(l: i64) -> i64 {
+    VT + l - envi("GEB_PREFIX_DROP_EMPTY", 0)
+}
+
 /// erf 近似（Abramowitz-Stegun 7.1.26，|ε|<1.5e-7——exact gelu 对照够用）
 pub fn erf(x: f32) -> f32 {
     let s = x.signum();
@@ -424,6 +469,13 @@ pub struct Seg {
     outports: std::collections::HashMap<String, &'static str>,
     /// LayerNormV4 实例名（finish 时 mean/rstd 绑 aux 图输出）
     ln_aux: Vec<String>,
+    /// gear 模式（GEB_DYN_LLIST）：每档的 p 值（VT+L-drop_v，段侧喂入）。
+    /// finish 时合成 ge.dynamicDims 档表 + 每档 S2 payload（全部动态输入
+    /// 维拼接，输入注册序）——mech 直接取用做 run_gear 入参
+    pub gear_ps: Vec<i64>,
+    gear_mul: std::collections::HashMap<String, i64>,
+    /// 每档 S2 payload（gear 模式非空；静态模式空 = run 等价）
+    pub gear_payloads: Vec<Vec<i64>>,
 }
 
 impl Seg {
@@ -440,6 +492,9 @@ impl Seg {
             datas: std::collections::HashSet::new(),
             outports: std::collections::HashMap::new(),
             ln_aux: Vec::new(),
+            gear_ps: Vec::new(),
+            gear_mul: std::collections::HashMap::new(),
+            gear_payloads: Vec::new(),
         }
     }
 
@@ -455,6 +510,75 @@ impl Seg {
     fn reg_out(&mut self, op: &str, port: &'static str) -> String {
         self.outports.insert(op.to_string(), port);
         op.to_string()
+    }
+
+    /// gear 模式装配（段侧喂档表的 p 值；动态输入 dim0 = mul×p，缺省 mul=1）
+    pub fn set_gear_ps(&mut self, ps: Vec<i64>) {
+        self.gear_ps = ps;
+    }
+
+    pub fn set_gear_mul(&mut self, name: &str, mul: i64) {
+        self.gear_mul.insert(name.to_string(), mul);
+    }
+
+    /// bind 下标按 Data 名查（mech 换装 rope 表用；names/binds 平行注册）
+    pub fn bind_of(&self, name: &str) -> usize {
+        self.names
+            .iter()
+            .position(|n| n == name)
+            .unwrap_or_else(|| panic!("bind_of: 图输入 {name} 不存在"))
+    }
+
+    /// 每档 S2 payload：全部含 -1 维的输入的 dim0 值拼接（输入注册序）。
+    /// 本图族动态维恒为 dim0 单维（多 -1 输入未支持——断言钉死）
+    fn compose_gear_payloads(&mut self) {
+        self.gear_payloads.clear();
+        if self.gear_ps.is_empty() {
+            return;
+        }
+        let names = self.names.clone();
+        let shapes = self.shapes.clone();
+        let muls: Vec<i64> = names
+            .iter()
+            .map(|n| self.gear_mul.get(n).copied().unwrap_or(1))
+            .collect();
+        for &pg in &self.gear_ps {
+            let mut pl = Vec::new();
+            for ((n, shp), &mul) in names.iter().zip(&shapes).zip(&muls) {
+                let ndyn = shp.iter().filter(|&&d| d == -1).count();
+                assert!(
+                    ndyn <= 1,
+                    "gear 输入 {n} 含 {ndyn} 个 -1 维（只支持 dim0 单维）"
+                );
+                if ndyn == 1 {
+                    assert_eq!(shp[0], -1, "gear 输入 {n} 的 -1 须在 dim0");
+                    pl.push(mul * pg);
+                }
+            }
+            self.gear_payloads.push(pl);
+        }
+        println!(
+            "[gear] {} 档；payload 维数 {}（首档 {:?}）",
+            self.gear_ps.len(),
+            self.gear_payloads[0].len(),
+            self.gear_payloads[0]
+        );
+    }
+
+    /// 档位执行便捷口：payload 取 self（静态模式走原 run，无分支切换）
+    pub fn run_seg(
+        &self,
+        gi: usize,
+        outputs: &[&DeviceBuffer],
+        stream: &AscendStream,
+    ) -> crate::Result<()> {
+        let ins = self.ins();
+        if self.gear_payloads.is_empty() {
+            self.g.run(&ins, outputs, stream)
+        } else {
+            self.g
+                .run_gear(&ins, outputs, stream, &self.gear_payloads[gi])
+        }
     }
 
     fn data_buf(&mut self, name: &str, dims: &[i64], buf: DeviceBuffer) -> String {
@@ -1264,6 +1388,9 @@ impl Seg {
     }
 
     fn finish(&mut self, out_names: &[&str]) {
+        // gear payload 合成先于一切早退（serve/e2e 模式跳过编译但 mech 仍需
+        // payload 做逐请求选档；names/shapes 此刻已定）
+        self.compose_gear_payloads();
         if std::env::var("GEB_LOAD").is_ok() {
             // 缓存加载模式：跳过编译，parity_and_bench 里替换为磁盘 OM
             return;
@@ -1297,6 +1424,23 @@ impl Seg {
             self.g.graph_outputs_idx(&all, &idxs).unwrap();
         }
         self.g.set_nd_input_shape(&shape_refs).unwrap();
+        // gear 模式：ge.dynamicDims 档表（每档全部 -1 维的值，输入注册序
+        // 拼接；与 payload 同源）——spike v1/v2 定式
+        if !self.gear_payloads.is_empty() {
+            let opt = self
+                .gear_payloads
+                .iter()
+                .map(|pl| {
+                    pl.iter()
+                        .map(|v| v.to_string())
+                        .collect::<Vec<String>>()
+                        .join(",")
+                })
+                .collect::<Vec<String>>()
+                .join(";");
+            println!("[gear] dynamicDims: {opt}");
+            self.g.set_option("ge.dynamicDims", &opt).unwrap();
+        }
         // GEB_OPT_<key>=<value>：build option 直通口（A/B 实验，如
         // GEB_OPT_ge.streamMaxParallelNum=AIcoreEngine:1,VectorEngine:1）
         for (k, v) in std::env::vars().filter(|(k, _)| k.starts_with("GEB_OPT_")) {
@@ -1369,7 +1513,6 @@ pub fn parity_and_bench(
     mem("after-eager");
 
     // GE run（加载缓存或已 build 的图；GEB_WCONST 时 ins 只含真图输入）
-    let ins: Vec<&DeviceBuffer> = seg.ins();
     let n_out = seg.g.num_outputs().unwrap();
     for i in 0..n_out {
         println!("[out-dims] {i}: size={} dims={:?}", seg.g.output_size(i).unwrap_or(0), seg.g.output_dims(i).unwrap_or_default());
@@ -1378,7 +1521,9 @@ pub fn parity_and_bench(
         .map(|i| ctx.malloc(seg.g.output_size(i).unwrap().max(16)).expect("out malloc"))
         .collect();
     let out_refs: Vec<&DeviceBuffer> = outs.iter().collect();
-    seg.g.run(&ins, &out_refs, stream).expect("ge run");
+    // gear 模式 bring-up = max 档内容 → 末档执行（静态 = run_seg 0 档）
+    seg.run_seg(seg.gear_payloads.len().saturating_sub(1), &out_refs, stream)
+        .expect("ge run");
     drop(stream.synchronize());
 
     // GEB_DBG：打印每个图输出缓冲的 |max| + head（层 0 各级绑成图输出后
@@ -1579,7 +1724,21 @@ pub struct PrefixMech {
     /// 数值恒等：同 ids 同算式（f32 mul 确定性）产同字节
     tok_cache_ids: Vec<u32>,
     tok_cache_rows: Vec<f16>,
+    /// gear 模式：L → 档下标（静态模式空 = 固定 L 单桶）
+    gear_of_l: std::collections::HashMap<i64, usize>,
 }
+
+impl PrefixMech {
+    /// L → 档下标（静态模式恒 0——run_seg 走原 run 分支）
+    fn gear_idx(&self, l: i64) -> usize {
+        if self.s.gear_payloads.is_empty() {
+            return 0;
+        }
+        *self
+            .gear_of_l
+            .get(&l)
+            .unwrap_or_else(|| panic!("prefix 档表缺 L={l}（GEB_DYN_LLIST 未含）"))
+    }
 
 impl PrefixMech {
     /// 一帧 prefix（设备态）：重组 x0（本帧 vision_out 可见行 + 真 token
@@ -1597,6 +1756,7 @@ impl PrefixMech {
         // 计时：asm(x0 组装+查表)/h2d_enq(零拷贝视图上流)/run/wait
         let tim = serve_timing();
         let t0 = std::time::Instant::now();
+        let gi = self.gear_idx(token_ids.len() as i64);
         // token 查表缓存：ids 变化才重算（prompt 跨 replan 恒定——同任务
         // 桶内 token_ids 不变）。数值恒等：同算式（f32 mul）产同 f16 字节
         if self.tok_cache_ids != token_ids {
@@ -1616,15 +1776,15 @@ impl PrefixMech {
         let mut x0 = vision_out[..self.vis_rows].to_vec();
         x0.extend_from_slice(&self.tok_cache_rows);
         let t1 = std::time::Instant::now();
-        assert_eq!(x0.len() * 2, self.s.binds[0].len(), "serve x0 尺寸不符");
+        // gear 模式 binds[0] = p_max 物化（x0 实际 p 行 ≤ max——h2d 按实长）
+        assert!(x0.len() * 2 <= self.s.binds[0].len(), "serve x0 尺寸超 max 档");
         // 零拷贝字节视图（x0 活到函数尾，async h2d 借用安全）
         let bytes: &[u8] =
             unsafe { std::slice::from_raw_parts(x0.as_ptr() as *const u8, x0.len() * 2) };
         ctx.copy_h2d_async(&self.s.binds[0], bytes, stream).expect("serve h2d x0");
         let t2 = std::time::Instant::now();
-        let ins = self.s.ins();
         let refs: Vec<&DeviceBuffer> = self.routs.iter().collect();
-        self.s.g.run(&ins, &refs, stream).expect("ge run");
+        self.s.run_seg(gi, &refs, stream).expect("ge run");
         let t3 = std::time::Instant::now();
         drop(stream.synchronize());
         if tim {
@@ -1651,9 +1811,18 @@ impl PrefixMech {
         token_ids: &[u32],
     ) -> Vec<Vec<f16>> {
         self.one_frame_dev(ctx, stream, vision_out, token_ids);
-        (0..self.nkv)
-            .map(|i| download_f16(ctx, &self.routs[i], self.s.g.output_size(i).unwrap() / 2))
-            .collect()
+        (0..self.nkv).map(|i| self.download_kv(ctx, i)).collect()
+    }
+
+    /// kv 下载（gear 模式按当前档实际行数——cur_output_dims；静态 = 满 buffer）
+    fn download_kv(&self, ctx: &AscendContext, i: usize) -> Vec<f16> {
+        let n = if self.s.gear_payloads.is_empty() {
+            self.s.g.output_size(i).unwrap() / 2
+        } else {
+            let dims = self.s.g.cur_output_dims(i).unwrap_or_else(|e| panic!("cur dims: {e:?}"));
+            dims.iter().product::<i64>() as usize
+        };
+        download_f16(ctx, &self.routs[i], n)
     }
 }
 
@@ -1673,6 +1842,11 @@ pub struct FlowMech {
     style_views: Vec<Vec<DeviceBuffer>>,
     style_map: std::collections::HashMap<usize, usize>,
     ins_order: Vec<usize>,
+    /// gear 模式：L → 档下标 + rope 表 bind 下标（表 HOR 定形、内容随
+    /// pos_offset=p 变——L 变更时换装；last_l 恒定则零动作）
+    gear_of_l: std::collections::HashMap<i64, usize>,
+    rope_binds: Vec<usize>,
+    last_l: i64,
 }
 
 /// styles 设备驻留构装：10 步 × (6*depth+2) 段拼一块 master（一次 h2d），
@@ -1722,6 +1896,36 @@ pub fn style_residency(
 }
 
 impl FlowMech {
+    /// L → 档下标（静态模式恒 0）
+    fn gear_idx(&self, l: i64) -> usize {
+        if self.s.gear_payloads.is_empty() {
+            return 0;
+        }
+        *self
+            .gear_of_l
+            .get(&l)
+            .unwrap_or_else(|| panic!("flow 档表缺 L={l}（GEB_DYN_LLIST 未含）"))
+    }
+
+    /// L 变更换装 rope 表（flat 四件 + rank-2 四件；内容 pos_offset=p——
+    /// 表 HOR 定形与 p 无关，内容随 p 平移。L 不变零动作）
+    fn set_rope_for(&mut self, ctx: &AscendContext, l: i64) {
+        if self.s.gear_payloads.is_empty() || self.last_l == l {
+            return;
+        }
+        let p = lp_to_p(l);
+        let (qc, qs, _) = rope_flat_const(HOR, HEADS, p);
+        let (kc, ks, _) = rope_flat_const(HOR, KV_HEADS, p);
+        let (qc2, qs2) = rope_rank2_const(HOR, HEADS, p);
+        let (kc2, ks2) = rope_rank2_const(HOR, KV_HEADS, p);
+        let tables: Vec<&[f16]> = vec![&qc, &qs, &kc, &ks, &qc2, &qs2, &kc2, &ks2];
+        for (bi, vals) in self.rope_binds.iter().zip(tables) {
+            let bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect();
+            ctx.copy_h2d(&self.s.binds[*bi], &bytes).expect("flow rope h2d");
+        }
+        self.last_l = l;
+    }
+
     /// 一帧 flow：36 路 pk/pv 换绑 + noise 重启 10 步（styles 缓存直取；
     /// euler c1/c2 已在 bring-up 换绑 LeRobot 语义且 buffer 内容恒持）
     fn one_frame(
@@ -1729,6 +1933,7 @@ impl FlowMech {
         ctx: &AscendContext,
         stream: &AscendStream,
         kv: &[Vec<f16>],
+        token_ids: &[u32],
         noise: &[f16],
     ) -> Vec<f16> {
         let h2d = |buf: &DeviceBuffer, vals: &[f16]| {
@@ -1736,6 +1941,8 @@ impl FlowMech {
             ctx.copy_h2d(buf, &bytes).expect("serve h2d");
         };
         assert_eq!(kv.len(), self.depth * 2, "serve kv 路数不符");
+        let gi = self.gear_idx(token_ids.len() as i64);
+        self.set_rope_for(ctx, token_ids.len() as i64);
         for i in 0..self.depth {
             h2d(&self.s.binds[self.pk_base + 2 * i], &kv[2 * i]);
             h2d(&self.s.binds[self.pk_base + 2 * i + 1], &kv[2 * i + 1]);
@@ -1754,9 +1961,8 @@ impl FlowMech {
             h2d(&self.s.binds[self.fs_idx], &sc[6 * self.depth]);
             h2d(&self.s.binds[self.fs_idx + 1], &sc[6 * self.depth + 1]);
             h2d(&self.s.binds[0], &x); // state = 当前 x
-            let ins = self.s.ins();
             let oref: Vec<&DeviceBuffer> = vec![&self.ob];
-            self.s.g.run(&ins, &oref, stream).expect("ge run");
+            self.s.run_seg(gi, &oref, stream).expect("ge run");
             drop(stream.synchronize());
             x = download_f16(ctx, &self.ob, (HOR * ADIM) as usize);
         }
@@ -1773,19 +1979,26 @@ impl FlowMech {
         ctx: &AscendContext,
         stream: &AscendStream,
         kv_dev: &[&DeviceBuffer],
+        token_ids: &[u32],
         noise: &[f16],
     ) -> Vec<f16> {
         assert_eq!(kv_dev.len(), self.depth * 2, "serve kv 路数不符");
         assert!(!self.style_views.is_empty(), "fast 路径须先构装 styles 驻留");
+        let gi = self.gear_idx(token_ids.len() as i64);
+        self.set_rope_for(ctx, token_ids.len() as i64);
         // 分步计时：kv(d2d×36)/h2d_enq(零拷贝视图上流)/steps(逐步 enqueue)+sync/dl
         let tim = serve_timing();
         let t0 = std::time::Instant::now();
         for i in 0..self.depth * 2 {
-            assert_eq!(
-                kv_dev[i].len(),
-                self.s.binds[self.pk_base + i].len(),
-                "fast kv 尺寸不符（路 {i}）"
-            );
+            // gear 模式两侧均 max 档 buffer（d2d 全量拷贝，尾部无效行被
+            // 分支 desc 裁掉；静态模式等长断言保留）
+            if self.s.gear_payloads.is_empty() {
+                assert_eq!(
+                    kv_dev[i].len(),
+                    self.s.binds[self.pk_base + i].len(),
+                    "fast kv 尺寸不符（路 {i}）"
+                );
+            }
             ctx.copy_d2d_async(&self.s.binds[self.pk_base + i], kv_dev[i], stream)
                 .expect("serve d2d kv");
         }
@@ -1808,7 +2021,16 @@ impl FlowMech {
                 .collect();
             let oref: Vec<&DeviceBuffer> = vec![&self.ob];
             let te = std::time::Instant::now();
-            self.s.g.run(&ins, &oref, stream).expect("ge run");
+            // gear 模式：ins 自组（run_seg 的 ins() 不含 style 视图替换）——
+            // 直接 run_gear，payload 按 gi
+            if self.s.gear_payloads.is_empty() {
+                self.s.g.run(&ins, &oref, stream).expect("ge run");
+            } else {
+                self.s
+                    .g
+                    .run_gear(&ins, &oref, stream, &self.s.gear_payloads[gi])
+                    .expect("ge run gear");
+            }
             if tim {
                 enq.push(te.elapsed().as_secs_f64() * 1e3);
             }
@@ -1941,7 +2163,12 @@ pub fn e2e_run(ctx: &AscendContext, stream: &AscendStream, s: &mut Seg, seg: &st
     let path = format!("{dir}/{seg}_real.om");
     println!("[e2e] loading {path}");
     s.g = ge_builder::load(&path).expect("load om");
-    let ins = s.ins();
+    // gear 模式：bring-up 内容按 max 档物化 → 用末档跑（静态 = run_seg 0 档）
+    let gi = s.gear_payloads.len().saturating_sub(1);
+    if !s.gear_payloads.is_empty() {
+        let n = s.g.gear_count().unwrap_or(0);
+        println!("[gear] {seg} OM 档数 {n}（bring-up 用末档执行）");
+    }
     let n_out = s.g.num_outputs().unwrap();
     // GEB_OUT_PAD=<bytes>：输出 buffer 之间插 dummy 占位（不改变输出自身
     // 大小——d2h 长度断言不受影响）。若 k/v 读回变干净 ⇒ 相邻算子越界写
@@ -1959,7 +2186,7 @@ pub fn e2e_run(ctx: &AscendContext, stream: &AscendStream, s: &mut Seg, seg: &st
         .collect();
     let _ = &pads; // 占位 buffer 活到 download 之后
     let refs: Vec<&DeviceBuffer> = outs.iter().collect();
-    s.g.run(&ins, &refs, stream).expect("ge run");
+    s.run_seg(gi, &refs, stream).expect("ge run");
     drop(stream.synchronize());
     let dl: Vec<Vec<f16>> = (0..n_out)
         .map(|i| download_f16(ctx, &outs[i], s.g.output_size(i).unwrap() / 2))
@@ -1971,7 +2198,7 @@ pub fn e2e_run(ctx: &AscendContext, stream: &AscendStream, s: &mut Seg, seg: &st
         let mut ts = Vec::with_capacity(nb);
         for _ in 0..nb {
             let t = std::time::Instant::now();
-            s.g.run(&ins, &refs, stream).expect("ge run");
+            s.run_seg(gi, &refs, stream).expect("ge run");
             drop(stream.synchronize());
             let _: Vec<_> = (0..n_out)
                 .map(|i| download_f16(ctx, &outs[i], s.g.output_size(i).unwrap() / 2))
@@ -2210,17 +2437,21 @@ pub fn serve_loop(be: &AscendBackend, st: &mut E2eStage, dir: &str, tokens: usiz
         };
         let t_all = std::time::Instant::now();
         let raw = std::fs::read(&path).expect("serve req read");
-        assert_eq!(
-            raw.len(),
-            8 + exp_patches * 4 + tokens * 4 + exp_noise * 4,
-            "serve 请求长度不符（seq {seq}）"
-        );
         let magic = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
         assert_eq!(magic, 0x4751_4531, "serve 请求 magic 不符");
         let l = u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]) as usize;
+        // 静态模式 = 单 L 桶（L 须钉死）；gear 模式按请求 L 验长 + 选档
+        //（档表外 L 由 gear_idx panic 拒绝——supervisor 档表 = 谱系全集）
+        if pipe.pm.s.gear_payloads.is_empty() {
+            assert_eq!(
+                l, tokens,
+                "serve 请求 L={l} ≠ 本进程桶 GEB_TOKENS={tokens}（Python 侧挑桶错）"
+            );
+        }
         assert_eq!(
-            l, tokens,
-            "serve 请求 L={l} ≠ 本进程桶 GEB_TOKENS={tokens}（Python 侧挑桶错）"
+            raw.len(),
+            8 + exp_patches * 4 + l * 4 + exp_noise * 4,
+            "serve 请求长度不符（seq {seq} L={l}）"
         );
         let mut off = 8usize;
         let f32s = |b: &[u8]| f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
@@ -2229,11 +2460,11 @@ pub fn serve_loop(be: &AscendBackend, st: &mut E2eStage, dir: &str, tokens: usiz
             .map(|c| f16::from_f32(f32s(c)))
             .collect();
         off += exp_patches * 4;
-        let ids: Vec<u32> = raw[off..off + tokens * 4]
+        let ids: Vec<u32> = raw[off..off + l * 4]
             .chunks_exact(4)
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect();
-        off += tokens * 4;
+        off += l * 4;
         let noise: Vec<f16> = raw[off..off + exp_noise * 4]
             .chunks_exact(4)
             .map(|c| f16::from_f32(f32s(c)))
@@ -2800,6 +3031,28 @@ pub fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e
     // 公民（可见 key + 占位 512..767）＝ e2e 314% 漂移的真根因
     let drop_v = envi("GEB_PREFIX_DROP_EMPTY", 0);
     let p = VT + tokens - drop_v; // prefix 长度（16 倍数纪律）
+    // 动态分档（GEB_DYN_LLIST）：desc 维度里的 p 一律 -1（gd()），内容/
+    // buffer 仍按 p 物化（gear 模式下 tokens 必须 = 档表 max L——rope 表/
+    // zeros/swap 逐行 p 无关，p_max 全量即前缀截断语义）。L 相关 Const
+    // （qswap_c/kswap_c）在 gear 模式转 Data[-1]。档表 p 值喂 Seg，finish
+    // 合成 ge.dynamicDims + 每档 S2 payload
+    let gear_ll = dyn_llist();
+    let mut gear_ps_hold: Option<Vec<i64>> = None;
+    let gd = |v: i64| if gear_ll.is_some() { -1 } else { v };
+    if let Some(g) = &gear_ll {
+        assert!(
+            std::env::var("GEB_WCONST").is_ok(),
+            "GEB_DYN_LLIST 需 GEB_WCONST=1（权重 Const 根图单份——档间零重复的前提）"
+        );
+        assert!(std::env::var("GEB_ROPEFLAT").is_ok(), "GEB_DYN_LLIST 需 GEB_ROPEFLAT=1");
+        assert!(attn_manual, "GEB_DYN_LLIST 需 GEB_ATTN=manual");
+        assert!(qkv3, "GEB_DYN_LLIST 需 GEB_QKV3=1");
+        let lmax = *g.iter().max().unwrap();
+        assert_eq!(tokens, lmax, "GEB_DYN_LLIST 模式 GEB_TOKENS 须 = 档表 max L（binds 按 max 物化）");
+        let ps = g.iter().map(|&l| VT + l - drop_v).collect::<Vec<i64>>();
+        println!("[gear] prefix 动态分档：L {:?} → p {:?}", g, ps);
+        gear_ps_hold = Some(ps);
+    }
     let mut seed = 0xBEEFu32;
     // GEB_QKV3：q/k/v 独立投影（同 vision 段——SliceD 列切视图的运行时
     // MemcopyAsync 物化是 prefix 750ms 的主源，取证见 vision 段注记）
@@ -2840,6 +3093,9 @@ pub fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e
     let dump_dir = dump_dir_s.as_deref();
     let i8sel = |p: &str| int8 && int8_projs.contains(p);
     let mut s = Seg::new("ge_prefix");
+    if let Some(ps) = gear_ps_hold.take() {
+        s.set_gear_ps(ps);
+    }
 
     // ---- 段级输入 ----
     // 0 x0 / 1 zeros / 2..7 flat rope 六件（eager flat 版用）/
@@ -2890,7 +3146,7 @@ pub fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e
         (None, Some(_), None) => panic!("e2e 需要 GEB_CKPT（token_embedding 查表）"),
         _ => rand_f16((p * PW) as usize, &mut seed, 100.0),
     };
-    s.data(ctx, "x0", &[p, PW], &x0_h);
+    s.data(ctx, "x0", &[gd(p), PW], &x0_h);
     // GEB_NORM32 v2：常量走 Const 折叠（n32_consts 懒建），无 Data 注册
     // ——binds[0]=x0 的硬编码约束自然解除
     // bisect：x0 = cat(vision_out, 查表×√PW) 组装后即比（idx 域 [0,VT*PW)
@@ -2903,41 +3159,63 @@ pub fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e
             st.cmp_mid("x0", &x0_h);
         }
     }
-    s.data_zeros(ctx, "zeros", p, PW);
+    // zeros 显式 gear 化（data_zeros 保持纯静态——vision/optest 共用）：
+    // 内容全零逐行 p 无关，p_max 全量即前缀截断
+    {
+        let zh = vec![f16::from_f32(0.0); (p * PW) as usize];
+        s.data(ctx, "zeros", &[gd(p), PW], &zh);
+    }
     let (qc, qs, qi) = rope_flat_const(p, HEADS, 0);
     let (kc, ks, ki) = rope_flat_const(p, KV_HEADS, 0);
     let qf = (p * HEADS * 2, HD / 2);
     let kf = (p * KV_HEADS * 2, HD / 2);
-    s.data(ctx, "qcos", &[qf.0, qf.1], &qc);
-    s.data(ctx, "qsin", &[qf.0, qf.1], &qs);
-    s.data_i32(ctx, "qswap", &[qf.0], &qi);
-    s.data(ctx, "kcos", &[kf.0, kf.1], &kc);
-    s.data(ctx, "ksin", &[kf.0, kf.1], &ks);
-    s.data_i32(ctx, "kswap", &[kf.0], &ki);
+    // gear 模式：dim0 一律 -1 + mul 登记（qf.0 = p×(HEADS*2)）；内容 p_max
+    // 全量（逐行 p 无关——前缀截断语义）
+    s.data(ctx, "qcos", &[gd(qf.0), qf.1], &qc);
+    s.set_gear_mul("qcos", HEADS * 2);
+    s.data(ctx, "qsin", &[gd(qf.0), qf.1], &qs);
+    s.set_gear_mul("qsin", HEADS * 2);
+    s.data_i32(ctx, "qswap", &[gd(qf.0)], &qi);
+    s.set_gear_mul("qswap", HEADS * 2);
+    s.data(ctx, "kcos", &[gd(kf.0), kf.1], &kc);
+    s.set_gear_mul("kcos", KV_HEADS * 2);
+    s.data(ctx, "ksin", &[gd(kf.0), kf.1], &ks);
+    s.set_gear_mul("ksin", KV_HEADS * 2);
+    s.data_i32(ctx, "kswap", &[gd(kf.0)], &ki);
+    s.set_gear_mul("kswap", KV_HEADS * 2);
     // rank-2 表（物理 [t*heads, d] 与 [t, heads*d] 同布局；desc 按 rank-2 设）
     let (qc2, qs2) = rope_rank2_const(p, HEADS, 0);
     let (kc2, ks2) = rope_rank2_const(p, KV_HEADS, 0);
-    s.data(ctx, "qcos2", &[p, QD], &qc2);
-    s.data(ctx, "qsin2", &[p, QD], &qs2);
-    s.data(ctx, "kcos2", &[p, KVD], &kc2);
-    s.data(ctx, "ksin2", &[p, KVD], &ks2);
-    // Reshape shape 张量（rank-3 桥；Const——Data 会让 desc unknown）
-    s.const_i32("shp_q3", &[1, p as i32, QD as i32]);
-    s.const_i32("shp_k3", &[1, p as i32, KVD as i32]);
-    s.const_i32("shp_v3", &[1, p as i32, KVD as i32]);
+    s.data(ctx, "qcos2", &[gd(p), QD], &qc2);
+    s.data(ctx, "qsin2", &[gd(p), QD], &qs2);
+    s.data(ctx, "kcos2", &[gd(p), KVD], &kc2);
+    s.data(ctx, "ksin2", &[gd(p), KVD], &ks2);
+    // Reshape shape 张量（rank-3 桥；Const 内容 gear 不变——p 位写 -1，
+    // 分支推理按档解析，spike v2 HF 链实证）
+    s.const_i32("shp_q3", &[1, gd(p) as i32, QD as i32]);
+    s.const_i32("shp_k3", &[1, gd(p) as i32, KVD as i32]);
+    s.const_i32("shp_v3", &[1, gd(p) as i32, KVD as i32]);
     // 手工 GQA attention 的头主序桥 shape（headsplit/headmerge 用，views=1）
-    s.const_i32("shp_mq4", &[1, p as i32, HEADS as i32, HD as i32]);
-    s.const_i32("shp_mq3", &[HEADS as i32, p as i32, HD as i32]);
-    s.const_i32("shp_ma4", &[1, HEADS as i32, p as i32, HD as i32]);
-    s.const_i32("shp_mflat", &[p as i32, QD as i32]);
+    s.const_i32("shp_mq4", &[1, gd(p) as i32, HEADS as i32, HD as i32]);
+    s.const_i32("shp_mq3", &[HEADS as i32, gd(p) as i32, HD as i32]);
+    s.const_i32("shp_ma4", &[1, HEADS as i32, gd(p) as i32, HD as i32]);
+    s.const_i32("shp_mflat", &[gd(p) as i32, QD as i32]);
     // GEB_ROPEFLAT：flat 版 rope（换视图行交换，免列切视图物化）。
-    // swap 索引做 Const（编译期折叠；Data indices 会让输出 desc unknown）
+    // swap 索引：静态 Const 折叠；gear 模式转 Data[-1]（Const 全档共享而
+    // 长度随档变；Data 逐档特化 desc，内容 r^1 逐行 p 无关——spike v2 P2）
     let ropeflat = std::env::var("GEB_ROPEFLAT").is_ok();
-    s.const_i32("qswap_c", &qi);
-    s.const_i32("kswap_c", &ki);
-    s.const_i32("shp_qflat", &[qf.0 as i32, qf.1 as i32]);
-    s.const_i32("shp_kflat", &[kf.0 as i32, kf.1 as i32]);
-    s.const_i32("shp_kb2", &[p as i32, KVD as i32]);
+    if gear_ll.is_some() {
+        s.data_i32(ctx, "qswap_c", &[gd(qf.0)], &qi);
+        s.set_gear_mul("qswap_c", HEADS * 2);
+        s.data_i32(ctx, "kswap_c", &[gd(kf.0)], &ki);
+        s.set_gear_mul("kswap_c", KV_HEADS * 2);
+    } else {
+        s.const_i32("qswap_c", &qi);
+        s.const_i32("kswap_c", &ki);
+    }
+    s.const_i32("shp_qflat", &[gd(qf.0) as i32, qf.1 as i32]);
+    s.const_i32("shp_kflat", &[gd(kf.0) as i32, kf.1 as i32]);
+    s.const_i32("shp_kb2", &[gd(p) as i32, KVD as i32]);
 
     // ---- 层循环（eager qkv 独立投影，同 vision 段注记）----
     let mut eager_qkv: Vec<(DeviceBuffer, DeviceBuffer, DeviceBuffer, DeviceBuffer, DeviceBuffer, DeviceBuffer)> = Vec::new();
@@ -3134,65 +3412,65 @@ pub fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e
             .unwrap_or_else(|| rand_f16(PW as usize, &mut seed, 4000.0));
         s.data(ctx, &format!("{}downb", tag), &[1, PW], &downb_h);
 
-        let norm1 = s.addrms(&format!("{}n1", tag), &cur, "zeros", &format!("{}g1", tag), &[p, PW]);
+        let norm1 = s.addrms(&format!("{}n1", tag), &cur, "zeros", &format!("{}g1", tag), &[gd(p), PW]);
         // rank-2 切分 + rope（rank-2 版）+ Reshape rank-3 桥。
         // ⚠ 图输出绑 rank-2（rope 的 ad / slice 的 v）——Reshape 输出绑图
         // 输出时 desc 是动态 [-1,-1,-1]（shape 张量驱动），size 无效
         let (q2, k2, v2) = if qkv3 {
-            let qm = mm_or_qmd(&mut s, &format!("{}qm", tag), &norm1, &[p, PW], iq8.as_ref(), &format!("{}qw", tag), QD, &[p, QD], int8_native);
-            let km = mm_or_qmd(&mut s, &format!("{}km", tag), &norm1, &[p, PW], ik8.as_ref(), &format!("{}kw", tag), KVD, &[p, KVD], int8_native);
-            let vm = mm_or_qmd(&mut s, &format!("{}vm", tag), &norm1, &[p, PW], iv8.as_ref(), &format!("{}vw", tag), KVD, &[p, KVD], int8_native);
+            let qm = mm_or_qmd(&mut s, &format!("{}qm", tag), &norm1, &[gd(p), PW], iq8.as_ref(), &format!("{}qw", tag), QD, &[gd(p), QD], int8_native);
+            let km = mm_or_qmd(&mut s, &format!("{}km", tag), &norm1, &[gd(p), PW], ik8.as_ref(), &format!("{}kw", tag), KVD, &[gd(p), KVD], int8_native);
+            let vm = mm_or_qmd(&mut s, &format!("{}vm", tag), &norm1, &[gd(p), PW], iv8.as_ref(), &format!("{}vw", tag), KVD, &[gd(p), KVD], int8_native);
             // int8：bias 已折入算子（int32 零）——跳过 TileD+Add 对
             let qb = if iq8.is_some() {
                 qm
             } else {
-                s.bias(&format!("{}qb_", tag), &qm, &[p, QD], &format!("{}qb", tag))
+                s.bias(&format!("{}qb_", tag), &qm, &[gd(p), QD], &format!("{}qb", tag))
             };
             let kb = if ik8.is_some() {
                 km
             } else {
-                s.bias(&format!("{}kb_", tag), &km, &[p, KVD], &format!("{}kb", tag))
+                s.bias(&format!("{}kb_", tag), &km, &[gd(p), KVD], &format!("{}kb", tag))
             };
             let vb = if iv8.is_some() {
                 vm
             } else {
-                s.bias(&format!("{}vb_", tag), &vm, &[p, KVD], &format!("{}vb", tag))
+                s.bias(&format!("{}vb_", tag), &vm, &[gd(p), KVD], &format!("{}vb", tag))
             };
             (qb, kb, vb)
         } else {
-            let qkv = s.mm(&format!("{}qkv", tag), &norm1, &[p, PW], &format!("{}qkvwt", tag), &[QKVW, PW], &[p, QKVW]);
-            let qkvb = s.bias(&format!("{}qkvb", tag), &qkv, &[p, QKVW], &format!("{}qkvb", tag));
-            let q2 = s.slice2(&format!("{}q", tag), &qkvb, &[p, QKVW], 0, QD);
-            let k2 = s.slice2(&format!("{}k", tag), &qkvb, &[p, QKVW], QD, KVD);
-            let v2 = s.slice2(&format!("{}v", tag), &qkvb, &[p, QKVW], QD + KVD, KVD);
+            let qkv = s.mm(&format!("{}qkv", tag), &norm1, &[gd(p), PW], &format!("{}qkvwt", tag), &[QKVW, PW], &[gd(p), QKVW]);
+            let qkvb = s.bias(&format!("{}qkvb", tag), &qkv, &[gd(p), QKVW], &format!("{}qkvb", tag));
+            let q2 = s.slice2(&format!("{}q", tag), &qkvb, &[gd(p), QKVW], 0, QD);
+            let k2 = s.slice2(&format!("{}k", tag), &qkvb, &[gd(p), QKVW], QD, KVD);
+            let v2 = s.slice2(&format!("{}v", tag), &qkvb, &[gd(p), QKVW], QD + KVD, KVD);
             (q2, k2, v2)
         };
         let (kr2, kr3) = if ropeflat {
-            let kf2 = [kf.0, kf.1];
-            s.rope2_flat(&format!("{}kr", tag), &k2, &[p, KVD], &kf2, "kcos", "ksin", "kswap_c", "shp_kflat", "shp_kb2", "shp_k3")
+            let kf2 = [gd(kf.0), kf.1];
+            s.rope2_flat(&format!("{}kr", tag), &k2, &[gd(p), KVD], &kf2, "kcos", "ksin", "kswap_c", "shp_kflat", "shp_kb2", "shp_k3")
         } else {
-            s.rope2(&format!("{}kr", tag), &k2, &[p, KVD], "kcos2", "ksin2", "shp_k3")
+            s.rope2(&format!("{}kr", tag), &k2, &[gd(p), KVD], "kcos2", "ksin2", "shp_k3")
         };
-        let v3 = s.reshape(&format!("{}v3", tag), &v2, &[p, KVD], "shp_v3", &[1, p, KVD]);
+        let v3 = s.reshape(&format!("{}v3", tag), &v2, &[gd(p), KVD], "shp_v3", &[1, gd(p), KVD]);
         kv_outs.push(kr2.clone());
         kv_outs.push(v2.clone());
         if last {
             break; // 末层无 PFA/tail（compute_tail=false）
         }
         let (qr2, qr3) = if ropeflat {
-            let qf2 = [qf.0, qf.1];
-            s.rope2_flat(&format!("{}qr", tag), &q2, &[p, QD], &qf2, "qcos", "qsin", "qswap_c", "shp_qflat", "shp_mflat", "shp_q3")
+            let qf2 = [gd(qf.0), qf.1];
+            s.rope2_flat(&format!("{}qr", tag), &q2, &[gd(p), QD], &qf2, "qcos", "qsin", "qswap_c", "shp_qflat", "shp_mflat", "shp_q3")
         } else {
-            s.rope2(&format!("{}qr", tag), &q2, &[p, QD], "qcos2", "qsin2", "shp_q3")
+            s.rope2(&format!("{}qr", tag), &q2, &[gd(p), QD], "qcos2", "qsin2", "shp_q3")
         };
         let sq = if attn_manual {
             // 头主序桥 + GQA 手工链（k/v 单头 TileD 广播；kr3/v3 rank-3 直用）
-            let q3 = s.headsplit(&format!("{}qh", tag), &qr2, p, 1, p, HEADS, HD, "shp_mq4", "shp_mq3");
-            let attn = s.attn_manual_gqa(&format!("{}attn", tag), &q3, &kr3, &v3, HEADS, p, p, HD);
-            s.headmerge(&format!("{}am", tag), &attn, 1, p, HEADS, HD, "shp_ma4", "shp_mflat")
+            let q3 = s.headsplit(&format!("{}qh", tag), &qr2, gd(p), 1, gd(p), HEADS, HD, "shp_mq4", "shp_mq3");
+            let attn = s.attn_manual_gqa(&format!("{}attn", tag), &q3, &kr3, &v3, HEADS, gd(p), gd(p), HD);
+            s.headmerge(&format!("{}am", tag), &attn, 1, gd(p), HEADS, HD, "shp_ma4", "shp_mflat")
         } else {
-            let pfa = s.pfa(&format!("{}pfa", tag), &qr3, &kr3, &v3, &[1, p, QD], &[1, p, KVD], HEADS, KV_HEADS, HD);
-            s.squeeze(&format!("{}sq", tag), &pfa, &[1, p, QD], &[p, QD])
+            let pfa = s.pfa(&format!("{}pfa", tag), &qr3, &kr3, &v3, &[1, gd(p), QD], &[1, gd(p), KVD], HEADS, KV_HEADS, HD);
+            s.squeeze(&format!("{}sq", tag), &pfa, &[1, gd(p), QD], &[gd(p), QD])
         };
         let io8 = if i8sel("o") {
             let l = lay.expect("GEB_PREFIX_INT8 需真权重");
@@ -3201,18 +3479,18 @@ pub fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e
         } else {
             None
         };
-        let proj = mm_or_qmd(&mut s, &format!("{}proj", tag), &sq, &[p, QD], io8.as_ref(), &format!("{}outwt", tag), PW, &[p, PW], int8_native);
+        let proj = mm_or_qmd(&mut s, &format!("{}proj", tag), &sq, &[gd(p), QD], io8.as_ref(), &format!("{}outwt", tag), PW, &[gd(p), PW], int8_native);
         let projb = if io8.is_some() {
             proj.clone() // int8：bias 已折入算子
         } else {
-            s.bias(&format!("{}projb", tag), &proj, &[p, PW], &format!("{}outb", tag))
+            s.bias(&format!("{}projb", tag), &proj, &[gd(p), PW], &format!("{}outb", tag))
         };
-        let res = s.add2(&format!("{}res", tag), &projb, &cur, &[p, PW]);
+        let res = s.add2(&format!("{}res", tag), &projb, &cur, &[gd(p), PW]);
         if dbg_mid && i == 0 {
             dbg_outs.push(sq.clone());
             dbg_outs.push(res.clone());
         }
-        let norm2 = s.addrms(&format!("{}n2", tag), &res, "zeros", &format!("{}g2", tag), &[p, PW]);
+        let norm2 = s.addrms(&format!("{}n2", tag), &res, "zeros", &format!("{}g2", tag), &[gd(p), PW]);
         let ig8 = if i8sel("gate") {
             let l = lay.expect("GEB_PREFIX_INT8 需真权重");
             Some(reg_i8(&mut s, ctx, &facs, &format!("prefix/L{:02}/gate", lay_i), &format!("L{:02}_gate", lay_i),
@@ -3227,10 +3505,10 @@ pub fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e
         } else {
             None
         };
-        let gate = mm_or_qmd(&mut s, &format!("{}gate", tag), &norm2, &[p, PW], ig8.as_ref(), &format!("{}gatewt", tag), INTER, &[p, INTER], int8_native);
-        let up = mm_or_qmd(&mut s, &format!("{}up", tag), &norm2, &[p, PW], iu8.as_ref(), &format!("{}upwt", tag), INTER, &[p, INTER], int8_native);
-        let gact = s.gelu(&format!("{}gact", tag), &gate, &[p, INTER], true);
-        let act = s.mul2(&format!("{}act", tag), &gact, &up, &[p, INTER]);
+        let gate = mm_or_qmd(&mut s, &format!("{}gate", tag), &norm2, &[gd(p), PW], ig8.as_ref(), &format!("{}gatewt", tag), INTER, &[gd(p), INTER], int8_native);
+        let up = mm_or_qmd(&mut s, &format!("{}up", tag), &norm2, &[gd(p), PW], iu8.as_ref(), &format!("{}upwt", tag), INTER, &[gd(p), INTER], int8_native);
+        let gact = s.gelu(&format!("{}gact", tag), &gate, &[gd(p), INTER], true);
+        let act = s.mul2(&format!("{}act", tag), &gact, &up, &[gd(p), INTER]);
         let id8 = if i8sel("down") {
             let l = lay.expect("GEB_PREFIX_INT8 需真权重");
             Some(reg_i8(&mut s, ctx, &facs, &format!("prefix/L{:02}/down", lay_i), &format!("L{:02}_down", lay_i),
@@ -3238,13 +3516,13 @@ pub fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e
         } else {
             None
         };
-        let down = mm_or_qmd(&mut s, &format!("{}down", tag), &act, &[p, INTER], id8.as_ref(), &format!("{}downwt", tag), PW, &[p, PW], int8_native);
+        let down = mm_or_qmd(&mut s, &format!("{}down", tag), &act, &[gd(p), INTER], id8.as_ref(), &format!("{}downwt", tag), PW, &[gd(p), PW], int8_native);
         let downb = if id8.is_some() {
             down.clone() // int8：bias 已折入算子
         } else {
-            s.bias(&format!("{}downb", tag), &down, &[p, PW], &format!("{}downb", tag))
+            s.bias(&format!("{}downb", tag), &down, &[gd(p), PW], &format!("{}downb", tag))
         };
-        cur = s.add2(&format!("{}out", tag), &downb, &res, &[p, PW]);
+        cur = s.add2(&format!("{}out", tag), &downb, &res, &[gd(p), PW]);
         if dbg_mid && i == 0 && std::env::var("GEB_DBG_FULL").is_ok() {
             // 全级导出（GEB_DBG_FULL）：逐级与教科书对拍钉 GE 图坏点。
             // ⚠ 输出槽可能被内存复用覆写（res 槽实测被 n2 覆写）——逐级
@@ -3379,9 +3657,10 @@ pub fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e
                 }
                 assert_eq!(x0.len() * 2, s.binds[0].len(), "replay x0 尺寸不符");
                 h2d(&s.binds[0], &x0);
-                let ins = s.ins();
                 let refs: Vec<&DeviceBuffer> = routs.iter().collect();
-                s.g.run(&ins, &refs, stream).expect("ge run");
+                // replay 帧恒 = GEB_TOKENS（= gear 模式 max 档）——末档执行
+                s.run_seg(s.gear_payloads.len().saturating_sub(1), &refs, stream)
+                    .expect("ge run");
                 drop(stream.synchronize());
                 f.kv = (0..nkv)
                     .map(|i| download_f16(ctx, &routs[i], s.g.output_size(i).unwrap() / 2))
@@ -3397,6 +3676,10 @@ pub fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e
                 .map(|i| ctx.malloc(s.g.output_size(i).unwrap().max(16)).expect("serve out malloc"))
                 .collect();
             let emb = w.vision.token_embedding.to_f32_vec().unwrap();
+            let gear_of_l = gear_ll
+                .as_ref()
+                .map(|g| g.iter().enumerate().map(|(i, &l)| (l, i)).collect())
+                .unwrap_or_default();
             st.pmech = Some(PrefixMech {
                 s,
                 routs,
@@ -3407,6 +3690,7 @@ pub fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e
                 emb,
                 tok_cache_ids: Vec::new(),
                 tok_cache_rows: Vec::new(),
+                gear_of_l,
             });
         }
         return;
@@ -3506,6 +3790,27 @@ pub fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e
     let attn_manual = std::env::var("GEB_ATTN").map(|v| v == "manual").unwrap_or(false);
     let fscale = if attn_manual { 1.0f32 / (HD as f32).sqrt() } else { 1.0 };
     let mut s = Seg::new("ge_flow");
+    // 动态分档：与 prefix 段同源（pk/pv 36 路 [-1,KVD]；rope 表 HOR 定形
+    // 内容随 pos_offset=p 变——mech 按 L 换装；shp_kall 内容 -1 化）
+    let gear_ll = dyn_llist();
+    let mut gear_ps_hold: Option<Vec<i64>> = None;
+    let gd = |v: i64| if gear_ll.is_some() { -1 } else { v };
+    if let Some(g) = &gear_ll {
+        assert!(
+            std::env::var("GEB_WCONST").is_ok(),
+            "GEB_DYN_LLIST 需 GEB_WCONST=1"
+        );
+        assert!(ropeflat && attn_manual && qkv3, "GEB_DYN_LLIST 需三件套（ROPEFLAT/ATTN=manual/QKV3）");
+        let lmax = *g.iter().max().unwrap();
+        assert_eq!(tokens, lmax, "GEB_DYN_LLIST 模式 GEB_TOKENS 须 = 档表 max L");
+        let drop_v2 = envi("GEB_PREFIX_DROP_EMPTY", 0);
+        let ps = g.iter().map(|&l| VT + l - drop_v2).collect::<Vec<i64>>();
+        println!("[gear] flow 动态分档：L {:?} → p {:?}", g, ps);
+        gear_ps_hold = Some(ps);
+    }
+    if let Some(ps) = gear_ps_hold.take() {
+        s.set_gear_ps(ps);
+    }
 
     // ---- 段级输入（注册序，两遍式：先全部注册再建图——层 i 的 next
     // ada-norm 引用层 i+1 的 style 输入，必须先注册后链接）----
@@ -3543,7 +3848,7 @@ pub fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e
     s.const_i32("shp_q3", &[1, HOR as i32, QD as i32]);
     s.const_i32("shp_k3", &[1, HOR as i32, KVD as i32]);
     s.const_i32("shp_v3", &[1, HOR as i32, KVD as i32]);
-    s.const_i32("shp_kall", &[1, (p + HOR) as i32, KVD as i32]);
+    s.const_i32("shp_kall", &[1, gd(p + HOR) as i32, KVD as i32]);
     // ropeflat / manual cross-attention 常量（swap 索引 Const 折叠）
     s.const_i32("qswap_c", &qi);
     s.const_i32("kswap_c", &ki);
@@ -3604,8 +3909,8 @@ pub fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e
                 }
             })
             .unwrap_or_else(|| rand_f16((p * KVD) as usize, &mut seed, 100.0));
-        s.data(ctx, &format!("pk{i}"), &[p, KVD], &pk_h);
-        s.data(ctx, &format!("pv{i}"), &[p, KVD], &pv_h);
+        s.data(ctx, &format!("pk{i}"), &[gd(p), KVD], &pk_h);
+        s.data(ctx, &format!("pv{i}"), &[gd(p), KVD], &pv_h);
     }
     // ---- flow int8（GEB_FLOW_INT8）：7 投影/层 → QuantMatmulDequant ----
     // 注册区在层区之前（sm Data 落此，pk_base 不动）；层内 int8 权重槽以
@@ -3912,31 +4217,31 @@ pub fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e
         let kcat = format!("{}kcat", tag);
         s.g.add_op(&kcat, "ConcatD").unwrap();
         s.g.dyn_inputs(&kcat, "x", 2).unwrap();
-        s.g.set_input_desc(&kcat, "x0", &[p, KVD], Dtype::Fp16).unwrap();
+        s.g.set_input_desc(&kcat, "x0", &[gd(p), KVD], Dtype::Fp16).unwrap();
         s.g.set_input_desc(&kcat, "x1", &[HOR, KVD], Dtype::Fp16).unwrap();
-        s.g.set_output_desc(&kcat, "y", &[total, KVD], Dtype::Fp16).unwrap();
+        s.g.set_output_desc(&kcat, "y", &[gd(total), KVD], Dtype::Fp16).unwrap();
         s.g.set_attr_int(&kcat, "concat_dim", 0).unwrap();
         s.g.set_attr_int(&kcat, "N", 2).unwrap();
         s.g.link(&kcat, "x0", &format!("pk{i}")).unwrap();
         s.wire(&kcat, "x1", &kr2);
         let kall = s.reg_out(&kcat, "y");
-        let kall3 = s.reshape(&format!("{}kall3", tag), &kall, &[total, KVD], "shp_kall", &[1, total, KVD]);
+        let kall3 = s.reshape(&format!("{}kall3", tag), &kall, &[gd(total), KVD], "shp_kall", &[1, gd(total), KVD]);
         let vcat = format!("{}vcat", tag);
         s.g.add_op(&vcat, "ConcatD").unwrap();
         s.g.dyn_inputs(&vcat, "x", 2).unwrap();
-        s.g.set_input_desc(&vcat, "x0", &[p, KVD], Dtype::Fp16).unwrap();
+        s.g.set_input_desc(&vcat, "x0", &[gd(p), KVD], Dtype::Fp16).unwrap();
         s.g.set_input_desc(&vcat, "x1", &[HOR, KVD], Dtype::Fp16).unwrap();
-        s.g.set_output_desc(&vcat, "y", &[total, KVD], Dtype::Fp16).unwrap();
+        s.g.set_output_desc(&vcat, "y", &[gd(total), KVD], Dtype::Fp16).unwrap();
         s.g.set_attr_int(&vcat, "concat_dim", 0).unwrap();
         s.g.set_attr_int(&vcat, "N", 2).unwrap();
         s.g.link(&vcat, "x0", &format!("pv{i}")).unwrap();
         s.wire(&vcat, "x1", &v2);
         let vall = s.reg_out(&vcat, "y");
-        let vall3 = s.reshape(&format!("{}vall3", tag), &vall, &[total, KVD], "shp_kall", &[1, total, KVD]);
+        let vall3 = s.reshape(&format!("{}vall3", tag), &vall, &[gd(total), KVD], "shp_kall", &[1, gd(total), KVD]);
         let sq = if attn_manual {
             // 手工 cross-GQA：q 头主序化（headsplit），k/v 已是 rank-3 单头
             let q3 = s.headsplit(&format!("{}qh", tag), &qr2, HOR, 1, HOR, HEADS, HD, "shp_fq4", "shp_fq3");
-            let attn = s.attn_manual_gqa(&format!("{}attn", tag), &q3, &kall3, &vall3, HEADS, HOR, total, HD);
+            let attn = s.attn_manual_gqa(&format!("{}attn", tag), &q3, &kall3, &vall3, HEADS, HOR, gd(total), HD);
             s.headmerge(&format!("{}am", tag), &attn, 1, HOR, HEADS, HD, "shp_fa4", "shp_fbq")
         } else {
             let pfa = s.pfa(&format!("{}pfa", tag), &qr3, &kall3, &vall3, &[1, HOR, QD], &[1, total, KVD], HEADS, KV_HEADS, HD);
@@ -4154,9 +4459,9 @@ pub fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e
             h2d_f16(&s.binds[fs_idx], &sc[6 * depth]);
             h2d_f16(&s.binds[fs_idx + 1], &sc[6 * depth + 1]);
             h2d_f16(&s.binds[0], &x); // state = 当前 x
-            let ins = s.ins();
             let oref: Vec<&DeviceBuffer> = vec![&ob];
-            s.g.run(&ins, &oref, stream).expect("ge run");
+            s.run_seg(s.gear_payloads.len().saturating_sub(1), &oref, stream)
+                .expect("ge run");
             drop(stream.synchronize());
             x = download_f16(ctx, &ob, (HOR * ADIM) as usize);
             let m = x.iter().fold(0f32, |m, v| m.max(v.to_f32().abs()));
@@ -4187,9 +4492,9 @@ pub fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e
                     h2d_f16(&s.binds[fs_idx], &sc[6 * depth]);
                     h2d_f16(&s.binds[fs_idx + 1], &sc[6 * depth + 1]);
                     h2d_f16(&s.binds[0], &xx);
-                    let ins = s.ins();
                     let oref: Vec<&DeviceBuffer> = vec![&ob];
-                    s.g.run(&ins, &oref, stream).expect("ge run");
+                    s.run_seg(s.gear_payloads.len().saturating_sub(1), &oref, stream)
+                        .expect("ge run");
                     drop(stream.synchronize());
                     xx = download_f16(ctx, &ob, (HOR * ADIM) as usize);
                 }
@@ -4253,9 +4558,9 @@ pub fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e
                     h2d_f16(&s.binds[fs_idx], &sc[6 * depth]);
                     h2d_f16(&s.binds[fs_idx + 1], &sc[6 * depth + 1]);
                     h2d_f16(&s.binds[0], &xx);
-                    let ins = s.ins();
                     let oref: Vec<&DeviceBuffer> = vec![&ob];
-                    s.g.run(&ins, &oref, stream).expect("ge run");
+                    s.run_seg(s.gear_payloads.len().saturating_sub(1), &oref, stream)
+                        .expect("ge run");
                     drop(stream.synchronize());
                     xx = download_f16(ctx, &ob, (HOR * ADIM) as usize);
                 }
@@ -4329,6 +4634,14 @@ pub fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e
             } else {
                 (0..s.binds.len()).collect()
             };
+            let rope_binds: Vec<usize> = ["qcos", "qsin", "kcos", "ksin", "qcos2", "qsin2", "kcos2", "ksin2"]
+                .iter()
+                .map(|n| s.bind_of(n))
+                .collect();
+            let gear_of_l = gear_ll
+                .as_ref()
+                .map(|g| g.iter().enumerate().map(|(i, &l)| (l, i)).collect())
+                .unwrap_or_default();
             st.fmech = Some(FlowMech {
                 s,
                 ob,
@@ -4341,6 +4654,9 @@ pub fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e
                 style_views,
                 style_map,
                 ins_order,
+                gear_of_l,
+                rope_binds,
+                last_l: -1,
             });
         }
         return;
@@ -7988,20 +8304,21 @@ impl GeServe {
         let vision_ms = t0.elapsed().as_secs_f64() * 1e3;
         let (actions, prefix_ms, flow_ms) = if self.fast {
             // GEB_SERVE_FAST：kv 设备直连 + styles 驻留 + x 驻留（tp 仍含
-            // prefix run 的 sync 等待——段计时与 legacy 可比）
+            // prefix run 的 sync 等待——段计时与 legacy 可比）。gear 模式
+            // 下 L = token_ids.len()，逐请求选档（prefix/flow 同档）
             let t1 = std::time::Instant::now();
             self.pm.one_frame_dev(ctx, stream, &vision_out, token_ids);
             let prefix_ms = t1.elapsed().as_secs_f64() * 1e3;
             let kvrefs: Vec<&DeviceBuffer> = self.pm.routs[..self.pm.nkv].iter().collect();
             let t2 = std::time::Instant::now();
-            let actions = self.fm.one_frame_fast(ctx, stream, &kvrefs, noise);
+            let actions = self.fm.one_frame_fast(ctx, stream, &kvrefs, token_ids, noise);
             (actions, prefix_ms, t2.elapsed().as_secs_f64() * 1e3)
         } else {
             let t1 = std::time::Instant::now();
             let kv = self.pm.one_frame(ctx, stream, &vision_out, token_ids);
             let prefix_ms = t1.elapsed().as_secs_f64() * 1e3;
             let t2 = std::time::Instant::now();
-            let actions = self.fm.one_frame(ctx, stream, &kv, noise);
+            let actions = self.fm.one_frame(ctx, stream, &kv, token_ids, noise);
             (actions, prefix_ms, t2.elapsed().as_secs_f64() * 1e3)
         };
         GeServeOut {
