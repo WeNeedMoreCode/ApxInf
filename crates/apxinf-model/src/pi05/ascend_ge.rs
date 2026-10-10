@@ -2214,8 +2214,10 @@ static OM_PRELOAD: std::sync::Mutex<
 > = std::sync::Mutex::new(None);
 
 /// 并行预载 GEB_OM_DIR 的 {vision,prefix,flow}_real.om（幂等；serve 冷启
-/// 动路径调一次）。装载失败不 panic——e2e_run 回退串行装载并报真错误
-pub fn preload_e2e_oms() {
+/// 动路径调一次）。装载线程须绑主 context（aclmdlLoadFromMem 随调用线程
+/// 的 current context 走——裸线程 rc=-3 实证）。失败不 panic——e2e_run
+/// 回退串行装载并报真错误
+pub fn preload_e2e_oms(ctx: &AscendContext) {
     {
         let guard = OM_PRELOAD.lock().unwrap();
         if guard.is_some() {
@@ -2230,7 +2232,14 @@ pub fn preload_e2e_oms() {
         .map(|seg| {
             let path = format!("{dir}/{seg}_real.om");
             let seg = seg.to_string();
+            let ctx2: &AscendContext = unsafe { std::mem::transmute(ctx) };
             std::thread::spawn(move || {
+                // 线程绑 context（&AscendContext 非 Send——transmute 借引用，
+                // join 前 ctx 存活，单次冷启动路径受控）
+                if let Err(e) = ctx2.set_current() {
+                    eprintln!("[preload] {seg} context 绑定失败: {e:?}");
+                    return (seg, None);
+                }
                 let g = ge_builder::load(&path);
                 if let Err(e) = &g {
                     eprintln!("[preload] {seg} OM 装载失败 {path}: {e:?}");
@@ -2335,7 +2344,7 @@ pub fn seg_e2e(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>) {
     let real = real.expect("GEB_SEG=e2e 需要 GEB_CKPT（token_embedding/time_mlp/style 投影 host 消费）");
     let tokens = envi("GEB_TOKENS", 64) as usize;
     // 冷启动 lazy：三段 OM 并行预载（e2e_run 命中即取）
-    preload_e2e_oms();
+    preload_e2e_oms(be.ctx());
     // 注：GE 静态 OM 接受非 16 倍 M（GEB_TOKENS=200 → P=968 实证编译/运行/
     // parity 正常——eager aclnn 的 16 倍 M 崩坑不适用于 GE 路径）
     let mut st = match std::env::var("GEB_E2E_GOLDEN") {
@@ -8371,7 +8380,7 @@ impl GeServe {
             std::env::set_var("GEB_SERVE_FAST", "1");
         }
         // 冷启动 lazy：三段 OM 并行预载（构造段序内 e2e_run 命中即取）
-        preload_e2e_oms();
+        preload_e2e_oms(be.ctx());
         // 合成 bring-up 输入（首帧 warmup 消费；真实帧走 infer）
         let mut seed = 0xE2E2u32;
         let mut st = E2eStage {
