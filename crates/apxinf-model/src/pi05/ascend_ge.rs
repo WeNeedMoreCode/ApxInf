@@ -529,8 +529,9 @@ impl Seg {
             .unwrap_or_else(|| panic!("bind_of: 图输入 {name} 不存在"))
     }
 
-    /// 每档 S2 payload：全部含 -1 维的输入的 dim0 值拼接（输入注册序）。
-    /// 本图族动态维恒为 dim0 单维（多 -1 输入未支持——断言钉死）
+    /// 每档 S2 payload：全部含 -1 维输入的**完整 dims**（动态位 = mul×p，
+    /// 静态尾维原样；spike v2 S2 定式——SetInputDynamicDims 一次调用带全部
+    /// 动态输入的全维）。ge.dynamicDims 选项串仍是纯 -1 位值（atc 语义）
     fn compose_gear_payloads(&mut self) {
         self.gear_payloads.clear();
         if self.gear_ps.is_empty() {
@@ -553,15 +554,16 @@ impl Seg {
                 if ndyn == 1 {
                     assert_eq!(shp[0], -1, "gear 输入 {n} 的 -1 须在 dim0");
                     pl.push(mul * pg);
+                    pl.extend_from_slice(&shp[1..]);
                 }
             }
             self.gear_payloads.push(pl);
         }
         println!(
-            "[gear] {} 档；payload 维数 {}（首档 {:?}）",
+            "[gear] {} 档；payload 维数 {}（首档前 8 {:?}）",
             self.gear_ps.len(),
             self.gear_payloads[0].len(),
-            self.gear_payloads[0]
+            &self.gear_payloads[0][..8.min(self.gear_payloads[0].len())]
         );
     }
 
