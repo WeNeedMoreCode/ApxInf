@@ -478,6 +478,9 @@ pub struct Seg {
     gear_fix: std::collections::HashMap<String, i64>,
     /// 每档 S2 payload（gear 模式非空；静态模式空 = run 等价）
     pub gear_payloads: Vec<Vec<i64>>,
+    /// 每档纯 -1 位值（ge.dynamicDims 选项串专用——atc 语义只要 -1 位的
+    /// 值；payload 的静态尾维混进选项会让编译 rc=-7，2026-10-10 取证）
+    gear_optvals: Vec<Vec<i64>>,
 }
 
 impl Seg {
@@ -498,6 +501,7 @@ impl Seg {
             gear_mul: std::collections::HashMap::new(),
             gear_fix: std::collections::HashMap::new(),
             gear_payloads: Vec::new(),
+            gear_optvals: Vec::new(),
         }
     }
 
@@ -555,6 +559,7 @@ impl Seg {
             .collect();
         for &pg in &self.gear_ps {
             let mut pl = Vec::new();
+            let mut ov = Vec::new();
             for ((n, shp), &mul) in names.iter().zip(&shapes).zip(&muls) {
                 let ndyn = shp.iter().filter(|&&d| d == -1).count();
                 assert!(
@@ -571,9 +576,11 @@ impl Seg {
                         .unwrap_or_else(|| mul * pg);
                     pl.push(v);
                     pl.extend_from_slice(&shp[1..]);
+                    ov.push(v);
                 }
             }
             self.gear_payloads.push(pl);
+            self.gear_optvals.push(ov);
         }
         println!(
             "[gear] {} 档；payload 维数 {}（首档前 8 {:?}）",
@@ -1482,11 +1489,11 @@ impl Seg {
             self.g.graph_outputs_idx(&all, &idxs).unwrap();
         }
         self.g.set_nd_input_shape(&shape_refs).unwrap();
-        // gear 模式：ge.dynamicDims 档表（每档全部 -1 维的值，输入注册序
-        // 拼接；与 payload 同源）——spike v1/v2 定式
-        if !self.gear_payloads.is_empty() {
+        // gear 模式：ge.dynamicDims 档表 = 纯 -1 位值（输入注册序；payload
+        // 的静态尾维混入选项会 rc=-7——选项/payload 双结构分离）
+        if !self.gear_optvals.is_empty() {
             let opt = self
-                .gear_payloads
+                .gear_optvals
                 .iter()
                 .map(|pl| {
                     pl.iter()
