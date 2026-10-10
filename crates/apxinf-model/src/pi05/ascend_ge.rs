@@ -758,9 +758,42 @@ impl Seg {
     /// 行广播 bias：TileD(row [1,cols], multiples=[rows,1]) + Add。
     /// （BroadcastToD 在 310P kernel 编译崩——TBE task_distribute；TileD
     /// attr 版编译验证过。算子名后缀 _bc/_ba 与 bias 行 Data 名错开。）
+    /// 行广播输入注册（bias 行）：静态 = [1,cols] 原行（消费端 TileD 广播）；
+    /// gear = [gdyn,cols] 行重复 rows 份——TileD multiples 含 p 时全档共享
+    /// 不可用（attr 不随档变），改内容即广播（逐行相同，前缀截断语义）。
+    /// int8 折叠路径不消费 bias：传 rows=1 注册原行省内存
+    fn row_bcast(
+        &mut self,
+        ctx: &AscendContext,
+        name: &str,
+        rows: i64,
+        cols: i64,
+        row: &[f16],
+    ) -> String {
+        if gear_mode() && rows > 1 {
+            let mut rep = Vec::with_capacity((rows * cols) as usize);
+            for _ in 0..rows {
+                rep.extend_from_slice(row);
+            }
+            self.data(ctx, name, &[gdyn(rows), cols], &rep)
+        } else {
+            self.data(ctx, name, &[1, cols], row)
+        }
+    }
+
     fn bias(&mut self, name: &str, x: &str, x_dims: &[i64], row: &str) -> String {
-        let bc = format!("{name}_bc");
         let ba = format!("{name}_ba");
+        if gear_mode() {
+            // 行已重复注册为同形 [-1,cols]——直接 Add（无 TileD）
+            self.g.add_op(&ba, "Add").unwrap();
+            self.g.set_input_desc(&ba, "x1", x_dims, Dtype::Fp16).unwrap();
+            self.g.set_input_desc(&ba, "x2", x_dims, Dtype::Fp16).unwrap();
+            self.g.set_output_desc(&ba, "y", x_dims, Dtype::Fp16).unwrap();
+            self.wire(&ba, "x1", x);
+            self.wire(&ba, "x2", row);
+            return self.reg_out(&ba, "y");
+        }
+        let bc = format!("{name}_bc");
         self.g.add_op(&bc, "TileD").unwrap();
         self.g.set_input_desc(&bc, "x", &[1, x_dims[1]], Dtype::Fp16).unwrap();
         self.g.set_output_desc(&bc, "y", x_dims, Dtype::Fp16).unwrap();
@@ -3343,9 +3376,10 @@ pub fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e
                 if iv8.is_none() {
                     s.wt(ctx, &format!("{}vw", tag), &[KVD, PW], &wv, PW, KVD);
                 }
-                s.data(ctx, &format!("{}qb", tag), &[1, QD], &bias_s[..QD as usize]);
-                s.data(ctx, &format!("{}kb", tag), &[1, KVD], &bias_s[QD as usize..(QD + KVD) as usize]);
-                s.data(ctx, &format!("{}vb", tag), &[1, KVD], &bias_s[(QD + KVD) as usize..]);
+                // gear 模式行重复注册（row_bcast）；int8 折叠不消费 → 原行省内存
+                s.row_bcast(ctx, &format!("{}qb", tag), if iq8.is_some() { 1 } else { p }, QD, &bias_s[..QD as usize]);
+                s.row_bcast(ctx, &format!("{}kb", tag), if ik8.is_some() { 1 } else { p }, KVD, &bias_s[QD as usize..(QD + KVD) as usize]);
+                s.row_bcast(ctx, &format!("{}vb", tag), if iv8.is_some() { 1 } else { p }, KVD, &bias_s[(QD + KVD) as usize..]);
             } else {
                 let mut fused = Vec::with_capacity((PW * QKVW) as usize);
                 for r in 0..PW as usize {
@@ -3380,7 +3414,7 @@ pub fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e
         let outb_h = lay
             .map(|_| vec![f16::from_f32(0.0); PW as usize])
             .unwrap_or_else(|| rand_f16(PW as usize, &mut seed, 4000.0));
-        s.data(ctx, &format!("{}outb", tag), &[1, PW], &outb_h);
+        s.row_bcast(ctx, &format!("{}outb", tag), if i8sel("o") { 1 } else { p }, PW, &outb_h);
         let mlp_i8 = i8sel("gate") || i8sel("up");
         let (g2_h, g2_t): (Vec<f16>, &[f32]) = if mlp_i8 {
             let g = &i8norms[&format!("prefix/L{:02}", lay_i)][1];
@@ -3415,7 +3449,7 @@ pub fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e
         let downb_h = lay
             .map(|_| vec![f16::from_f32(0.0); PW as usize])
             .unwrap_or_else(|| rand_f16(PW as usize, &mut seed, 4000.0));
-        s.data(ctx, &format!("{}downb", tag), &[1, PW], &downb_h);
+        s.row_bcast(ctx, &format!("{}downb", tag), if i8sel("down") { 1 } else { p }, PW, &downb_h);
 
         let norm1 = s.addrms(&format!("{}n1", tag), &cur, "zeros", &format!("{}g1", tag), &[gd(p), PW]);
         // rank-2 切分 + rope（rank-2 版）+ Reshape rank-3 桥。
