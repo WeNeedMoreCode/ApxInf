@@ -790,7 +790,7 @@ impl Seg {
         cols: i64,
         row: &[f16],
     ) -> String {
-        if gear_mode() {
+        if gear_mode() && envi("GEB_BIAS_REG", 0) == 0 {
             if rows > 1 {
                 let mut rep = Vec::with_capacity((rows * cols) as usize);
                 for _ in 0..rows {
@@ -3123,9 +3123,10 @@ fn reg_i8(
     };
     let sm_n = if native {
         let smf: Vec<f16> = f.smooth.iter().map(|&v| f16::from_f32(v)).collect();
-        // gear 模式：定值动态输入（[-1] + 每档恒 k）——Const 化撞 legacy
-        // 算子 Const 输入墙（rc=-7），纯静态 Data 又毒化 SetDims 档位匹配
-        if gear_mode() {
+        // GEB_SM_DYN=1（gear 微分离旋钮，缺省开）：定值动态输入（[-1]+每档
+        // 恒 k）——Const 化撞 legacy Const 输入墙（rc=-7），纯静态 Data 又
+        // 毒化 SetDims 档位匹配。0 = 回静态 [k] Data（对照）
+        if gear_mode() && envi("GEB_SM_DYN", 1) == 1 {
             let n = s.data(ctx, &format!("{dump_tag}sm"), &[-1], &smf);
             s.set_gear_fix(&n, k);
             n
@@ -3134,7 +3135,7 @@ fn reg_i8(
         }
     } else {
         let invf: Vec<f16> = f.inv.iter().map(|&v| f16::from_f32(v)).collect();
-        if gear_mode() {
+        if gear_mode() && envi("GEB_SM_DYN", 1) == 1 {
             let n = s.data(ctx, &format!("{dump_tag}inv"), &[-1, k], &invf);
             s.set_gear_fix(&n, k);
             n
@@ -3460,9 +3461,8 @@ pub fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e
                 &[],
             )
         };
-        // gear 模式：定值动态输入（每档恒 PW——同 reg_i8 sm 注记，Const 墙 +
-        // SetDims 纯动态集前提）
-        if gear_mode() {
+        // gear 模式：定值动态输入（每档恒 PW——GEB_G_DYN 旋钮同 sm 注记）
+        if gear_mode() && envi("GEB_G_DYN", 1) == 1 {
             let n = s.data(ctx, &format!("{}g1", tag), &[-1], &g1_h);
             s.set_gear_fix(&n, PW);
         } else {
@@ -3568,7 +3568,7 @@ pub fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e
                 &[],
             )
         };
-        if gear_mode() {
+        if gear_mode() && envi("GEB_G_DYN", 1) == 1 {
             let n = s.data(ctx, &format!("{}g2", tag), &[-1], &g2_h);
             s.set_gear_fix(&n, PW);
         } else {
