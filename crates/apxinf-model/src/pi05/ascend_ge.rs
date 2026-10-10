@@ -2204,11 +2204,69 @@ pub fn e2e_style_pair(w: &LinearWeights, cond: &[f32], width: usize) -> (Vec<f16
 
 /// e2e 收尾共通：GEB_OM_DIR（默认 /data/apxinf/om_cache）加载 {seg}_real.om
 /// 跑一次，全部图输出下载回 host。Seg 构造须与 OM 构建同 env（四件套）
+
+/// 三段 OM 预载缓存（冷启动 lazy）：GeServe::open 前并行装载（ge_builder
+/// 侧带锁），e2e_run 命中即取——把串行 52s 的 OM 装载压成 ~max(单段)
+static OM_PRELOAD: std::sync::Mutex<
+    Option<std::collections::HashMap<String, ge_builder::GeGraph>>,
+> = std::sync::Mutex::new(None);
+
+/// 并行预载 GEB_OM_DIR 的 {vision,prefix,flow}_real.om（幂等；serve 冷启
+/// 动路径调一次）。装载失败不 panic——e2e_run 回退串行装载并报真错误
+pub fn preload_e2e_oms() {
+    {
+        let guard = OM_PRELOAD.lock().unwrap();
+        if guard.is_some() {
+            return;
+        }
+    }
+    let dir = std::env::var("GEB_OM_DIR").unwrap_or_else(|_| "/data/apxinf/om_cache".into());
+    let t0 = std::time::Instant::now();
+    let segs = ["vision", "prefix", "flow"];
+    let handles: Vec<std::thread::JoinHandle<(String, Option<ge_builder::GeGraph>)>> = segs
+        .iter()
+        .map(|seg| {
+            let path = format!("{dir}/{seg}_real.om");
+            let seg = seg.to_string();
+            std::thread::spawn(move || {
+                let g = ge_builder::load(&path);
+                if let Err(e) = &g {
+                    eprintln!("[preload] {seg} OM 装载失败 {path}: {e:?}");
+                }
+                (seg, g.ok())
+            })
+        })
+        .collect();
+    let mut map = std::collections::HashMap::new();
+    for h in handles {
+        if let Ok((seg, g)) = h.join() {
+            if let Some(g) = g {
+                map.insert(seg, g);
+            }
+        }
+    }
+    println!("[preload] {} 段 OM 并行装载完成 {:?}", map.len(), t0.elapsed());
+    *OM_PRELOAD.lock().unwrap() = Some(map);
+}
+
 pub fn e2e_run(ctx: &AscendContext, stream: &AscendStream, s: &mut Seg, seg: &str) -> Vec<Vec<f16>> {
     let dir = std::env::var("GEB_OM_DIR").unwrap_or_else(|_| "/data/apxinf/om_cache".into());
     let path = format!("{dir}/{seg}_real.om");
-    println!("[e2e] loading {path}");
-    s.g = ge_builder::load(&path).expect("load om");
+    let preloaded = OM_PRELOAD
+        .lock()
+        .unwrap()
+        .as_mut()
+        .and_then(|m| m.remove(seg));
+    s.g = match preloaded {
+        Some(g) => {
+            println!("[e2e] {seg} OM 预载命中");
+            g
+        }
+        None => {
+            println!("[e2e] loading {path}");
+            ge_builder::load(&path).expect("load om")
+        }
+    };
     // gear 模式：bring-up 内容按 max 档物化 → 用末档跑（静态 = run_seg 0 档）
     let gi = s.gear_payloads.len().saturating_sub(1);
     if !s.gear_payloads.is_empty() {
@@ -2274,6 +2332,8 @@ pub fn seg_e2e(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>) {
     );
     let real = real.expect("GEB_SEG=e2e 需要 GEB_CKPT（token_embedding/time_mlp/style 投影 host 消费）");
     let tokens = envi("GEB_TOKENS", 64) as usize;
+    // 冷启动 lazy：三段 OM 并行预载（e2e_run 命中即取）
+    preload_e2e_oms();
     // 注：GE 静态 OM 接受非 16 倍 M（GEB_TOKENS=200 → P=968 实证编译/运行/
     // parity 正常——eager aclnn 的 16 倍 M 崩坑不适用于 GE 路径）
     let mut st = match std::env::var("GEB_E2E_GOLDEN") {
@@ -8308,6 +8368,8 @@ impl GeServe {
         if fast {
             std::env::set_var("GEB_SERVE_FAST", "1");
         }
+        // 冷启动 lazy：三段 OM 并行预载（构造段序内 e2e_run 命中即取）
+        preload_e2e_oms();
         // 合成 bring-up 输入（首帧 warmup 消费；真实帧走 infer）
         let mut seed = 0xE2E2u32;
         let mut st = E2eStage {
