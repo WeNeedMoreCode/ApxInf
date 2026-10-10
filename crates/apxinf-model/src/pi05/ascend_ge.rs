@@ -571,7 +571,7 @@ impl Seg {
         gi: usize,
         outputs: &[&DeviceBuffer],
         stream: &AscendStream,
-    ) -> crate::Result<()> {
+    ) -> apxinf_ascend::Result<()> {
         let ins = self.ins();
         if self.gear_payloads.is_empty() {
             self.g.run(&ins, outputs, stream)
@@ -1588,15 +1588,16 @@ pub fn parity_and_bench(
         // rounds=3 时 min(3) 会把全部轮次吃成 warmup → ts 空仓 panic；
         // 至少留 1 个样本轮
         let skip = rounds.saturating_sub(1).min(3);
+        let gi = seg.gear_payloads.len().saturating_sub(1);
         for _ in 0..3 {
-            seg.g.run(&ins, &out_refs, stream).unwrap();
+            seg.run_seg(gi, &out_refs, stream).unwrap();
         }
         drop(stream.synchronize());
         let mut ts = Vec::new();
         for r in 0..rounds {
             let t0 = std::time::Instant::now();
             for _ in 0..per {
-                seg.g.run(&ins, &out_refs, stream).unwrap();
+                seg.run_seg(gi, &out_refs, stream).unwrap();
             }
             drop(stream.synchronize());
             if r >= skip {
@@ -1739,6 +1740,7 @@ impl PrefixMech {
             .get(&l)
             .unwrap_or_else(|| panic!("prefix 档表缺 L={l}（GEB_DYN_LLIST 未含）"))
     }
+}
 
 impl PrefixMech {
     /// 一帧 prefix（设备态）：重组 x0（本帧 vision_out 可见行 + 真 token
@@ -3045,8 +3047,11 @@ pub fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e
             "GEB_DYN_LLIST 需 GEB_WCONST=1（权重 Const 根图单份——档间零重复的前提）"
         );
         assert!(std::env::var("GEB_ROPEFLAT").is_ok(), "GEB_DYN_LLIST 需 GEB_ROPEFLAT=1");
-        assert!(attn_manual, "GEB_DYN_LLIST 需 GEB_ATTN=manual");
-        assert!(qkv3, "GEB_DYN_LLIST 需 GEB_QKV3=1");
+        assert!(
+            std::env::var("GEB_ATTN").map(|v| v == "manual").unwrap_or(false),
+            "GEB_DYN_LLIST 需 GEB_ATTN=manual"
+        );
+        assert!(std::env::var("GEB_QKV3").is_ok(), "GEB_DYN_LLIST 需 GEB_QKV3=1");
         let lmax = *g.iter().max().unwrap();
         assert_eq!(tokens, lmax, "GEB_DYN_LLIST 模式 GEB_TOKENS 须 = 档表 max L（binds 按 max 物化）");
         let ps = g.iter().map(|&l| VT + l - drop_v).collect::<Vec<i64>>();
