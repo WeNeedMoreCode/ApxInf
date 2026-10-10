@@ -1499,6 +1499,17 @@ pub fn parity_and_bench(
     eager: &dyn Fn(&[DeviceBuffer]) -> Vec<DeviceBuffer>,
     bench: bool,
 ) {
+    // gear 模式：eager 参考与 row_bcast/动态 binds 布局不兼容（bias 行
+    // 重复物化、rope 表 p_max 全量），且多档对拍需逐档参考——数值裁判走
+    // e2e golden 与行为 eval。烤桶 OM 落盘照常（save 只需 build 产物）
+    if gear_mode() {
+        println!("[parity] gear 模式：跳过 eager 对拍（裁判 = e2e golden + 行为 eval）");
+        if let Ok(p) = std::env::var("GEB_SAVE") {
+            seg.g.save(&p).expect("save om (gear)");
+            println!("OM saved: {p}");
+        }
+        return;
+    }
     // GEB_NORM32：GE 是 fp32 方差语义、eager 参考（aclnnAddRmsNorm）是
     // f16——对拍必分叉；且标量池前插使 eager 的层索引错位。单段模式
     // 下跳过对拍（数值裁判走 GEB_OPTEST=n32v + e2e 路径的 golden 对拍）
