@@ -3135,7 +3135,7 @@ fn reg_i8(
         // 18 层×9 输入 + 基础 24 = 186 维）。缺省（=1）走 Const——此前
         // 「Const 撞 legacy 墙 rc=-7」实为 dynamicDims 选项串 bug 的误判
         // （fix11 前选项被 payload 静态尾维污染，与 Const 无关）
-        if gear_mode() {
+        if !s.gear_ps.is_empty() {
             if envi("GEB_SM_DYN", 0) == 1 {
                 let n = s.data(ctx, &format!("{dump_tag}sm"), &[-1], &smf);
                 s.set_gear_fix(&n, k);
@@ -3148,7 +3148,7 @@ fn reg_i8(
         }
     } else {
         let invf: Vec<f16> = f.inv.iter().map(|&v| f16::from_f32(v)).collect();
-        if gear_mode() {
+        if !s.gear_ps.is_empty() {
             if envi("GEB_SM_DYN", 0) == 1 {
                 let n = s.data(ctx, &format!("{dump_tag}inv"), &[-1, k], &invf);
                 s.set_gear_fix(&n, k);
@@ -3480,7 +3480,7 @@ pub fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e
         };
         // gear 模式：Const 化（GEB_G_DYN=1 定值动态——同 sm 注记的 128 维
         // 上限问题，缺省 Const）
-        if gear_mode() {
+        if !s.gear_ps.is_empty() {
             if envi("GEB_G_DYN", 0) == 1 {
                 let n = s.data(ctx, &format!("{}g1", tag), &[-1], &g1_h);
                 s.set_gear_fix(&n, PW);
@@ -3590,7 +3590,7 @@ pub fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e
                 &[],
             )
         };
-        if gear_mode() {
+        if !s.gear_ps.is_empty() {
             if envi("GEB_G_DYN", 0) == 1 {
                 let n = s.data(ctx, &format!("{}g2", tag), &[-1], &g2_h);
                 s.set_gear_fix(&n, PW);
