@@ -270,6 +270,30 @@ impl AscendContext {
         )
     }
 
+    /// Sized stream-ordered H2D（动态分档：实际内容行数 ≤ max 物化 buffer
+    /// ——只写前 host.len() 字节，尾部保留旧值；分支 desc 只读本档行）
+    pub fn copy_h2d_async_sized(
+        &self,
+        dst: &DeviceBuffer,
+        host: &[u8],
+        stream: &crate::AscendStream,
+    ) -> Result<()> {
+        assert!(host.len() <= dst.len, "h2d sized: {} > dst {}", host.len(), dst.len);
+        self.check(
+            unsafe {
+                ffi::aclrtMemcpyAsync(
+                    dst.ptr,
+                    host.len(),
+                    host.as_ptr() as *const c_void,
+                    host.len(),
+                    ffi::ACL_MEMCPY_HOST_TO_DEVICE,
+                    stream.handle(),
+                )
+            },
+            "aclrtMemcpyAsync h2d sized",
+        )
+    }
+
     /// Stream-ordered device → host copy (async). Same lifetime rule for the
     /// host buffer: not written before the stream sync completes it.
     pub fn copy_d2h_async(

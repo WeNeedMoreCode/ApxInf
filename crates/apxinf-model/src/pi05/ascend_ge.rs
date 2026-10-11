@@ -1854,12 +1854,17 @@ impl PrefixMech {
         let mut x0 = vision_out[..self.vis_rows].to_vec();
         x0.extend_from_slice(&self.tok_cache_rows);
         let t1 = std::time::Instant::now();
-        // gear 模式 binds[0] = p_max 物化（x0 实际 p 行 ≤ max——h2d 按实长）
+        // gear 模式 binds[0] = p_max 物化（x0 实际 p 行 ≤ max——sized h2d）
         assert!(x0.len() * 2 <= self.s.binds[0].len(), "serve x0 尺寸超 max 档");
         // 零拷贝字节视图（x0 活到函数尾，async h2d 借用安全）
         let bytes: &[u8] =
             unsafe { std::slice::from_raw_parts(x0.as_ptr() as *const u8, x0.len() * 2) };
-        ctx.copy_h2d_async(&self.s.binds[0], bytes, stream).expect("serve h2d x0");
+        if self.s.gear_payloads.is_empty() {
+            ctx.copy_h2d_async(&self.s.binds[0], bytes, stream).expect("serve h2d x0");
+        } else {
+            ctx.copy_h2d_async_sized(&self.s.binds[0], bytes, stream)
+                .expect("serve h2d x0 (gear)");
+        }
         let t2 = std::time::Instant::now();
         let refs: Vec<&DeviceBuffer> = self.routs.iter().collect();
         self.s.run_seg(gi, &refs, stream).expect("ge run");
@@ -2029,7 +2034,8 @@ impl FlowMech {
     ) -> Vec<f16> {
         let h2d = |buf: &DeviceBuffer, vals: &[f16]| {
             let bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect();
-            ctx.copy_h2d(buf, &bytes).expect("serve h2d");
+            // sized：HYBRID 下 pk/pv 内容 = 实际 p 行 < max 物化 bind
+            ctx.copy_h2d_async_sized(buf, &bytes, stream).expect("serve h2d");
         };
         assert_eq!(kv.len(), self.depth * 2, "serve kv 路数不符");
         let gi = self.gear_idx(token_ids.len() as i64);
