@@ -17,14 +17,27 @@ fn main() {
     let bench = std::env::var("GEB_BENCH").is_ok();
     ge_builder::init("Ascend310P3").expect("geb init (before acl runtime)");
     let be = AscendBackend::new(0).expect("be");
+    // GEB_PRELOAD_EARLY=1（e2e serve 冷启动 lazy）：ckpt 解析（~63s 全量）
+    // 与 OM 预载并行——线程持 backend context 引用（进程存续，一次性）
+    if std::env::var("GEB_PRELOAD_EARLY").is_ok() && seg == "e2e" {
+        let ctx2: &apxinf_ascend::AscendContext = unsafe { std::mem::transmute(be.ctx()) };
+        std::thread::spawn(move || {
+            apxinf_model::pi05::preload_e2e_oms(ctx2);
+        });
+    }
     // GEB_CKPT：真 checkpoint（LeRobot safetensors 目录/单文件）。host 解析
     // 管线含 LeRobot 前缀归一、[in,out] 物理转置、Gemma 1+w scale 折叠
     // （g1/g2 变 ones，折叠进 q/k/v/gate/up——probe 图直接消费该约定）
     let real = std::env::var("GEB_CKPT").ok().map(|path| {
         let t0 = std::time::Instant::now();
-        let w = Pi05Weights::from_safetensors(&Pi05Config::default(), std::path::Path::new(&path))
-            .expect("GEB_CKPT load");
-        println!("GEB_CKPT: {path} loaded in {:?}", t0.elapsed());
+        // 两段计时（lazy 施工取证）：mmap+Tensor 拷贝 vs from_map 数学
+        // （前缀归一/[in,out] 转置/Gemma fold）——决定 stub 化收益落点
+        let (tensors, _) = apxinf_loader::safetensors::load_native_path(std::path::Path::new(&path))
+            .expect("GEB_CKPT load_native_path");
+        let t1 = std::time::Instant::now();
+        println!("GEB_CKPT io/copy: {:?}（{} tensors）", t1 - t0, tensors.len());
+        let w = Pi05Weights::from_map(&Pi05Config::default(), tensors).expect("GEB_CKPT from_map");
+        println!("GEB_CKPT from_map: {:?}（total {:?}）", t0.elapsed() - (t1 - t0), t0.elapsed());
         w
     });
     if let Ok(t) = std::env::var("GEB_OPTEST") {

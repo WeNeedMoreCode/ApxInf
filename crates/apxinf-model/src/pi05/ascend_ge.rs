@@ -4594,12 +4594,36 @@ pub fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e
         let mut flow_pool: std::collections::HashMap<i64, GeGraph> = std::collections::HashMap::new();
         if let Ok(pool_root) = std::env::var("GEB_FLOW_POOL") {
             let ls = dyn_llist().unwrap_or_else(|| panic!("GEB_FLOW_POOL 需 GEB_DYN_LLIST 档表"));
-            for &l in &ls {
-                let p = format!("{pool_root}/tl{l}_i8/flow_real.om");
-                println!("[flow-pool] loading {p}");
-                let g = ge_builder::load(&p).unwrap_or_else(|e| panic!("flow pool {p}: {e:?}"));
-                flow_pool.insert(l, g);
+            // 并行装载（冷启动 lazy）：22 只 × ~500MB 串行 ≈ 1-2min → 线程池
+            // 并行 ≈ 15s（ge_builder load 带锁；线程绑主 context——裸线程 rc=-3）
+            let t0p = std::time::Instant::now();
+            let ctx3: &AscendContext = unsafe { std::mem::transmute(ctx) };
+            let handles: Vec<std::thread::JoinHandle<(i64, Option<GeGraph>)>> = ls
+                .iter()
+                .map(|&l| {
+                    let p = format!("{pool_root}/tl{l}_i8/flow_real.om");
+                    std::thread::spawn(move || {
+                        if let Err(e) = ctx3.set_current() {
+                            eprintln!("[flow-pool] L={l} context 绑定失败: {e:?}");
+                            return (l, None);
+                        }
+                        let g = ge_builder::load(&p);
+                        if let Err(e) = &g {
+                            eprintln!("[flow-pool] L={l} 装载失败 {p}: {e:?}");
+                        }
+                        (l, g.ok())
+                    })
+                })
+                .collect();
+            for h in handles {
+                if let Ok((l, g)) = h.join() {
+                    if let Some(g) = g {
+                        flow_pool.insert(l, g);
+                    }
+                }
             }
+            assert_eq!(flow_pool.len(), ls.len(), "flow 池装载不全");
+            println!("[flow-pool] {} 只并行装载完成 {:?}", flow_pool.len(), t0p.elapsed());
             let first = *ls.first().expect("档表非空");
             s.g = flow_pool[&first];
         } else {
