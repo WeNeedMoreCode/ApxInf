@@ -61,7 +61,8 @@ pub use ascend_executor::{
 };
 #[cfg(feature = "ascend")]
 pub use ascend_ge::{
-    optest, seg_e2e, seg_flow, seg_prefix, seg_vision, serve_loop, GeServe, GeServeOut,
+    optest, preload_e2e_oms, seg_e2e, seg_flow, seg_prefix, seg_vision, serve_loop, GeServe,
+    GeServeOut,
 };
 #[cfg(feature = "ascend")]
 pub use ascend_runtime::{AscendPrefixKvCache, Pi05AscendRuntime};
