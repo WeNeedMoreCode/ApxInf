@@ -1853,6 +1853,15 @@ impl PrefixMech {
         }
         let mut x0 = vision_out[..self.vis_rows].to_vec();
         x0.extend_from_slice(&self.tok_cache_rows);
+        if envi("GEB_STYLES_DBG", 0) == 1 {
+            let cs = |v: &[f16]| -> u64 { v.iter().map(|x| x.to_bits() as u64).sum() };
+            println!(
+                "[dbg] x0 cs_vis={:016x} cs_tok={:016x} len={}",
+                cs(&vision_out[..self.vis_rows]),
+                cs(&self.tok_cache_rows),
+                x0.len()
+            );
+        }
         let t1 = std::time::Instant::now();
         // gear 模式 binds[0] = p_max 物化（x0 实际 p 行 ≤ max——sized h2d）
         assert!(x0.len() * 2 <= self.s.binds[0].len(), "serve x0 尺寸超 max 档");
@@ -4675,6 +4684,13 @@ pub fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e
                     v.push(m_gt);
                 }
                 let (f_scl, f_sh, _) = e2e_style_pair(&rw.action_final_norm.style, &cond, AW as usize);
+                if envi("GEB_STYLES_DBG", 0) == 1 && step < 4 {
+                    println!(
+                        "[dbg] step {step} cond[0..4]={:?} L0a_scl[0..3]={:?}",
+                        &cond[..4],
+                        &v[0].iter().take(3).map(|x| x.to_f32()).collect::<Vec<_>>()
+                    );
+                }
                 v.push(f_scl);
                 v.push(f_sh);
                 v
@@ -4685,6 +4701,12 @@ pub fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e
             cfg.num_flow_steps,
             tpre.elapsed()
         );
+        if envi("GEB_STYLES_DBG", 0) == 1 {
+            let cs = |v: &Vec<Vec<Vec<f16>>>| -> u64 {
+                v.iter().flatten().flatten().map(|x| x.to_bits() as u64).sum()
+            };
+            println!("[dbg] styles_cache cs={:016x}", cs(&style_cache));
+        }
         let t0 = std::time::Instant::now();
         for step in 0..cfg.num_flow_steps {
             let sc = &style_cache[step];

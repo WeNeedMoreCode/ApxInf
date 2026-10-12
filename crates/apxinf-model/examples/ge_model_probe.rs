@@ -39,9 +39,27 @@ fn main() {
             .expect("GEB_CKPT load_native_path");
         let t1 = std::time::Instant::now();
         println!("GEB_CKPT io/copy: {:?}（{} tensors）", t1 - t0, tensors.len());
-        let w = Pi05Weights::from_map(&Pi05Config::default(), tensors).expect("GEB_CKPT from_map");
-        println!("GEB_CKPT from_map: {:?}（total {:?}）", t0.elapsed() - (t1 - t0), t0.elapsed());
-        w
+        if std::env::var("GEB_CKPT_SERVE_MIN").is_ok() {
+            // serve 最小消费面（styles 链 + 嵌入表），其余 synthetic 占位——
+            // 占位不可入图：bake（GEB_SAVE）路径直接拒绝
+            assert!(
+                std::env::var("GEB_SAVE").is_err(),
+                "GEB_CKPT_SERVE_MIN 占位权重不可入图——bake（GEB_SAVE）必须全量加载"
+            );
+            let w =
+                Pi05Weights::from_map_serve(&Pi05Config::default(), tensors)
+                    .expect("GEB_CKPT from_map_serve");
+            println!(
+                "GEB_CKPT from_map_serve: {:?}（total {:?}）",
+                t0.elapsed() - (t1 - t0),
+                t0.elapsed()
+            );
+            w
+        } else {
+            let w = Pi05Weights::from_map(&Pi05Config::default(), tensors).expect("GEB_CKPT from_map");
+            println!("GEB_CKPT from_map: {:?}（total {:?}）", t0.elapsed() - (t1 - t0), t0.elapsed());
+            w
+        }
     });
     if let Ok(t) = std::env::var("GEB_OPTEST") {
         optest(&be, &t, real.as_ref());

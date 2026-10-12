@@ -243,6 +243,71 @@ impl Pi05Weights {
         Ok(weights)
     }
 
+    /// Serve-only minimal load: synthetic skeleton (shape-correct placeholders)
+    /// plus the host-consumed subset — `time_mlp_{in,out}`, the 37 AdaRMS style
+    /// projections (`gemma_expert` per-layer input/post norms + final norm) and
+    /// the tied token embedding for host lookup. Everything else (vision tower,
+    /// language layers, expert projections) is baked into the prebaked OMs a
+    /// serve loads, so placeholders are never consumed: serve skips graph
+    /// compilation, and the probe driver refuses `GEB_CKPT_SERVE_MIN` on a bake
+    /// (`GEB_SAVE`) path so placeholder weights can't silently reach an OM.
+    /// Cuts the 61s single-threaded from_map math over 812 tensors to ~2s
+    /// (2026-10-12 cold-start breakdown: io/copy 5.5s is untouched).
+    pub fn from_map_serve(config: &Pi05Config, mut tensors: HashMap<String, Tensor>) -> Result<Self> {
+        config.validate()?;
+        normalize_lerobot_prefix(&mut tensors);
+        let mut weights = Self::synthetic(config, 0)?;
+        weights.time_mlp_in = take_linear(&mut tensors, "time_mlp_in", true)?;
+        weights.time_mlp_out = take_linear(&mut tensors, "time_mlp_out", true)?;
+        let action_prefix = format!("{ROOT}.gemma_expert.model");
+        for layer in 0..config.action_expert.depth {
+            let p = format!("{action_prefix}.layers.{layer}");
+            weights.action_layers[layer].input_norm =
+                take_ada_norm(&mut tensors, &format!("{p}.input_layernorm"))?;
+            weights.action_layers[layer].post_attention_norm =
+                take_ada_norm(&mut tensors, &format!("{p}.post_attention_layernorm"))?;
+        }
+        weights.action_final_norm = take_ada_norm(&mut tensors, &format!("{action_prefix}.norm"))?;
+        // flow 段 Data bias 槽（ainb/aoutb 图输入——binds 物化消费；mm
+        // 权重 wt() 在 WCONST 下 Const 烤入 OM 不占输入，占位无害）
+        weights.action_in.bias = take_opt(&mut tensors, "action_in_proj.bias");
+        weights.action_out.bias = take_opt(&mut tensors, "action_out_proj.bias");
+        // vision 段 Data 输入源（binds 物化消费——mm 权重仍占位：WCONST
+        // 烤入 OM 不走 binds；2026-10-12 tmp 桶 vis_head 分岔定位的补遗：
+        // patch/pos/LN/qkv/fc bias 全部经 s.data() 进 binds）
+        let vp = format!("{ROOT}.paligemma.model.vision_tower.vision_model");
+        weights.vision.patch_embedding.bias =
+            Some(take(&mut tensors, &format!("{vp}.embeddings.patch_embedding.bias"))?);
+        weights.vision.position_embedding =
+            take(&mut tensors, &format!("{vp}.embeddings.position_embedding.weight"))?;
+        for layer in 0..config.vision_depth {
+            let p = format!("{vp}.encoder.layers.{layer}");
+            let blk = &mut weights.vision.blocks[layer];
+            blk.norm1 = take_layer_norm(&mut tensors, &format!("{p}.layer_norm1"))?;
+            blk.norm2 = take_layer_norm(&mut tensors, &format!("{p}.layer_norm2"))?;
+            blk.q.bias = take_opt(&mut tensors, &format!("{p}.self_attn.q_proj.bias"));
+            blk.k.bias = take_opt(&mut tensors, &format!("{p}.self_attn.k_proj.bias"));
+            blk.v.bias = take_opt(&mut tensors, &format!("{p}.self_attn.v_proj.bias"));
+            blk.output.bias = take_opt(&mut tensors, &format!("{p}.self_attn.out_proj.bias"));
+            blk.fc1.bias = take_opt(&mut tensors, &format!("{p}.mlp.fc1.bias"));
+            blk.fc2.bias = take_opt(&mut tensors, &format!("{p}.mlp.fc2.bias"));
+        }
+        weights.vision.post_layer_norm =
+            take_layer_norm(&mut tensors, &format!("{vp}.post_layernorm"))?;
+        weights.vision.multimodal_projector.bias = take_opt(
+            &mut tensors,
+            &format!("{ROOT}.paligemma.model.multi_modal_projector.linear.bias"),
+        );
+        weights.vision.token_embedding = take_any(
+            &mut tensors,
+            &[
+                format!("{ROOT}.paligemma.model.language_model.embed_tokens.weight"),
+                format!("{ROOT}.paligemma.lm_head.weight"),
+            ],
+        )?;
+        Ok(weights)
+    }
+
     /// Build deterministic random host weights for a config, with no checkpoint.
     ///
     /// Latency depends only on tensor shape and dtype, so a benchmark that only
@@ -468,6 +533,11 @@ fn take(tensors: &mut HashMap<String, Tensor>, name: &str) -> Result<Tensor> {
     tensors
         .remove(name)
         .ok_or_else(|| Error::Other(format!("missing π0.5 weight `{name}`")))
+}
+
+/// Optional take for serve-min overwrites: absent key keeps the placeholder.
+fn take_opt(tensors: &mut HashMap<String, Tensor>, name: &str) -> Option<Tensor> {
+    tensors.remove(name)
 }
 
 fn take_any(tensors: &mut HashMap<String, Tensor>, names: &[String]) -> Result<Tensor> {
