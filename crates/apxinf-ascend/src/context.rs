@@ -13,7 +13,10 @@ static ACL_INIT: OnceLock<i32> = OnceLock::new();
 
 fn ensure_init() -> Result<()> {
     let &code = ACL_INIT.get_or_init(|| unsafe { ffi::aclInit(std::ptr::null()) });
-    if code == 0 {
+    // 100002 = ACL_ERROR_REPEAT_INITIALIZE：进程里已有先行初始化者（GE 的
+    // aclgrphBuildInitialize 隐式 aclInit——inproc 宿主里 open 先于 backend）。
+    // 运行时已就绪，视为成功。
+    if code == 0 || code == 100002 {
         Ok(())
     } else {
         Err(AclError { code, op: "aclInit" })

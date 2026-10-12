@@ -1017,9 +1017,18 @@ mod ge_serve_py {
                 .as_slice()
                 .map_err(|_| PyValueError::new_err("ids must be C-contiguous uint32"))?
                 .to_vec();
-            if ids.len() != self.serve.tokens {
+            // gear 模式（GEB_DYN_LLIST 档表）L 由 payload 驱动选档——只查
+            // L ≤ open 时的 max tokens（binds 按 max 物化）；静态桶模式仍
+            // 要求逐字节等于（挑桶语义）
+            let gear_mode = std::env::var("GEB_DYN_LLIST").is_ok();
+            let ids_ok = if gear_mode {
+                ids.len() <= self.serve.tokens
+            } else {
+                ids.len() == self.serve.tokens
+            };
+            if !ids_ok {
                 return Err(PyValueError::new_err(format!(
-                    "GeServeModel.infer: ids length {} != bucket tokens {}（挑桶错）",
+                    "GeServeModel.infer: ids length {} != bucket tokens {}（挑桶错；gear 模式 L 须 ≤ max）",
                     ids.len(),
                     self.serve.tokens
                 )));
