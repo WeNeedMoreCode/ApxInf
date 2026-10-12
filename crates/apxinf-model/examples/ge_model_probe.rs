@@ -20,6 +20,9 @@ fn main() {
     // GEB_PRELOAD_EARLY=1（e2e serve 冷启动 lazy）：ckpt 解析（~63s 全量）
     // 与 OM 预载并行——线程持 backend context 引用（进程存续，一次性）
     if std::env::var("GEB_PRELOAD_EARLY").is_ok() && seg == "e2e" {
+        // 主线程先激活 context（裸 SetCurrentContext 从未激活的 context 跨
+        // 线程会 107000——tl152 实测；激活后 early 线程绑定才成立）
+        let _ = be.ctx().set_current();
         let ctx2: &apxinf_ascend::AscendContext = unsafe { std::mem::transmute(be.ctx()) };
         std::thread::spawn(move || {
             apxinf_model::pi05::preload_e2e_oms(ctx2);
