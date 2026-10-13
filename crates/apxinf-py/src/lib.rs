@@ -970,8 +970,16 @@ mod ge_serve_py {
             // PyGILState_Ensure/Release，宿主线程状态全程完好。
             let (backend, serve) = py.allow_threads(|| -> PyResult<(AscendBackend, GeServe)> {
                 ge_init_once()?;
-                let real = Pi05Weights::from_safetensors(&Pi05Config::default(), &ckpt)
-                    .map_err(runtime_err)?;
+                // serve-min（GEB_CKPT_SERVE_MIN=1）：零物化骨架 + Data 源真值
+                // 的选择性加载（与 probe 驱动同 env 约定）。PyO3 open 只有
+                // GEB_LOAD 面（不 bake），无 GEB_SAVE 护栏需求；inproc 全链
+                // 冷启动由此砍掉 ckpt 数学段的大头（2026-10-13）。
+                let real = if std::env::var("GEB_CKPT_SERVE_MIN").is_ok() {
+                    Pi05Weights::from_safetensors_serve(&Pi05Config::default(), &ckpt)
+                } else {
+                    Pi05Weights::from_safetensors(&Pi05Config::default(), &ckpt)
+                }
+                .map_err(runtime_err)?;
                 let backend = AscendBackend::new(0).map_err(runtime_err)?;
                 let serve = GeServe::open(&backend, &real, &om_dir_s, tokens, fast);
                 Ok((backend, serve))

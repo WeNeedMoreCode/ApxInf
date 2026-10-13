@@ -111,6 +111,13 @@ impl Pi05Weights {
         Self::from_map(config, tensors)
     }
 
+    /// Serve-only minimal load straight from a checkpoint dir (see `from_map_serve`).
+    pub fn from_safetensors_serve(config: &Pi05Config, path: &Path) -> Result<Self> {
+        let (tensors, _) = apxinf_loader::safetensors::load_native_path(path)
+            .map_err(|error| Error::Other(format!("load π0.5 SafeTensors: {error}")))?;
+        Self::from_map_serve(config, tensors)
+    }
+
     /// Consume a LeRobot/OpenPI π0.5 safetensors map and validate every tensor
     /// required by the inference graph. Unused action LM-head weights may remain.
     pub fn from_map(config: &Pi05Config, mut tensors: HashMap<String, Tensor>) -> Result<Self> {
@@ -252,22 +259,50 @@ impl Pi05Weights {
     /// compilation, and the probe driver refuses `GEB_CKPT_SERVE_MIN` on a bake
     /// (`GEB_SAVE`) path so placeholder weights can't silently reach an OM.
     /// Cuts the 61s single-threaded from_map math over 812 tensors to ~2s
-    /// (2026-10-12 cold-start breakdown: io/copy 5.5s is untouched).
+    /// (2026-10-12 cold-start breakdown: io/copy 5.5s is untouched). The
+    /// 2026-10-13 follow-up zeroes the skeleton fill (`synthetic_skeleton`:
+    /// placeholders are never read, and untouched zero pages cost no RSS)
+    /// and parallelizes the 39 style transposes that then dominate.
     pub fn from_map_serve(config: &Pi05Config, mut tensors: HashMap<String, Tensor>) -> Result<Self> {
         config.validate()?;
         normalize_lerobot_prefix(&mut tensors);
-        let mut weights = Self::synthetic(config, 0)?;
-        weights.time_mlp_in = take_linear(&mut tensors, "time_mlp_in", true)?;
-        weights.time_mlp_out = take_linear(&mut tensors, "time_mlp_out", true)?;
+        let mut weights = Self::synthetic_skeleton(config)?;
+        // styles 链（18 层 ×2 + final + time_mlp ×2 = 39 件 [3w,w]/[w,w] 转置）
+        // 是零物化骨架后数学段的大头：先顺序 take（纯 move），再按线程分块
+        // 并行转置——chunk 独占所有权无锁；不引 rayon（引擎 crate 零新依赖）。
         let action_prefix = format!("{ROOT}.gemma_expert.model");
+        let mut srcs: Vec<(Tensor, Option<Tensor>)> = Vec::with_capacity(39);
         for layer in 0..config.action_expert.depth {
             let p = format!("{action_prefix}.layers.{layer}");
-            weights.action_layers[layer].input_norm =
-                take_ada_norm(&mut tensors, &format!("{p}.input_layernorm"))?;
-            weights.action_layers[layer].post_attention_norm =
-                take_ada_norm(&mut tensors, &format!("{p}.post_attention_layernorm"))?;
+            for half in ["input_layernorm", "post_attention_layernorm"] {
+                let d = format!("{p}.{half}.dense");
+                srcs.push((
+                    take(&mut tensors, &format!("{d}.weight"))?,
+                    Some(take(&mut tensors, &format!("{d}.bias"))?),
+                ));
+            }
         }
-        weights.action_final_norm = take_ada_norm(&mut tensors, &format!("{action_prefix}.norm"))?;
+        srcs.push((
+            take(&mut tensors, &format!("{action_prefix}.norm.dense.weight"))?,
+            Some(take(&mut tensors, &format!("{action_prefix}.norm.dense.bias"))?),
+        ));
+        for t in ["time_mlp_in", "time_mlp_out"] {
+            srcs.push((
+                take(&mut tensors, &format!("{t}.weight"))?,
+                Some(take(&mut tensors, &format!("{t}.bias"))?),
+            ));
+        }
+        let mut lin = parallel_transpose(srcs)?.into_iter();
+        for layer in 0..config.action_expert.depth {
+            weights.action_layers[layer].input_norm =
+                AdaRmsNormWeights { style: lin.next().expect("style slots") };
+            weights.action_layers[layer].post_attention_norm =
+                AdaRmsNormWeights { style: lin.next().expect("style slots") };
+        }
+        weights.action_final_norm =
+            AdaRmsNormWeights { style: lin.next().expect("style slots") };
+        weights.time_mlp_in = lin.next().expect("style slots");
+        weights.time_mlp_out = lin.next().expect("style slots");
         // flow 段 Data bias 槽（ainb/aoutb 图输入——binds 物化消费；mm
         // 权重 wt() 在 WCONST 下 Const 烤入 OM 不占输入，占位无害）
         weights.action_in.bias = take_opt(&mut tensors, "action_in_proj.bias");
@@ -318,8 +353,28 @@ impl Pi05Weights {
     /// folds the learned offset into the projections, so the runtime multiplies
     /// by unit scale); LayerNorm gamma is one and beta is zero.
     pub fn synthetic(config: &Pi05Config, seed: u64) -> Result<Self> {
-        config.validate()?;
         let mut rng = SyntheticRng::new(seed);
+        Self::build_skeleton(config, &mut SkeletonFill::Random(&mut rng))
+    }
+
+    /// Shape-only zero skeleton: every placeholder `synthetic` would fill with
+    /// RNG values is allocated zeroed instead. For serve-min (`from_map_serve`)
+    /// the placeholders are provably never read — the prebaked OM carries the
+    /// Const/WCONST faces — so the ~7GB LCG fill is pure cold-start waste, and
+    /// zero pages that are never touched cost neither time nor RSS. Benchmarks
+    /// and bakes must keep `synthetic`: they compute with the values.
+    pub fn synthetic_skeleton(config: &Pi05Config) -> Result<Self> {
+        // GEB_SM_ZSCOPE：bisect/debug 旋钮。默认空 = 全零（生产）；rand =
+        // 全随机占位（旧行为单变量对照——隔离「零填充」与「重构本身」）
+        if std::env::var("GEB_SM_ZSCOPE").as_deref() == Ok("rand") {
+            let mut rng = SyntheticRng::new(0);
+            return Self::build_skeleton(config, &mut SkeletonFill::Random(&mut rng));
+        }
+        Self::build_skeleton(config, &mut SkeletonFill::Zero)
+    }
+
+    fn build_skeleton(config: &Pi05Config, fill: &mut SkeletonFill) -> Result<Self> {
+        config.validate()?;
 
         let lang = &config.language;
         let action = &config.action_expert;
@@ -330,50 +385,43 @@ impl Pi05Weights {
         for _ in 0..config.vision_depth {
             vision_blocks.push(VisionBlockWeights {
                 norm1: synthetic_layer_norm(config.vision_width)?,
-                q: synthetic_linear(&mut rng, config.vision_width, vision_qkv, true)?,
-                k: synthetic_linear(&mut rng, config.vision_width, vision_qkv, true)?,
-                v: synthetic_linear(&mut rng, config.vision_width, vision_qkv, true)?,
-                output: synthetic_linear(&mut rng, vision_qkv, config.vision_width, true)?,
+                q: fill.linear(config.vision_width, vision_qkv, true)?,
+                k: fill.linear(config.vision_width, vision_qkv, true)?,
+                v: fill.linear(config.vision_width, vision_qkv, true)?,
+                output: fill.linear(vision_qkv, config.vision_width, true)?,
                 norm2: synthetic_layer_norm(config.vision_width)?,
-                fc1: synthetic_linear(&mut rng, config.vision_width, config.vision_mlp_dim, true)?,
-                fc2: synthetic_linear(&mut rng, config.vision_mlp_dim, config.vision_width, true)?,
+                fc1: fill.linear(config.vision_width, config.vision_mlp_dim, true)?,
+                fc2: fill.linear(config.vision_mlp_dim, config.vision_width, true)?,
             });
         }
 
         let vision = VisionWeights {
-            patch_embedding: synthetic_linear(&mut rng, patch_width, config.vision_width, true)?,
-            position_embedding: synthetic_tensor(
-                &mut rng,
-                vec![config.patches_per_view(), config.vision_width],
-            )?,
+            patch_embedding: fill.linear(patch_width, config.vision_width, true)?,
+            position_embedding: fill
+                .tensor(vec![config.patches_per_view(), config.vision_width])?,
             blocks: vision_blocks,
             post_layer_norm: synthetic_layer_norm(config.vision_width)?,
-            multimodal_projector: synthetic_linear(
-                &mut rng,
-                config.vision_width,
-                lang.width,
-                true,
-            )?,
-            token_embedding: synthetic_tensor(&mut rng, vec![config.vocab_size, lang.width])?,
+            multimodal_projector: fill.linear(config.vision_width, lang.width, true)?,
+            token_embedding: fill.tensor(vec![config.vocab_size, lang.width])?,
         };
 
         let mut language_layers = Vec::with_capacity(lang.depth);
         for _ in 0..lang.depth {
             language_layers.push(LanguageLayerWeights {
                 input_norm_scale: ones(&[lang.width])?,
-                attention: synthetic_attention(&mut rng, lang)?,
+                attention: synthetic_attention(fill, lang)?,
                 post_attention_norm_scale: ones(&[lang.width])?,
-                mlp: synthetic_mlp(&mut rng, lang)?,
+                mlp: synthetic_mlp(fill, lang)?,
             });
         }
 
         let mut action_layers = Vec::with_capacity(action.depth);
         for _ in 0..action.depth {
             action_layers.push(ActionLayerWeights {
-                input_norm: synthetic_ada_norm(&mut rng, action.width)?,
-                attention: synthetic_attention(&mut rng, action)?,
-                post_attention_norm: synthetic_ada_norm(&mut rng, action.width)?,
-                mlp: synthetic_mlp(&mut rng, action)?,
+                input_norm: synthetic_ada_norm(fill, action.width)?,
+                attention: synthetic_attention(fill, action)?,
+                post_attention_norm: synthetic_ada_norm(fill, action.width)?,
+                mlp: synthetic_mlp(fill, action)?,
             });
         }
 
@@ -382,11 +430,11 @@ impl Pi05Weights {
             language_layers,
             language_final_norm_scale: ones(&[lang.width])?,
             action_layers,
-            action_final_norm: synthetic_ada_norm(&mut rng, action.width)?,
-            action_in: synthetic_linear(&mut rng, config.action_dim, action.width, true)?,
-            action_out: synthetic_linear(&mut rng, action.width, config.action_dim, true)?,
-            time_mlp_in: synthetic_linear(&mut rng, action.width, action.width, true)?,
-            time_mlp_out: synthetic_linear(&mut rng, action.width, action.width, true)?,
+            action_final_norm: synthetic_ada_norm(fill, action.width)?,
+            action_in: fill.linear(config.action_dim, action.width, true)?,
+            action_out: fill.linear(action.width, config.action_dim, true)?,
+            time_mlp_in: fill.linear(action.width, action.width, true)?,
+            time_mlp_out: fill.linear(action.width, action.width, true)?,
         };
 
         validate_shapes(config, &weights)?;
@@ -428,18 +476,63 @@ fn synthetic_tensor(rng: &mut SyntheticRng, shape: Vec<usize>) -> Result<Tensor>
     Tensor::from_bf16(shape, &values)
 }
 
-fn synthetic_linear(
-    rng: &mut SyntheticRng,
-    in_dim: usize,
-    out_dim: usize,
-    has_bias: bool,
-) -> Result<LinearWeights> {
-    Ok(LinearWeights {
-        weight: synthetic_tensor(rng, vec![in_dim, out_dim])?,
-        bias: has_bias
-            .then(|| synthetic_tensor(rng, vec![out_dim]))
-            .transpose()?,
-    })
+/// Fill policy for skeleton construction (see `synthetic_skeleton`).
+enum SkeletonFill<'r> {
+    Random(&'r mut SyntheticRng),
+    Zero,
+}
+
+impl SkeletonFill<'_> {
+    fn tensor(&mut self, shape: Vec<usize>) -> Result<Tensor> {
+        match self {
+            Self::Random(rng) => synthetic_tensor(rng, shape),
+            // 大块 `vec![0u8]` 走 calloc → 懒 commit 零页：不 touch 不计费
+            Self::Zero => Ok(Tensor::zeros(shape, DType::BF16)),
+        }
+    }
+
+    fn linear(&mut self, in_dim: usize, out_dim: usize, has_bias: bool) -> Result<LinearWeights> {
+        Ok(LinearWeights {
+            weight: self.tensor(vec![in_dim, out_dim])?,
+            bias: has_bias.then(|| self.tensor(vec![out_dim])).transpose()?,
+        })
+    }
+}
+
+/// Parallel `transpose_2d` over disjoint (weight, bias) pairs — the serve-min
+/// style chain is 39 independent cache-hostile transposes (~925MB), the only
+/// parallel-worthy math left after the zero-fill skeleton. Chunks own their
+/// tensors outright: no locks, no shared state, `std::thread::scope` joins
+/// before any result is consumed.
+fn parallel_transpose(mut srcs: Vec<(Tensor, Option<Tensor>)>) -> Result<Vec<LinearWeights>> {
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .clamp(1, 8);
+    let chunk = srcs.len().div_ceil(threads);
+    let done: Vec<Result<LinearWeights>> = std::thread::scope(|s| {
+        let handles: Vec<_> = srcs
+            .chunks_mut(chunk)
+            .map(|c| {
+                s.spawn(move || {
+                    c.iter_mut()
+                        .map(|(w, b)| {
+                            Ok(LinearWeights {
+                                weight: transpose_2d(w)?,
+                                bias: b.take(),
+                            })
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        let mut out = Vec::new();
+        for h in handles {
+            out.extend(h.join().expect("style transpose thread panicked"));
+        }
+        out
+    });
+    done.into_iter().collect()
 }
 
 fn synthetic_layer_norm(dim: usize) -> Result<LayerNormWeights> {
@@ -451,31 +544,31 @@ fn synthetic_layer_norm(dim: usize) -> Result<LayerNormWeights> {
     })
 }
 
-fn synthetic_ada_norm(rng: &mut SyntheticRng, width: usize) -> Result<AdaRmsNormWeights> {
+fn synthetic_ada_norm(fill: &mut SkeletonFill, width: usize) -> Result<AdaRmsNormWeights> {
     Ok(AdaRmsNormWeights {
-        style: synthetic_linear(rng, width, 3 * width, true)?,
+        style: fill.linear(width, 3 * width, true)?,
     })
 }
 
 fn synthetic_attention(
-    rng: &mut SyntheticRng,
+    fill: &mut SkeletonFill,
     config: &GemmaVariantConfig,
 ) -> Result<GemmaAttentionWeights> {
     let q = config.num_heads * config.head_dim;
     let kv = config.num_kv_heads * config.head_dim;
     Ok(GemmaAttentionWeights {
-        q: synthetic_linear(rng, config.width, q, false)?,
-        k: synthetic_linear(rng, config.width, kv, false)?,
-        v: synthetic_linear(rng, config.width, kv, false)?,
-        output: synthetic_linear(rng, q, config.width, false)?,
+        q: fill.linear(config.width, q, false)?,
+        k: fill.linear(config.width, kv, false)?,
+        v: fill.linear(config.width, kv, false)?,
+        output: fill.linear(q, config.width, false)?,
     })
 }
 
-fn synthetic_mlp(rng: &mut SyntheticRng, config: &GemmaVariantConfig) -> Result<GemmaMlpWeights> {
+fn synthetic_mlp(fill: &mut SkeletonFill, config: &GemmaVariantConfig) -> Result<GemmaMlpWeights> {
     Ok(GemmaMlpWeights {
-        gate: synthetic_linear(rng, config.width, config.mlp_dim, false)?,
-        up: synthetic_linear(rng, config.width, config.mlp_dim, false)?,
-        down: synthetic_linear(rng, config.mlp_dim, config.width, false)?,
+        gate: fill.linear(config.width, config.mlp_dim, false)?,
+        up: fill.linear(config.width, config.mlp_dim, false)?,
+        down: fill.linear(config.mlp_dim, config.width, false)?,
     })
 }
 
