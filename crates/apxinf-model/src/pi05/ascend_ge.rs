@@ -1803,6 +1803,14 @@ pub struct PrefixMech {
     tok_cache_rows: Vec<f16>,
     /// gear 模式：L → 档下标（静态模式空 = 固定 L 单桶）
     gear_of_l: std::collections::HashMap<i64, usize>,
+    /// GEB_PREFIX_POOL：per-L 静态 prefix OM 池（换柄执行，routs 全 L 共用
+    /// ——max 物化、无跨请求状态）。T4R 根因修复，见 compose 处注记
+    pool_root: Option<String>,
+    pool_graphs: std::collections::HashMap<i64, ge_builder::GeGraph>,
+    pool_lru: Vec<i64>,
+    pool_cap: usize,
+    /// routs 各槽字节数（= max 档 OM 输出尺寸——池 OM d2h 整缓冲后截断用）
+    rout_bytes: Vec<usize>,
 }
 
 impl PrefixMech {
@@ -1819,6 +1827,35 @@ impl PrefixMech {
 }
 
 impl PrefixMech {
+    /// 池模式：按 L 换静态 OM 句柄（lazy 装载 tl{l}_i8；LRU 上限防全档
+    /// 驻留炸显存——单只 1.88GB）。routs/binds 不换（max 物化全 L 共用）
+    fn swap_prefix(&mut self, l: i64) {
+        if !self.pool_graphs.contains_key(&l) {
+            let p = format!("{}/tl{l}_i8/prefix_real.om",
+                            self.pool_root.as_deref().unwrap_or_default());
+            println!("[prefix-pool] lazy load L={l}（{p}）");
+            let g = ge_builder::load(&p)
+                .unwrap_or_else(|e| panic!("prefix pool 缺 L={l}（{e:?}）——先烤 {p}"));
+            let n_out = g.num_outputs().unwrap();
+            assert!(n_out <= self.rout_bytes.len(),
+                    "池 OM 输出数 {n_out} > max 槽位 {}", self.rout_bytes.len());
+            self.pool_graphs.insert(l, g);
+            self.pool_lru.push(l);
+            while self.pool_lru.len() > self.pool_cap {
+                let victim = self.pool_lru.remove(0);
+                if let Some(g) = self.pool_graphs.remove(&victim) {
+                    let _ = g.unload();
+                }
+                println!("[prefix-pool] LRU 驱逐 L={victim}（cap={}）", self.pool_cap);
+            }
+        } else {
+            let i = self.pool_lru.iter().position(|&x| x == l).unwrap();
+            self.pool_lru.remove(i);
+            self.pool_lru.push(l);
+        }
+        self.s.g = *self.pool_graphs.get(&l).unwrap();
+    }
+
     /// 一帧 prefix（设备态）：重组 x0（本帧 vision_out 可见行 + 真 token
     /// 查表 ×lang_scale）覆写 binds[0] 重跑 + sync；36 路 kv 留在
     /// self.routs（设备）——GEB_SERVE_FAST 下由 FlowMech 异步 d2d 直连
@@ -1835,6 +1872,9 @@ impl PrefixMech {
         let tim = serve_timing();
         let t0 = std::time::Instant::now();
         let gi = self.gear_idx(token_ids.len() as i64);
+        if self.pool_root.is_some() {
+            self.swap_prefix(token_ids.len() as i64);
+        }
         // token 查表缓存：ids 变化才重算（prompt 跨 replan 恒定——同任务
         // 桶内 token_ids 不变）。数值恒等：同算式（f32 mul）产同 f16 字节
         if self.tok_cache_ids != token_ids {
@@ -1868,11 +1908,12 @@ impl PrefixMech {
         // 零拷贝字节视图（x0 活到函数尾，async h2d 借用安全）
         let bytes: &[u8] =
             unsafe { std::slice::from_raw_parts(x0.as_ptr() as *const u8, x0.len() * 2) };
-        if self.s.gear_payloads.is_empty() {
+        if self.s.gear_payloads.is_empty() && self.pool_root.is_none() {
             ctx.copy_h2d_async(&self.s.binds[0], bytes, stream).expect("serve h2d x0");
         } else {
+            // gear / prefix-pool：binds[0] 按 max 物化，本帧实际 p 行 → sized
             ctx.copy_h2d_async_sized(&self.s.binds[0], bytes, stream)
-                .expect("serve h2d x0 (gear)");
+                .expect("serve h2d x0 (sized)");
         }
         let t2 = std::time::Instant::now();
         let refs: Vec<&DeviceBuffer> = self.routs.iter().collect();
@@ -1906,15 +1947,24 @@ impl PrefixMech {
         (0..self.nkv).map(|i| self.download_kv(ctx, i)).collect()
     }
 
-    /// kv 下载（gear 模式按当前档实际行数——cur_output_dims；静态 = 满 buffer）
+    /// kv 下载（按当前执行 OM 的实际行数；routs/binds 按 max 物化——
+    /// d2h 整缓冲契约下先全量再截断）
     fn download_kv(&self, ctx: &AscendContext, i: usize) -> Vec<f16> {
-        let n = if self.s.gear_payloads.is_empty() {
-            self.s.g.output_size(i).unwrap() / 2
-        } else {
+        if !self.s.gear_payloads.is_empty() {
             let dims = self.s.g.cur_output_dims(i).unwrap_or_else(|e| panic!("cur dims: {e:?}"));
-            dims.iter().product::<i64>() as usize
-        };
-        download_f16(ctx, &self.routs[i], n)
+            let n = dims.iter().product::<i64>() as usize;
+            let full = self.s.g.output_size(i).unwrap() / 2;
+            let mut v = download_f16(ctx, &self.routs[i], full);
+            v.truncate(n);
+            return v;
+        }
+        if self.pool_root.is_some() {
+            let full = self.rout_bytes[i] / 2;
+            let mut v = download_f16(ctx, &self.routs[i], full);
+            v.truncate(self.s.g.output_size(i).unwrap() / 2);
+            return v;
+        }
+        download_f16(ctx, &self.routs[i], self.s.g.output_size(i).unwrap() / 2)
     }
 }
 
@@ -3247,7 +3297,16 @@ pub fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e
     // zeros/swap 逐行 p 无关，p_max 全量即前缀截断语义）。L 相关 Const
     // （qswap_c/kswap_c）在 gear 模式转 Data[-1]。档表 p 值喂 Seg，finish
     // 合成 ge.dynamicDims + 每档 S2 payload
-    let gear_ll = dyn_llist();
+    // GEB_PREFIX_POOL：prefix 段改静态组装 + per-L 静态 OM 池换柄执行——
+    // T4R 2026-10-15 判决：动态图结构（-1 维 Reshape / rope·qswap Data 化）
+    // 使 int8 逐层漂移 3×（真帧互差 13.1% actions 级；2 档对照证伪
+    // range-tiling 假设）；llist 仍留给 flow 池与客户端校验
+    let gear_ll = if std::env::var("GEB_PREFIX_POOL").is_ok() {
+        println!("[prefix-pool] GEB_PREFIX_POOL 生效：prefix 静态组装 + per-L 池");
+        None
+    } else {
+        dyn_llist()
+    };
     let mut gear_ps_hold: Option<Vec<i64>> = None;
     let gd = |v: i64| if gear_ll.is_some() { -1 } else { v };
     if let Some(g) = &gear_ll {
@@ -3918,6 +3977,12 @@ pub fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e
                 .as_ref()
                 .map(|g| g.iter().enumerate().map(|(i, &l)| (l, i)).collect())
                 .unwrap_or_default();
+            let rout_bytes: Vec<usize> =
+                (0..n_out).map(|i| s.g.output_size(i).unwrap()).collect();
+            let pool_root = std::env::var("GEB_PREFIX_POOL").ok();
+            if pool_root.is_some() {
+                println!("[prefix-pool] serve 池模式：per-L 静态 OM 换柄（lazy，cap 8）");
+            }
             st.pmech = Some(PrefixMech {
                 s,
                 routs,
@@ -3929,6 +3994,11 @@ pub fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e
                 tok_cache_ids: Vec::new(),
                 tok_cache_rows: Vec::new(),
                 gear_of_l,
+                pool_root,
+                pool_graphs: std::collections::HashMap::new(),
+                pool_lru: Vec::new(),
+                pool_cap: 8,
+                rout_bytes,
             });
         }
         return;
