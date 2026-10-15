@@ -2363,17 +2363,17 @@ pub fn e2e_run(ctx: &AscendContext, stream: &AscendStream, s: &mut Seg, seg: &st
     let refs: Vec<&DeviceBuffer> = outs.iter().collect();
     s.run_seg(gi, &refs, stream).expect("ge run");
     drop(stream.synchronize());
-    // kv 下载行数：gear 模式按当前档实际输出（cur_output_dims——同生产
-    // download_kv；buffer 按 max 档物化，尾部是未写残留）；静态 = 满 buffer
-    let out_n = |i: usize| -> usize {
-        if s.gear_payloads.is_empty() {
-            s.g.output_size(i).unwrap() / 2
-        } else {
-            s.g.cur_output_dims(i).unwrap().iter().product::<i64>() as usize
-        }
-    };
+    // gear 模式 buffer 按 max 档物化（712 行）而本档只写前 666——d2h 须整
+    // 缓冲（copy_d2h 长度断言），下载后 host 侧截到 cur_output_dims 行数
     let dl: Vec<Vec<f16>> = (0..n_out)
-        .map(|i| download_f16(ctx, &outs[i], out_n(i)))
+        .map(|i| {
+            let mut v = download_f16(ctx, &outs[i], s.g.output_size(i).unwrap() / 2);
+            if !s.gear_payloads.is_empty() {
+                let n = s.g.cur_output_dims(i).unwrap().iter().product::<i64>() as usize;
+                v.truncate(n);
+            }
+            v
+        })
         .collect();
     // GEB_E2E_BENCH=N：稳态 rerun bench（输入 binds 不变重跑；含全输出 d2h
     // ——prefix 的 36 路 kv 下载 = today 生产 host 中转 glue，如实计入）
@@ -2385,7 +2385,7 @@ pub fn e2e_run(ctx: &AscendContext, stream: &AscendStream, s: &mut Seg, seg: &st
             s.run_seg(gi, &refs, stream).expect("ge run");
             drop(stream.synchronize());
             let _: Vec<_> = (0..n_out)
-                .map(|i| download_f16(ctx, &outs[i], out_n(i)))
+                .map(|i| download_f16(ctx, &outs[i], s.g.output_size(i).unwrap() / 2))
                 .collect();
             ts.push(t.elapsed().as_secs_f64() * 1e3);
         }
