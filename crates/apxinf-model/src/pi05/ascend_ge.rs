@@ -2683,8 +2683,9 @@ pub fn serve_loop(be: &AscendBackend, st: &mut E2eStage, dir: &str, tokens: usiz
         assert_eq!(magic, 0x4751_4531, "serve 请求 magic 不符");
         let l = u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]) as usize;
         // 静态模式 = 单 L 桶（L 须钉死）；gear 模式按请求 L 验长 + 选档
-        //（档表外 L 由 gear_idx panic 拒绝——supervisor 档表 = 谱系全集）
-        if pipe.pm.s.gear_payloads.is_empty() {
+        //（档表外 L 由 gear_idx panic 拒绝——supervisor 档表 = 谱系全集）；
+        // prefix 池模式（GEB_PREFIX_POOL）任意 L 由池换柄承载
+        if pipe.pm.s.gear_payloads.is_empty() && pipe.pm.pool_root.is_none() {
             assert_eq!(
                 l, tokens,
                 "serve 请求 L={l} ≠ 本进程桶 GEB_TOKENS={tokens}（Python 侧挑桶错）"
