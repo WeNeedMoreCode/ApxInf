@@ -115,8 +115,12 @@ pub fn dyn_llist() -> Option<Vec<i64>> {
 static GEAR_MODE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
 /// 进程级 gear 模式开关（env 读一次；构图/执行两侧共用）。
+/// GEB_PREFIX_POOL 例外：池模式下压成 false——prefix 组装须与静态桶 OM 的
+/// 接口一致（gear 折叠 rows==1 bias 少注册 90 个 Data，n_in 170!=260 实证
+/// 2026-10-15）；flow 接口两模式同形（rope 恒 Data）不受影响，但
+/// set_rope_for 的早退门按 flows 池判（见彼处）。
 pub fn gear_mode() -> bool {
-    *GEAR_MODE.get_or_init(|| dyn_llist().is_some())
+    *GEAR_MODE.get_or_init(|| dyn_llist().is_some() && std::env::var("GEB_PREFIX_POOL").is_err())
 }
 
 /// desc 维度的动态位替换：gear 模式一律 -1（MultiBatchClone 逐档特化；
@@ -2063,9 +2067,11 @@ impl FlowMech {
     }
 
     /// L 变更换装 rope 表（flat 四件 + rank-2 四件；内容 pos_offset=p——
-    /// 表 HOR 定形与 p 无关，内容随 p 平移。L 不变零动作）
+    /// 表 HOR 定形与 p 无关，内容随 p 平移。L 不变零动作）。早退门按 flows
+    /// 池判：池非空 = HYBRID 逐 L 换静态 flow OM，rope 须随 L 换装（哪怕
+    /// payloads 空——GEB_PREFIX_POOL 下 gear_mode 全局为 false 的情形）
     fn set_rope_for(&mut self, ctx: &AscendContext, l: i64) {
-        if self.s.gear_payloads.is_empty() || self.last_l == l {
+        if (self.s.gear_payloads.is_empty() && self.flows.is_empty()) || self.last_l == l {
             return;
         }
         let p = lp_to_p(l);
