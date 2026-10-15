@@ -3823,6 +3823,20 @@ pub fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e
         let outs = e2e_run(ctx, stream, &mut s, "prefix");
         let nkv = depth * 2;
         assert!(outs.len() >= nkv, "prefix OM 输出 {} < kv {}", outs.len(), nkv);
+        // GEB_E2E_DUMP_MID=<dir>：prefix 全部输出原始 f16 落盘——含 36 路 kv
+        //（slot{2i}=k_l{i} / slot{2i+1}=v_l{i}，行数 = 可见 Pv）+ 调试槽位
+        //（GEB_DBG_MID 烤的 OM 才有；槽值可能被复用覆写，判读用「值匹配
+        // 教科书哪级」而非槽序）。T4R 用法：static 侧 dump → 合并进 golden
+        // → dyn 跑时 cmp_mid 打的即逐层 dyn-vs-static 互差
+        if let Ok(dir) = std::env::var("GEB_E2E_DUMP_MID") {
+            std::fs::create_dir_all(&dir).expect("dump dir");
+            for (i, vals) in outs.iter().enumerate() {
+                let bytes: Vec<u8> =
+                    vals.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect();
+                std::fs::write(format!("{dir}/ge_slot{i}.f16"), &bytes).expect("dump mid");
+            }
+            println!("[e2e] prefix 输出已落盘 {dir}/ge_slot{{0..{}}}.f16（含 36 路 kv）", outs.len());
+        }
         if outs.len() > nkv {
             // 剔除空视图时 golden 参考键为 _vis（712 行，与图槽同形）
             if drop_v > 0 {
@@ -3831,17 +3845,6 @@ pub fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e
             } else {
                 st.cmp_mid("m0", &outs[nkv]);
                 st.cmp_mid("h1", &outs[nkv + 1]);
-            }
-            // GEB_E2E_DUMP_MID=<dir>：全部调试槽位原始 f16 落盘
-            //（ge_slot{i}.f16，i 与图输出序一致——槽值可能被复用覆写，
-            // 判读用「值匹配教科书哪级」而非槽序）
-            if let Ok(dir) = std::env::var("GEB_E2E_DUMP_MID") {
-                for (i, vals) in outs.iter().enumerate().skip(nkv) {
-                    let bytes: Vec<u8> =
-                        vals.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect();
-                    std::fs::write(format!("{dir}/ge_slot{i}.f16"), &bytes).expect("dump mid");
-                }
-                println!("[e2e] 调试槽位已落盘 {dir}/ge_slot{{nkv+}}.f16 ×{}", outs.len() - nkv);
             }
         }
         st.kv = outs[..nkv].to_vec();
@@ -4772,6 +4775,14 @@ pub fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e
             );
         }
         st.actions = x;
+        // GEB_E2E_DUMP_MID 同目录落 actions（f16 raw [50,ADIM]——T4R 互差的
+        // golden 合并原料：static actions 并进 golden_actions 后，dyn 跑的
+        // GOLDEN PARITY 即 actions 级 dyn-vs-static 互差）
+        if let Ok(dir) = std::env::var("GEB_E2E_DUMP_MID") {
+            let bytes: Vec<u8> = st.actions.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect();
+            std::fs::write(format!("{dir}/ge_actions.f16"), &bytes).expect("dump actions");
+            println!("[e2e] actions 已落盘 {dir}/ge_actions.f16");
+        }
         if let Some(g) = &st.golden_actions {
             // golden actions = predict_action_chunk 的 deployable 切片
             // (50, gd)——取 e2e 输出 [50, ADIM] 每行前 gd 列比（pad_vector
