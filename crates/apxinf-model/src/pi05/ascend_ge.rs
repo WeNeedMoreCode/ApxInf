@@ -2181,17 +2181,22 @@ impl FlowMech {
     }
 
     /// range padding：flow padmask 填充——键布局 = cache 行在前（真
-    /// [0,vis+L) / pad [vis+L, vis+P)）+ flow HOR 行恒真。L 不变零动作。
-    /// 池模式限定（flows 非空）：单 OM 模式无网格映射不调用
+    /// [0,vis+L) / pad [vis+L, vis+P)）+ 本桶 flow HOR 行恒真。L 不变零
+    /// 动作。池模式限定（flows 非空）。⚠ 全长度填充（copy_h2d 等长断言）：
+    /// bind 按 max 桶物化（762 行），本桶外行未被消费取 −30000 无害
     fn fill_mask(&mut self, ctx: &AscendContext, l_true: i64, p_bkt: i64) {
         let Some(bi) = self.mask_bind else { return };
         if self.flows.is_empty() || self.mask_last == l_true {
             return;
         }
         let vis = lp_to_p(0);
-        let mut mh = vec![f16::from_f32(0.0); (vis + p_bkt + HOR) as usize];
-        for r in &mut mh[(vis + l_true) as usize..(vis + p_bkt) as usize] {
-            *r = f16::from_f32(-30000.0);
+        let full = lp_to_p(envi("GEB_POOL_GRID_MAX", 200)) + HOR;
+        let mut mh = vec![f16::from_f32(-30000.0); full as usize];
+        for r in &mut mh[..(vis + l_true) as usize] {
+            *r = f16::from_f32(0.0);
+        }
+        for r in &mut mh[(vis + p_bkt) as usize..(vis + p_bkt + HOR) as usize] {
+            *r = f16::from_f32(0.0);
         }
         let bytes: Vec<u8> = mh.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect();
         ctx.copy_h2d(&self.s.binds[bi], &bytes).expect("flow padmask h2d");
