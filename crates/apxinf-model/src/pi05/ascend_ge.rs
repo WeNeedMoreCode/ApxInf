@@ -475,6 +475,11 @@ pub struct Seg {
     names: Vec<String>,
     shapes: Vec<Vec<i64>>,
     pub binds: Vec<DeviceBuffer>,
+    /// binds 平行名表（bind_of 用）。⚠ names/shapes 只覆盖 Data 输入——
+    /// WCONST 权重（wt Const 分支）与 i8 占位槽只 push binds 不进 names，
+    /// 两表历史上不对齐（bind_of 恰只查头部 Data 输入而幸存）；bind_names
+    /// 与 binds 严格平行，按名定位不再依赖注册顺序（2026-10-16 c1/c2 事故）
+    pub bind_names: Vec<String>,
     /// 图输入在 binds 里的下标（GEB_WCONST 时权重是 Const 不占图输入，
     /// binds 仍全量持上传副本供 eager/层基址——索引两模式恒同）
     data_inputs: Vec<usize>,
@@ -510,6 +515,7 @@ impl Seg {
             names: Vec::new(),
             shapes: Vec::new(),
             binds: Vec::new(),
+            bind_names: Vec::new(),
             data_inputs: Vec::new(),
             n32_c: std::collections::HashMap::new(),
             wconst: std::env::var("GEB_WCONST").is_ok(),
@@ -554,14 +560,15 @@ impl Seg {
         self.gear_fix.insert(name.to_string(), v);
     }
 
-    /// bind 下标按 Data 名查（mech 换装 rope 表用；names/binds 平行注册）
+    /// bind 下标按名查（bind_names 与 binds 严格平行——含 WCONST 权重与
+    /// i8 占位槽；names/shapes 仅 Data 输入面，两者历史上不对齐）
     /// try 版：缺名返回 None（GEB_ATTN_MASK 可选输入 padmask 的 mech 接线）
     pub fn try_bind_of(&self, name: &str) -> Option<usize> {
-        self.names.iter().position(|n| n == name)
+        self.bind_names.iter().position(|n| n == name)
     }
 
     pub fn bind_of(&self, name: &str) -> usize {
-        self.names
+        self.bind_names
             .iter()
             .position(|n| n == name)
             .unwrap_or_else(|| panic!("bind_of: 图输入 {name} 不存在"))
@@ -636,6 +643,7 @@ impl Seg {
         self.names.push(name.to_string());
         self.shapes.push(dims.to_vec());
         self.binds.push(buf);
+        self.bind_names.push(name.to_string());
         self.data_inputs.push(self.binds.len() - 1);
         self.datas.insert(name.to_string());
         name.to_string()
@@ -655,6 +663,7 @@ impl Seg {
                 .collect();
             self.const_f16(name, dims, &th);
             self.binds.push(buf);
+            self.bind_names.push(name.to_string());
             self.datas.insert(name.to_string());
         } else {
             self.data_buf(name, dims, buf);
@@ -676,6 +685,7 @@ impl Seg {
         self.names.push(name.to_string());
         self.shapes.push(dims.to_vec());
         self.binds.push(buf);
+        self.bind_names.push(name.to_string());
         self.data_inputs.push(self.binds.len() - 1);
         self.datas.insert(name.to_string());
         name.to_string()
@@ -693,6 +703,7 @@ impl Seg {
         self.names.push(name.to_string());
         self.shapes.push(dims.to_vec());
         self.binds.push(buf);
+        self.bind_names.push(name.to_string());
         self.data_inputs.push(self.binds.len() - 1);
         self.datas.insert(name.to_string());
         name.to_string()
@@ -707,6 +718,7 @@ impl Seg {
         self.names.push(name.to_string());
         self.shapes.push(dims.to_vec());
         self.binds.push(buf);
+        self.bind_names.push(name.to_string());
         self.data_inputs.push(self.binds.len() - 1);
         self.datas.insert(name.to_string());
         name.to_string()
@@ -739,6 +751,7 @@ impl Seg {
         self.names.push(name.to_string());
         self.shapes.push(dims_nz.to_vec());
         self.binds.push(buf);
+        self.bind_names.push(name.to_string());
         self.data_inputs.push(self.binds.len() - 1);
         self.datas.insert(name.to_string());
         name.to_string()
@@ -4539,7 +4552,10 @@ pub fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e
             }
             if qkv3 {
                 // qkv3 层内输入位次 2..8（ascl/ash 之后）；eager 按 qkv3 偏移读
-                let i8_slot = |s: &mut Seg| s.binds.push(ctx.malloc(16).expect("i8 wt 槽占位"));
+                let i8_slot = |s: &mut Seg| {
+                    s.binds.push(ctx.malloc(16).expect("i8 wt 槽占位"));
+                    s.bind_names.push(String::new());
+                };
                 if fi8[i][0].is_some() {
                     i8_slot(&mut s);
                 } else {
@@ -4582,6 +4598,7 @@ pub fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e
         }
         if fi8[i][3].is_some() {
             s.binds.push(ctx.malloc(16).expect("i8 wt 槽占位"));
+            s.bind_names.push(String::new());
         } else {
             let host = lay
                 .map(|l| lw_f16(&l.attention.output))
@@ -4596,6 +4613,7 @@ pub fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e
         s.data(ctx, &format!("{}msh", tag), &[AW], &norm_f16(AW as usize, &mut seed, 0.0));
         if fi8[i][4].is_some() {
             s.binds.push(ctx.malloc(16).expect("i8 wt 槽占位"));
+            s.bind_names.push(String::new());
         } else {
             let host = lay
                 .map(|l| lw_f16(&l.mlp.gate))
@@ -4604,6 +4622,7 @@ pub fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e
         }
         if fi8[i][5].is_some() {
             s.binds.push(ctx.malloc(16).expect("i8 wt 槽占位"));
+            s.bind_names.push(String::new());
         } else {
             let host = lay
                 .map(|l| lw_f16(&l.mlp.up))
@@ -4612,6 +4631,7 @@ pub fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e
         }
         if fi8[i][6].is_some() {
             s.binds.push(ctx.malloc(16).expect("i8 wt 槽占位"));
+            s.bind_names.push(String::new());
         } else {
             let host = lay
                 .map(|l| lw_f16(&l.mlp.down))
