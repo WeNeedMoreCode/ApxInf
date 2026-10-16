@@ -2601,7 +2601,10 @@ pub fn seg_e2e(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>) {
             };
             let f16v = |k: &str| -> Vec<f16> { f32v(k).into_iter().map(f16::from_f32).collect() };
             let ids: Vec<u32> = f32v("token_ids").iter().map(|&v| v as u32).collect();
-            assert_eq!(ids.len(), tokens, "golden token 数与 GEB_TOKENS 不符");
+            // GEB_E2E_PAD_TOKENS（range padding 对拍）：golden 真长 < 桶界
+            if envi("GEB_E2E_PAD_TOKENS", 0) == 0 {
+                assert_eq!(ids.len(), tokens, "golden token 数与 GEB_TOKENS 不符");
+            }
             // 中间量（可选键，名对齐 golden_gen.py 落盘键）：vision_out / x0 /
             // kvk_l{i} 全 18 层（prefix k cache）/ step0_x1——段边界 bisect
             let mut keys: Vec<String> = Vec::new();
