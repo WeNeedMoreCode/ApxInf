@@ -3227,7 +3227,7 @@ fn reg_i8(
             } else {
                 s.const_f16(&format!("{dump_tag}sm"), &[k], &smf)
             }
-        } else if envi("GEB_ABL_SMCONST", 0) == 1 {
+        } else if envi("GEB_ABL_SMCONST", 0) == 1 && key.starts_with("prefix/") {
             // GEB_ABL_SMCONST=1（结构消融 V4，2026-10-16）：静态模式 smooth
             // 烤 Const——隔离 dyn OM 的 smooth 注册差异（gear 缺省 Const vs
             // 静态 Data[k]，18 层×7 投影=126 个被 qmd 消费的输入；Const 或
