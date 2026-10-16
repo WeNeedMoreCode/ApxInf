@@ -4315,8 +4315,16 @@ pub fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e
         assert_eq!(st.kv.len(), depth * 2, "e2e: prefix 段 k/v 数与 flow 深度不符（GEB_DEPTH 须全 18）");
     }
     s.data_zeros(ctx, "zeros", HOR, AW);
-    let (qc, qs, qi) = rope_flat_const(HOR, HEADS, p);
-    let (kc, ks, ki) = rope_flat_const(HOR, KV_HEADS, p);
+    // PAD 对拍：flow token 位置 = vis+真L+i（serve 侧 set_rope_for(真L) 同
+    // 义）——桶界 P 只定 cache 消费维度，rope 相位必须按真 L，否则 flow
+    // 整体相位漂移（首战 24.7% l17 教训：数值验收两坑之一）
+    let rope_p = if envi("GEB_E2E_PAD_TOKENS", 0) > 0 {
+        lp_to_p(envi("GEB_E2E_PAD_TOKENS", 0))
+    } else {
+        p
+    };
+    let (qc, qs, qi) = rope_flat_const(HOR, HEADS, rope_p);
+    let (kc, ks, ki) = rope_flat_const(HOR, KV_HEADS, rope_p);
     let qf = (HOR * HEADS * 2, HD / 2);
     let kf = (HOR * KV_HEADS * 2, HD / 2);
     s.data(ctx, "qcos", &[qf.0, qf.1], &qc);
@@ -4325,8 +4333,8 @@ pub fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e
     s.data(ctx, "kcos", &[kf.0, kf.1], &kc);
     s.data(ctx, "ksin", &[kf.0, kf.1], &ks);
     s.data_i32(ctx, "kswap", &[kf.0], &ki);
-    let (qc2, qs2) = rope_rank2_const(HOR, HEADS, p);
-    let (kc2, ks2) = rope_rank2_const(HOR, KV_HEADS, p);
+    let (qc2, qs2) = rope_rank2_const(HOR, HEADS, rope_p);
+    let (kc2, ks2) = rope_rank2_const(HOR, KV_HEADS, rope_p);
     s.data(ctx, "qcos2", &[HOR, QD], &qc2);
     s.data(ctx, "qsin2", &[HOR, QD], &qs2);
     s.data(ctx, "kcos2", &[HOR, KVD], &kc2);
@@ -4894,12 +4902,12 @@ pub fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e
         let mut x = st.noise.clone();
         // euler 常数换绑为 LeRobot 语义 x' = x + dt·v（c1=1.0，sample_actions
         // L894；OM 缺省 0.9/-0.1 = openpi x1-预测式）。c1/c2 是 Data 输入，
-        // 绑定位次 = binds 尾两位（eager b[n-2]/b[n-1] 同源）
+        // 按名定位——原「binds 尾两位」假设被 GEB_ATTN_MASK 的 padmask
+        // 追加注册打破（padmask 落尾，c2 灌进 1444B mask bind 即崩）
         let c1_h = vec![f16::from_f32(1.0); (HOR * ADIM) as usize];
         let c2_h = vec![f16::from_f32(-0.1); (HOR * ADIM) as usize];
-        let nb = s.binds.len();
-        h2d_f16(&s.binds[nb - 2], &c1_h);
-        h2d_f16(&s.binds[nb - 1], &c2_h);
+        h2d_f16(&s.binds[s.bind_of("c1")], &c1_h);
+        h2d_f16(&s.binds[s.bind_of("c2")], &c2_h);
         // styles 预计算缓存：10 步 time 调度固定（1+step·dt）⇒ styles 跨调用
         // 不变，生产口径一次性算 + 常驻（每步 host 现算 ≈173ms/步 是 glue 大头，
         // 2026-09-21 bring-up 计时定罪）。cond 对拍/替入诊断（bisect）保留在此
