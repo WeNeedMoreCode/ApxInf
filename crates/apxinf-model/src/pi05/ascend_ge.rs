@@ -801,7 +801,10 @@ impl Seg {
         cols: i64,
         row: &[f16],
     ) -> String {
-        if gear_mode() && envi("GEB_BIAS_REG", 0) == 0 {
+        // GEB_ABL_BIAS=1（结构消融 V1，2026-10-16）：静态模式下也走 gear 式
+        // 注册（重复行/rows==1 折叠不注册）——隔离 dyn OM 的 bias 注册差异
+        //（int8 路径 90 个 [1,cols] 行悬空不消费，预期数值零差异）
+        if (gear_mode() || envi("GEB_ABL_BIAS", 0) == 1) && envi("GEB_BIAS_REG", 0) == 0 {
             if rows > 1 {
                 let mut rep = Vec::with_capacity((rows * cols) as usize);
                 for _ in 0..rows {
@@ -819,7 +822,7 @@ impl Seg {
 
     fn bias(&mut self, name: &str, x: &str, x_dims: &[i64], row: &str) -> String {
         let ba = format!("{name}_ba");
-        if gear_mode() {
+        if gear_mode() || envi("GEB_ABL_BIAS", 0) == 1 {
             // 行已重复注册为同形 [-1,cols]——直接 Add（无 TileD）
             self.g.add_op(&ba, "Add").unwrap();
             self.g.set_input_desc(&ba, "x1", x_dims, Dtype::Fp16).unwrap();
@@ -3224,6 +3227,12 @@ fn reg_i8(
             } else {
                 s.const_f16(&format!("{dump_tag}sm"), &[k], &smf)
             }
+        } else if envi("GEB_ABL_SMCONST", 0) == 1 {
+            // GEB_ABL_SMCONST=1（结构消融 V4，2026-10-16）：静态模式 smooth
+            // 烤 Const——隔离 dyn OM 的 smooth 注册差异（gear 缺省 Const vs
+            // 静态 Data[k]，18 层×7 投影=126 个被 qmd 消费的输入；Const 或
+            // 触发编译期折叠改变 int8 累加次序——13.1% 互差候选元凶）
+            s.const_f16(&format!("{dump_tag}sm"), &[k], &smf)
         } else {
             s.data(ctx, &format!("{dump_tag}sm"), &[k], &smf)
         }
@@ -3484,7 +3493,9 @@ pub fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e
     // swap 索引：静态 Const 折叠；gear 模式转 Data[-1]（Const 全档共享而
     // 长度随档变；Data 逐档特化 desc，内容 r^1 逐行 p 无关——spike v2 P2）
     let ropeflat = std::env::var("GEB_ROPEFLAT").is_ok();
-    if gear_ll.is_some() {
+    // GEB_ABL_ROPE=1（结构消融 V2，2026-10-16）：静态模式下 swap 索引也走
+    // Data 注册——隔离 dyn OM 的 rope·qswap Data 化差异（静态缺省 Const 折叠）
+    if gear_ll.is_some() || envi("GEB_ABL_ROPE", 0) == 1 {
         s.data_i32(ctx, "qswap_c", &[gd(qf.0)], &qi);
         s.set_gear_mul("qswap_c", HEADS * 2);
         s.data_i32(ctx, "kswap_c", &[gd(kf.0)], &ki);
