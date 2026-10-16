@@ -4928,6 +4928,22 @@ pub fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e
         let c2_h = vec![f16::from_f32(-0.1); (HOR * ADIM) as usize];
         h2d_f16(&s.binds[s.bind_of("c1")], &c1_h);
         h2d_f16(&s.binds[s.bind_of("c2")], &c2_h);
+        // PAD 对拍：flow padmask 填真 mask（cache pad 键列 [vis+真L, p) =
+        // -30000，flow HOR 行与真 cache 行恒 0——serve 侧 fill_mask 同义；
+        // 缺此步则 pad cache 键裸露，actions 对拍被语义污染（首战 9% 教训）
+        if envi("GEB_E2E_PAD_TOKENS", 0) > 0 {
+            if let Some(bi) = s.try_bind_of("padmask") {
+                let lt = envi("GEB_E2E_PAD_TOKENS", 0);
+                let vis = lp_to_p(0);
+                let mut mh = vec![f16::from_f32(0.0); (p + HOR) as usize];
+                for r in &mut mh[(vis + lt) as usize..p as usize] {
+                    *r = f16::from_f32(-30000.0);
+                }
+                let bytes: Vec<u8> =
+                    mh.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect();
+                ctx.copy_h2d(&s.binds[bi], &bytes).expect("flow padmask h2d");
+            }
+        }
         // styles 预计算缓存：10 步 time 调度固定（1+step·dt）⇒ styles 跨调用
         // 不变，生产口径一次性算 + 常驻（每步 host 现算 ≈173ms/步 是 glue 大头，
         // 2026-09-21 bring-up 计时定罪）。cond 对拍/替入诊断（bisect）保留在此
