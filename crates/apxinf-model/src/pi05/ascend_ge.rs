@@ -138,6 +138,21 @@ pub fn lp_to_p(l: i64) -> i64 {
     VT + l - envi("GEB_PREFIX_DROP_EMPTY", 0)
 }
 
+/// Range padding 网格映射（GEB_POOL_GRID=stride，2026-10-16）：请求真 L →
+/// 桶界 P（向上取整到 stride 倍数，clamp [MIN, MAX]）。无 env = 恒等（精确
+/// 桶现行为）。桶界与真长的差行由 GEB_ATTN_MASK 的 softmax 加性 mask 遮蔽
+/// ——表外 L 根除（任意 L ≤ MAX 均有归属），单任务 eval 从 ~4 桶缩到 1 桶。
+pub fn pool_grid_p(l: i64) -> i64 {
+    let stride = envi("GEB_POOL_GRID", 0);
+    if stride <= 1 {
+        return l;
+    }
+    let hi = envi("GEB_POOL_GRID_MAX", 200);
+    assert!(l <= hi, "range-padding: L={l} 超桶表上限 {hi}");
+    let p = ((l + stride - 1) / stride) * stride;
+    p.clamp(envi("GEB_POOL_GRID_MIN", 136), hi)
+}
+
 /// erf 近似（Abramowitz-Stegun 7.1.26，|ε|<1.5e-7——exact gelu 对照够用）
 pub fn erf(x: f32) -> f32 {
     let s = x.signum();
@@ -540,6 +555,11 @@ impl Seg {
     }
 
     /// bind 下标按 Data 名查（mech 换装 rope 表用；names/binds 平行注册）
+    /// try 版：缺名返回 None（GEB_ATTN_MASK 可选输入 padmask 的 mech 接线）
+    pub fn try_bind_of(&self, name: &str) -> Option<usize> {
+        self.names.iter().position(|n| n == name)
+    }
+
     pub fn bind_of(&self, name: &str) -> usize {
         self.names
             .iter()
@@ -1355,9 +1375,12 @@ impl Seg {
 
     /// GQA 版（ma2 验证 0.24%）：k3/v3 [1,skv,d] TileD 广播到 bh 头。
     /// q3 [bh,sq,d]。返回 [bh,sq,d]。
+    /// mask（GEB_ATTN_MASK，range padding 2026-10-16）：Some = softmax 前
+    /// 加性 mask 广播 Add（x2 [1,1,skv]——pad 键列大负数，真列 0）。数学上
+    /// 精确（x+0 恒等 + exp(-30000+max) 下溢恰 0），真行输出与精确 L 版等价
     fn attn_manual_gqa(
         &mut self, name: &str, q3: &str, k3: &str, v3: &str,
-        bh: i64, sq: i64, skv: i64, d: i64,
+        bh: i64, sq: i64, skv: i64, d: i64, mask: Option<&str>,
     ) -> String {
         let tile = |s: &mut Self, name: &str, src: &str| -> String {
             s.g.add_op(name, "TileD").unwrap();
@@ -1379,12 +1402,25 @@ impl Seg {
         self.wire(&sc, "x1", q3);
         self.wire(&sc, "x2", &kt);
         let scr = self.reg_out(&sc, "y");
+        let smx = match mask {
+            Some(mk) => {
+                let ad = format!("{name}_mk");
+                self.g.add_op(&ad, "Add").unwrap();
+                self.g.set_input_desc(&ad, "x1", &[bh, sq, skv], Dtype::Fp16).unwrap();
+                self.g.set_input_desc(&ad, "x2", &[1, 1, skv], Dtype::Fp16).unwrap();
+                self.g.set_output_desc(&ad, "y", &[bh, sq, skv], Dtype::Fp16).unwrap();
+                self.wire(&ad, "x1", &scr);
+                self.g.link(&ad, "x2", mk).unwrap();
+                self.reg_out(&ad, "y")
+            }
+            None => scr,
+        };
         self.g.add_op(&sm, "SoftmaxV2").unwrap();
         self.g.set_input_desc(&sm, "x", &[bh, sq, skv], Dtype::Fp16).unwrap();
         self.g.set_output_desc(&sm, "y", &[bh, sq, skv], Dtype::Fp16).unwrap();
         self.g.set_attr_int_list(&sm, "axes", &[-1]).unwrap();
         self.g.set_attr_bool(&sm, "half_to_float", false).unwrap();
-        self.wire(&sm, "x", &scr);
+        self.wire(&sm, "x", &smx);
         let smr = self.reg_out(&sm, "y");
         self.g.add_op(&bm, "BatchMatMulV2").unwrap();
         self.g.set_input_desc(&bm, "x1", &[bh, sq, skv], Dtype::Fp16).unwrap();
@@ -1818,6 +1854,9 @@ pub struct PrefixMech {
     pool_cap: usize,
     /// routs 各槽字节数（= max 档 OM 输出尺寸——池 OM d2h 整缓冲后截断用）
     rout_bytes: Vec<usize>,
+    /// GEB_ATTN_MASK（range padding）：padmask 输入 bind 下标（无 mask OM
+    /// = None；池模式网格映射下必须 Some，否则 pad 行无遮蔽）
+    mask_bind: Option<usize>,
 }
 
 impl PrefixMech {
@@ -1875,12 +1914,33 @@ impl PrefixMech {
         token_ids: &[u32],
     ) {
         assert_eq!(vision_out.len(), (VT * PW) as usize, "serve vision_out 尺寸不符");
+        // range padding（GEB_POOL_GRID，池模式限定）：真 L → 桶界 P，token
+        // 补 0（embedding[0]）——pad 行由 padmask 遮蔽；非池模式恒等不受扰
+        let l_true = token_ids.len() as i64;
+        let p_bkt = if self.pool_root.is_some() {
+            pool_grid_p(l_true)
+        } else {
+            l_true
+        };
+        assert!(
+            p_bkt == l_true || self.mask_bind.is_some(),
+            "range-padding: pad 到 P={p_bkt} 但 OM 无 padmask（GEB_ATTN_MASK=1 烤）"
+        );
+        let pad_owned;
+        let token_ids: &[u32] = if p_bkt > l_true {
+            let mut v = token_ids.to_vec();
+            v.resize(p_bkt as usize, 0);
+            pad_owned = v;
+            &pad_owned
+        } else {
+            token_ids
+        };
         // 计时：asm(x0 组装+查表)/h2d_enq(零拷贝视图上流)/run/wait
         let tim = serve_timing();
         let t0 = std::time::Instant::now();
-        let gi = self.gear_idx(token_ids.len() as i64);
+        let gi = self.gear_idx(p_bkt);
         if self.pool_root.is_some() {
-            self.swap_prefix(token_ids.len() as i64);
+            self.swap_prefix(p_bkt);
         }
         // token 查表缓存：ids 变化才重算（prompt 跨 replan 恒定——同任务
         // 桶内 token_ids 不变）。数值恒等：同算式（f32 mul）产同 f16 字节
@@ -1897,6 +1957,19 @@ impl PrefixMech {
             }
             self.tok_cache_ids = token_ids.to_vec();
             self.tok_cache_rows = rows;
+            // padmask 随 token 变化填（L 不变零动作）：行 [vis+L, vis+P)
+            // = -30000，真行/视觉行 0——整只重建，无跨桶污染
+            if let Some(bi) = self.mask_bind {
+                let vis = (self.vis_rows / self.vocab_w) as i64;
+                let mut mh = vec![f16::from_f32(0.0); (vis + p_bkt) as usize];
+                for r in &mut mh[(vis + l_true) as usize..] {
+                    *r = f16::from_f32(-30000.0);
+                }
+                let bytes: Vec<u8> =
+                    mh.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect();
+                ctx.copy_h2d_async_sized(&self.s.binds[bi], &bytes, stream)
+                    .expect("serve h2d padmask");
+            }
         }
         let mut x0 = vision_out[..self.vis_rows].to_vec();
         x0.extend_from_slice(&self.tok_cache_rows);
@@ -1999,6 +2072,10 @@ pub struct FlowMech {
     /// HYBRID：per-L 静态 flow OM 池（非空 = 按请求换句柄执行，flow 不
     /// 走 gear——styles 静态 Data 之故，见 seg_flow 注记）
     flows: std::collections::HashMap<i64, GeGraph>,
+    /// GEB_ATTN_MASK（range padding）：padmask bind 下标 + 上次填充的 L
+    ///（不变零动作；整只重建无跨桶污染）
+    mask_bind: Option<usize>,
+    mask_last: i64,
 }
 
 /// styles 设备驻留构装：10 步 × (6*depth+2) 段拼一块 master（一次 h2d），
@@ -2090,6 +2167,24 @@ impl FlowMech {
         self.last_l = l;
     }
 
+    /// range padding：flow padmask 填充——键布局 = cache 行在前（真
+    /// [0,vis+L) / pad [vis+L, vis+P)）+ flow HOR 行恒真。L 不变零动作。
+    /// 池模式限定（flows 非空）：单 OM 模式无网格映射不调用
+    fn fill_mask(&mut self, ctx: &AscendContext, l_true: i64, p_bkt: i64) {
+        let Some(bi) = self.mask_bind else { return };
+        if self.flows.is_empty() || self.mask_last == l_true {
+            return;
+        }
+        let vis = lp_to_p(0);
+        let mut mh = vec![f16::from_f32(0.0); (vis + p_bkt + HOR) as usize];
+        for r in &mut mh[(vis + l_true) as usize..(vis + p_bkt) as usize] {
+            *r = f16::from_f32(-30000.0);
+        }
+        let bytes: Vec<u8> = mh.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect();
+        ctx.copy_h2d(&self.s.binds[bi], &bytes).expect("flow padmask h2d");
+        self.mask_last = l_true;
+    }
+
     /// 一帧 flow：36 路 pk/pv 换绑 + noise 重启 10 步（styles 缓存直取；
     /// euler c1/c2 已在 bring-up 换绑 LeRobot 语义且 buffer 内容恒持）
     fn one_frame(
@@ -2106,9 +2201,18 @@ impl FlowMech {
             ctx.copy_h2d_async_sized(buf, &bytes, stream).expect("serve h2d");
         };
         assert_eq!(kv.len(), self.depth * 2, "serve kv 路数不符");
-        let gi = self.gear_idx(token_ids.len() as i64);
-        self.swap_flow(token_ids.len() as i64);
-        self.set_rope_for(ctx, token_ids.len() as i64);
+        // range padding：flow OM 按桶界 P 换柄，rope 内容按真 L 换装
+        //（flow token 位置 = vis+L+i 与 P 无关，表 HOR 定形）；mask 同步填
+        let l_true = token_ids.len() as i64;
+        let p_bkt = if self.flows.is_empty() {
+            l_true
+        } else {
+            pool_grid_p(l_true)
+        };
+        let gi = self.gear_idx(p_bkt);
+        self.swap_flow(p_bkt);
+        self.set_rope_for(ctx, l_true);
+        self.fill_mask(ctx, l_true, p_bkt);
         for i in 0..self.depth {
             h2d(&self.s.binds[self.pk_base + 2 * i], &kv[2 * i]);
             h2d(&self.s.binds[self.pk_base + 2 * i + 1], &kv[2 * i + 1]);
@@ -2150,9 +2254,18 @@ impl FlowMech {
     ) -> Vec<f16> {
         assert_eq!(kv_dev.len(), self.depth * 2, "serve kv 路数不符");
         assert!(!self.style_views.is_empty(), "fast 路径须先构装 styles 驻留");
-        let gi = self.gear_idx(token_ids.len() as i64);
-        self.swap_flow(token_ids.len() as i64);
-        self.set_rope_for(ctx, token_ids.len() as i64);
+        // range padding：flow OM 按桶界 P 换柄，rope 内容按真 L 换装
+        //（flow token 位置 = vis+L+i 与 P 无关，表 HOR 定形）；mask 同步填
+        let l_true = token_ids.len() as i64;
+        let p_bkt = if self.flows.is_empty() {
+            l_true
+        } else {
+            pool_grid_p(l_true)
+        };
+        let gi = self.gear_idx(p_bkt);
+        self.swap_flow(p_bkt);
+        self.set_rope_for(ctx, l_true);
+        self.fill_mask(ctx, l_true, p_bkt);
         // 分步计时：kv(d2d×36)/h2d_enq(零拷贝视图上流)/steps(逐步 enqueue)+sync/dl
         let tim = serve_timing();
         let t0 = std::time::Instant::now();
@@ -2232,12 +2345,15 @@ impl FlowMech {
 
 impl E2eStage {
     /// 段边界 bisect 对拍：golden 有该键才比（BISECT 前缀），无则静默跳过。
-    /// 带 argmax 索引——x0 上可直接分辨分岔落在视觉段/语言段行区间
+    /// 带 argmax 索引——x0 上可直接分辨分岔落在视觉段/语言段行区间。
+    /// got ≥ want 时截断比前缀（range padding 对拍：桶界 OM 出 P 行，
+    /// golden 是真 L 行——真行恰为前缀，数学等价由 mask 保证）
     fn cmp_mid(&self, tag: &str, got: &[f16]) {
         let Some(want) = self.golden_mid.iter().find(|(k, _)| k == tag).map(|(_, v)| v) else {
             return;
         };
-        assert_eq!(got.len(), want.len(), "golden {tag} 长度不符（got {} want {}）", got.len(), want.len());
+        assert!(got.len() >= want.len(), "golden {tag} 长度不足（got {} want {}）", got.len(), want.len());
+        let got = &got[..want.len()];
         let mut md = 0f32;
         let mut i_at = 0usize;
         for (i, (&g, &w)) in got.iter().zip(want.iter()).enumerate() {
@@ -3405,6 +3521,10 @@ pub fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e
         }
         _ => None,
     };
+    // GEB_E2E_PAD_TOKENS（range padding 对拍 2026-10-16）：golden 真长 <
+    // GEB_TOKENS（桶界）——token 补 0 到桶界（pad 行由 padmask 遮蔽），
+    // 真长供 padmask 填充。cmp_mid 截断比前缀 = 真行对拍
+    let pad_true_l = envi("GEB_E2E_PAD_TOKENS", 0);
     let x0_h = match (x0_override, &e2e, real) {
         (Some(v), _, _) => {
             assert_eq!(v.len(), (p * PW) as usize, "GEB_E2E_X0_KEY 张量长度 ≠ p×PW");
@@ -3413,7 +3533,12 @@ pub fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e
         (None, Some(st), Some(w)) => {
             assert!(!st.vision_out.is_empty(), "e2e: 须先跑 vision 段");
             assert_eq!(st.vision_out.len(), (VT * PW) as usize);
-            assert_eq!(st.token_ids.len(), tokens as usize, "golden token 数与 GEB_TOKENS 不符");
+            if pad_true_l > 0 {
+                assert_eq!(st.token_ids.len(), pad_true_l as usize, "GEB_E2E_PAD_TOKENS ≠ golden token 数");
+                assert!(pad_true_l < tokens, "GEB_E2E_PAD_TOKENS 须 < GEB_TOKENS（桶界）");
+            } else {
+                assert_eq!(st.token_ids.len(), tokens as usize, "golden token 数与 GEB_TOKENS 不符");
+            }
             // 一次性 f32 物化 [vocab,PW]（~2.1GB 峰值，查完即弃）
             let emb = w.vision.token_embedding.to_f32_vec().unwrap();
             let vocab_w = PW as usize;
@@ -3424,8 +3549,15 @@ pub fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e
             let lang_scale = (PW as f32).sqrt();
             let vis_rows = ((VT - drop_v) * PW) as usize;
             let mut x0 = st.vision_out[..vis_rows].to_vec();
-            x0.reserve(st.token_ids.len() * vocab_w);
-            for &id in &st.token_ids {
+            let ids_eff: Vec<u32> = if pad_true_l > 0 {
+                let mut v = st.token_ids.clone();
+                v.resize(tokens as usize, 0);
+                v
+            } else {
+                st.token_ids.clone()
+            };
+            x0.reserve(ids_eff.len() * vocab_w);
+            for &id in &ids_eff {
                 let r = id as usize * vocab_w;
                 assert!(r + vocab_w <= emb.len(), "token id {id} 超 vocab");
                 x0.extend(emb[r..r + vocab_w].iter().map(|&v| f16::from_f32(v * lang_scale)));
@@ -3453,6 +3585,26 @@ pub fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e
     {
         let zh = vec![f16::from_f32(0.0); (p * PW) as usize];
         s.data(ctx, "zeros", &[gd(p), PW], &zh);
+    }
+    // GEB_ATTN_MASK（range padding 2026-10-16）：softmax 加性 mask 输入
+    // [1,1,p]——bake 内容占位全 0（无 pad），serve/probe 侧按真 L 填充
+    //（行 [vis+L, vis+P) = -30000；f16 域禁 -inf）。全层共用一只 Data
+    let attn_mask_n: Option<String> = if envi("GEB_ATTN_MASK", 0) == 1 {
+        let mh = vec![f16::from_f32(0.0); p as usize];
+        Some(s.data(ctx, "padmask", &[1, 1, p], &mh))
+    } else {
+        None
+    };
+    // PAD 对拍：padmask 填真 mask（行 [vis+真L, p) = -30000）——serve 同义
+    if attn_mask_n.is_some() && pad_true_l > 0 {
+        let vis = VT - envi("GEB_PREFIX_DROP_EMPTY", 0);
+        let mut mh = vec![f16::from_f32(0.0); p as usize];
+        for r in &mut mh[(vis + pad_true_l) as usize..] {
+            *r = f16::from_f32(-30000.0);
+        }
+        let bytes: Vec<u8> = mh.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect();
+        let bi = s.bind_of("padmask");
+        ctx.copy_h2d(&s.binds[bi], &bytes).expect("padmask h2d");
     }
     let (qc, qs, qi) = rope_flat_const(p, HEADS, 0);
     let (kc, ks, ki) = rope_flat_const(p, KV_HEADS, 0);
@@ -3778,7 +3930,7 @@ pub fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e
         let sq = if attn_manual {
             // 头主序桥 + GQA 手工链（k/v 单头 TileD 广播；kr3/v3 rank-3 直用）
             let q3 = s.headsplit(&format!("{}qh", tag), &qr2, gd(p), 1, gd(p), HEADS, HD, "shp_mq4", "shp_mq3");
-            let attn = s.attn_manual_gqa(&format!("{}attn", tag), &q3, &kr3, &v3, HEADS, gd(p), gd(p), HD);
+            let attn = s.attn_manual_gqa(&format!("{}attn", tag), &q3, &kr3, &v3, HEADS, gd(p), gd(p), HD, attn_mask_n.as_deref());
             s.headmerge(&format!("{}am", tag), &attn, 1, gd(p), HEADS, HD, "shp_ma4", "shp_mflat")
         } else {
             let pfa = s.pfa(&format!("{}pfa", tag), &qr3, &kr3, &v3, &[1, gd(p), QD], &[1, gd(p), KVD], HEADS, KV_HEADS, HD);
@@ -4001,6 +4153,7 @@ pub fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e
             if pool_root.is_some() {
                 println!("[prefix-pool] serve 池模式：per-L 静态 OM 换柄（lazy，cap 8）");
             }
+            let mask_bind = s.try_bind_of("padmask");
             st.pmech = Some(PrefixMech {
                 s,
                 routs,
@@ -4017,6 +4170,7 @@ pub fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e
                 pool_lru: Vec::new(),
                 pool_cap: 8,
                 rout_bytes,
+                mask_bind,
             });
         }
         return;
@@ -4498,6 +4652,15 @@ pub fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e
     let mut xstream = ain;
 
     let total = p + HOR;
+    // GEB_ATTN_MASK（range padding）：flow 侧 mask [1,1,total]——键布局 =
+    // cache 行在前（真 [0,vis+L) / pad [vis+L, vis+P)）+ flow HOR 行恒真。
+    // bake 占位全 0，serve 侧按真 L 填充
+    let fmask_n: Option<String> = if envi("GEB_ATTN_MASK", 0) == 1 {
+        let mh = vec![f16::from_f32(0.0); total as usize];
+        Some(s.data(ctx, "padmask", &[1, 1, total], &mh))
+    } else {
+        None
+    };
     for i in 0..depth {
         let tag = format!("l{i}_");
         // attention（normed 已是本层 ada-norm 输出；q1/r1 验证链）
@@ -4571,7 +4734,7 @@ pub fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e
         let sq = if attn_manual {
             // 手工 cross-GQA：q 头主序化（headsplit），k/v 已是 rank-3 单头
             let q3 = s.headsplit(&format!("{}qh", tag), &qr2, HOR, 1, HOR, HEADS, HD, "shp_fq4", "shp_fq3");
-            let attn = s.attn_manual_gqa(&format!("{}attn", tag), &q3, &kall3, &vall3, HEADS, HOR, gd(total), HD);
+            let attn = s.attn_manual_gqa(&format!("{}attn", tag), &q3, &kall3, &vall3, HEADS, HOR, gd(total), HD, fmask_n.as_deref());
             s.headmerge(&format!("{}am", tag), &attn, 1, HOR, HEADS, HD, "shp_fa4", "shp_fbq")
         } else {
             let pfa = s.pfa(&format!("{}pfa", tag), &qr3, &kall3, &vall3, &[1, HOR, QD], &[1, total, KVD], HEADS, KV_HEADS, HD);
@@ -5013,6 +5176,7 @@ pub fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e
                 .as_ref()
                 .map(|g| g.iter().enumerate().map(|(i, &l)| (l, i)).collect())
                 .unwrap_or_default();
+            let fmask_bind = s.try_bind_of("padmask");
             st.fmech = Some(FlowMech {
                 s,
                 ob,
@@ -5029,6 +5193,8 @@ pub fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e
                 rope_binds,
                 last_l: -1,
                 flows: flow_pool,
+                mask_bind: fmask_bind,
+                mask_last: -1,
             });
         }
         return;
@@ -7030,7 +7196,7 @@ pub fn optest(be: &AscendBackend, which: &str, real: Option<&Pi05Weights>) {
                     (proj, s.add2("res", &projb, "x0", &[p, PW]))
                 } else {
                     let q3 = s.headsplit("qh", &qr2, p, 1, p, HEADS, HD, "shp_mq4", "shp_mq3");
-                    let attn = s.attn_manual_gqa("attn", &q3, &kr3, &v3, HEADS, p, p, HD);
+                    let attn = s.attn_manual_gqa("attn", &q3, &kr3, &v3, HEADS, p, p, HD, None);
                     let sq = s.headmerge("am", &attn, 1, p, HEADS, HD, "shp_ma4", "shp_mflat");
                     let proj = s.mm("proj", &sq, &[p, QD], "outwt", &[PW, QD], &[p, PW]);
                     let projb = s.bias("projb", &proj, &[p, PW], "outb");
