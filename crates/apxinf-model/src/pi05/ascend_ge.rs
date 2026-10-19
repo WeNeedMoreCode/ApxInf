@@ -834,10 +834,8 @@ impl Seg {
         cols: i64,
         row: &[f16],
     ) -> String {
-        // GEB_ABL_BIAS=1（结构消融 V1，2026-10-16）：静态模式下也走 gear 式
-        // 注册（重复行/rows==1 折叠不注册）——隔离 dyn OM 的 bias 注册差异
-        //（int8 路径 90 个 [1,cols] 行悬空不消费，预期数值零差异）
-        if (gear_mode() || envi("GEB_ABL_BIAS", 0) == 1) && envi("GEB_BIAS_REG", 0) == 0 {
+        // gear 模式：行重复注册为同形 [-1,cols]（rows==1 且未消费则折叠不注册）
+        if gear_mode() {
             if rows > 1 {
                 let mut rep = Vec::with_capacity((rows * cols) as usize);
                 for _ in 0..rows {
@@ -855,7 +853,7 @@ impl Seg {
 
     fn bias(&mut self, name: &str, x: &str, x_dims: &[i64], row: &str) -> String {
         let ba = format!("{name}_ba");
-        if gear_mode() || envi("GEB_ABL_BIAS", 0) == 1 {
+        if gear_mode() {
             // 行已重复注册为同形 [-1,cols]——直接 Add（无 TileD）
             self.g.add_op(&ba, "Add").unwrap();
             self.g.set_input_desc(&ba, "x1", x_dims, Dtype::Fp16).unwrap();
@@ -1986,15 +1984,6 @@ impl PrefixMech {
         }
         let mut x0 = vision_out[..self.vis_rows].to_vec();
         x0.extend_from_slice(&self.tok_cache_rows);
-        if envi("GEB_STYLES_DBG", 0) == 1 {
-            let cs = |v: &[f16]| -> u64 { v.iter().map(|x| x.to_bits() as u64).sum() };
-            println!(
-                "[dbg] x0 cs_vis={:016x} cs_tok={:016x} len={}",
-                cs(&vision_out[..self.vis_rows]),
-                cs(&self.tok_cache_rows),
-                x0.len()
-            );
-        }
         let t1 = std::time::Instant::now();
         // gear 模式 binds[0] = p_max 物化（x0 实际 p 行 ≤ max——sized h2d）
         assert!(x0.len() * 2 <= self.s.binds[0].len(), "serve x0 尺寸超 max 档");
@@ -2538,21 +2527,9 @@ pub fn e2e_run(ctx: &AscendContext, stream: &AscendStream, s: &mut Seg, seg: &st
         println!("[gear] {seg} OM 档数 {n}（bring-up 用末档执行）");
     }
     let n_out = s.g.num_outputs().unwrap();
-    // GEB_OUT_PAD=<bytes>：输出 buffer 之间插 dummy 占位（不改变输出自身
-    // 大小——d2h 长度断言不受影响）。若 k/v 读回变干净 ⇒ 相邻算子越界写
-    // 踩用户输出 buffer 实锤（OOB 取证用）
-    let pad = envi("GEB_OUT_PAD", 0) as usize;
-    let mut pads: Vec<DeviceBuffer> = Vec::new();
     let outs: Vec<DeviceBuffer> = (0..n_out)
-        .map(|i| {
-            let b = ctx.malloc(s.g.output_size(i).unwrap().max(16)).expect("out malloc");
-            if pad > 0 {
-                pads.push(ctx.malloc(pad).expect("pad malloc"));
-            }
-            b
-        })
+        .map(|i| ctx.malloc(s.g.output_size(i).unwrap().max(16)).expect("out malloc"))
         .collect();
-    let _ = &pads; // 占位 buffer 活到 download 之后
     let refs: Vec<&DeviceBuffer> = outs.iter().collect();
     s.run_seg(gi, &refs, stream).expect("ge run");
     drop(stream.synchronize());
@@ -3357,18 +3334,6 @@ fn reg_i8(
         // 「Const 撞 legacy 墙 rc=-7」实为 dynamicDims 选项串 bug 的误判
         // （fix11 前选项被 payload 静态尾维污染，与 Const 无关）
         if !s.gear_ps.is_empty() {
-            if envi("GEB_SM_DYN", 0) == 1 {
-                let n = s.data(ctx, &format!("{dump_tag}sm"), &[-1], &smf);
-                s.set_gear_fix(&n, k);
-                n
-            } else {
-                s.const_f16(&format!("{dump_tag}sm"), &[k], &smf)
-            }
-        } else if envi("GEB_ABL_SMCONST", 0) == 1 && key.starts_with("prefix/") {
-            // GEB_ABL_SMCONST=1（结构消融 V4，2026-10-16）：静态模式 smooth
-            // 烤 Const——隔离 dyn OM 的 smooth 注册差异（gear 缺省 Const vs
-            // 静态 Data[k]，18 层×7 投影=126 个被 qmd 消费的输入；Const 或
-            // 触发编译期折叠改变 int8 累加次序——13.1% 互差候选元凶）
             s.const_f16(&format!("{dump_tag}sm"), &[k], &smf)
         } else {
             s.data(ctx, &format!("{dump_tag}sm"), &[k], &smf)
@@ -3376,13 +3341,7 @@ fn reg_i8(
     } else {
         let invf: Vec<f16> = f.inv.iter().map(|&v| f16::from_f32(v)).collect();
         if !s.gear_ps.is_empty() {
-            if envi("GEB_SM_DYN", 0) == 1 {
-                let n = s.data(ctx, &format!("{dump_tag}inv"), &[-1, k], &invf);
-                s.set_gear_fix(&n, k);
-                n
-            } else {
-                s.const_f16(&format!("{dump_tag}inv"), &[1, k], &invf)
-            }
+            s.const_f16(&format!("{dump_tag}inv"), &[1, k], &invf)
         } else {
             s.data(ctx, &format!("{dump_tag}inv"), &[1, k], &invf)
         }
@@ -3666,9 +3625,7 @@ pub fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e
     // swap 索引：静态 Const 折叠；gear 模式转 Data[-1]（Const 全档共享而
     // 长度随档变；Data 逐档特化 desc，内容 r^1 逐行 p 无关——spike v2 P2）
     let ropeflat = std::env::var("GEB_ROPEFLAT").is_ok();
-    // GEB_ABL_ROPE=1（结构消融 V2，2026-10-16）：静态模式下 swap 索引也走
-    // Data 注册——隔离 dyn OM 的 rope·qswap Data 化差异（静态缺省 Const 折叠）
-    if gear_ll.is_some() || envi("GEB_ABL_ROPE", 0) == 1 {
+    if gear_ll.is_some() {
         s.data_i32(ctx, "qswap_c", &[gd(qf.0)], &qi);
         s.set_gear_mul("qswap_c", HEADS * 2);
         s.data_i32(ctx, "kswap_c", &[gd(kf.0)], &ki);
@@ -3752,15 +3709,10 @@ pub fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e
                 &[],
             )
         };
-        // gear 模式：Const 化（GEB_G_DYN=1 定值动态——同 sm 注记的 128 维
-        // 上限问题，缺省 Const）
+        // gear 模式：Const 化（定值动态维会撑爆 SetDims payload 的 128 维
+        // 上限——同 smooth 注册注记）
         if !s.gear_ps.is_empty() {
-            if envi("GEB_G_DYN", 0) == 1 {
-                let n = s.data(ctx, &format!("{}g1", tag), &[-1], &g1_h);
-                s.set_gear_fix(&n, PW);
-            } else {
-                s.const_f16(&format!("{}g1", tag), &[PW], &g1_h);
-            }
+            s.const_f16(&format!("{}g1", tag), &[PW], &g1_h);
         } else {
             s.data(ctx, &format!("{}g1", tag), &[PW], &g1_h);
         }
@@ -3865,12 +3817,7 @@ pub fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e
             )
         };
         if !s.gear_ps.is_empty() {
-            if envi("GEB_G_DYN", 0) == 1 {
-                let n = s.data(ctx, &format!("{}g2", tag), &[-1], &g2_h);
-                s.set_gear_fix(&n, PW);
-            } else {
-                s.const_f16(&format!("{}g2", tag), &[PW], &g2_h);
-            }
+            s.const_f16(&format!("{}g2", tag), &[PW], &g2_h);
         } else {
             s.data(ctx, &format!("{}g2", tag), &[PW], &g2_h);
         }
@@ -4386,43 +4333,16 @@ pub fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e
     s.data(ctx, "ainb", &[1, AW], &ainb_h);
     // prefix k/v（rank-2——ConcatD axis=0 拼接后统一 Unsqueeze）；
     // e2e：prefix OM 36 输出直连（k0,v0,k1,v1,... → pk{i}=kv[2i]/pv{i}=kv[2i+1]）
-    // GEB_E2E_PK_GOLD=1：pk/pv 改喂 golden kvk_l{i}/kvv_l{i}（step0 残差
-    // bisect——检验 prefix 主路 k/v 残差喂 cross-attn 的贡献）
-    let pk_gold = envi("GEB_E2E_PK_GOLD", 0) == 1;
-    if pk_gold {
-        println!("[e2e] PK_GOLD: pk/pv 替入 golden kvk/kvv（bisect）");
-    }
-    let gold_key_f16 = |st: &E2eStage, k: &str| -> Vec<f16> {
-        let v = st
-            .golden_mid
-            .iter()
-            .find(|(gk, _)| gk == k)
-            .map(|(_, v)| v.clone())
-            .unwrap_or_else(|| panic!("GEB_E2E_PK_GOLD 需要 golden 键 {k}"));
-        v.into_iter().map(f16::from_f32).collect()
-    };
     // pk/pv 注册基址（replay 逐帧换绑用——循环体恰好两次 s.data）
     let pk_base = s.binds.len();
     for i in 0..depth {
         let pk_h = e2e
             .as_ref()
-            .map(|st| {
-                if pk_gold {
-                    gold_key_f16(st, &format!("kvk_l{i}"))
-                } else {
-                    st.kv[2 * i].clone()
-                }
-            })
+            .map(|st| st.kv[2 * i].clone())
             .unwrap_or_else(|| rand_f16((p * KVD) as usize, &mut seed, 100.0));
         let pv_h = e2e
             .as_ref()
-            .map(|st| {
-                if pk_gold {
-                    gold_key_f16(st, &format!("kvv_l{i}"))
-                } else {
-                    st.kv[2 * i + 1].clone()
-                }
-            })
+            .map(|st| st.kv[2 * i + 1].clone())
             .unwrap_or_else(|| rand_f16((p * KVD) as usize, &mut seed, 100.0));
         s.data(ctx, &format!("pk{i}"), &[gd(p), KVD], &pk_h);
         s.data(ctx, &format!("pv{i}"), &[gd(p), KVD], &pv_h);
@@ -4965,9 +4885,8 @@ pub fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e
                     cfg.time_max_period,
                 );
                 let cond = e2e_conditioning(rw, &te);
-                // styles bisect：golden cond_s{step}（frame0_v3b）存在时打印 host
-                // f32 cond 与 golden 的差；GEB_E2E_STYLE_GOLD=1 则替入 golden cond
-                // （styles 仍由 host 投影重算——分离 {te+mlp 链} 与 {style 投影}）
+                // golden cond_s{step}（frame0_v3b）存在时打印 host f32 cond 与
+                // golden 的差（styles 对拍诊断）
                 let gold_cond = {
                     let key = format!("cond_s{step}");
                     st.golden_mid
@@ -4983,11 +4902,6 @@ pub fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e
                     }
                     println!("[e2e] step {step} cond host-vs-golden max_diff={md:.6}");
                 }
-                let cond: Vec<f32> = if envi("GEB_E2E_STYLE_GOLD", 0) == 1 {
-                    gold_cond.expect("GEB_E2E_STYLE_GOLD 需要 golden cond_s{step} 键（frame0_v3b）")
-                } else {
-                    cond
-                };
                 let mut v: Vec<Vec<f16>> = Vec::with_capacity(depth * 6 + 2);
                 for i in 0..depth {
                     let lay = &rw.action_layers[i];
@@ -5001,13 +4915,6 @@ pub fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e
                     v.push(m_gt);
                 }
                 let (f_scl, f_sh, _) = e2e_style_pair(&rw.action_final_norm.style, &cond, AW as usize);
-                if envi("GEB_STYLES_DBG", 0) == 1 && step < 4 {
-                    println!(
-                        "[dbg] step {step} cond[0..4]={:?} L0a_scl[0..3]={:?}",
-                        &cond[..4],
-                        &v[0].iter().take(3).map(|x| x.to_f32()).collect::<Vec<_>>()
-                    );
-                }
                 v.push(f_scl);
                 v.push(f_sh);
                 v
@@ -5018,12 +4925,6 @@ pub fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e
             cfg.num_flow_steps,
             tpre.elapsed()
         );
-        if envi("GEB_STYLES_DBG", 0) == 1 {
-            let cs = |v: &Vec<Vec<Vec<f16>>>| -> u64 {
-                v.iter().flatten().flatten().map(|x| x.to_bits() as u64).sum()
-            };
-            println!("[dbg] styles_cache cs={:016x}", cs(&style_cache));
-        }
         let t0 = std::time::Instant::now();
         for step in 0..cfg.num_flow_steps {
             let sc = &style_cache[step];
@@ -6671,83 +6572,6 @@ pub fn optest(be: &AscendBackend, which: &str, real: Option<&Pi05Weights>) {
             );
             ge_builder::fini().expect("fini");
             println!("GE_ARM32_PROBE_OK");
-            return;
-        }
-        // n32c：NORM32 组合链逐级编译二分（N32C=1 Cast / 2 +Mul / 3
-        // +ReduceSumD / 4 +Sqrt / 5 +RealDiv / 6 全链对拍 host 参考）——
-        // rc=-7 定位用（AfterInfershape 后失败，算子/kernel 逐个定罪）
-        "n32c" => {
-            let (m, w) = (576i64, 2048i64);
-            let lvl = envi("N32C", 6);
-            let mut seed = 0xC0FEu32;
-            let host: Vec<f16> = rand_f16((m * w) as usize, &mut seed, 3.0);
-            let stream = be.stream();
-            let mut s = Seg::new("n32c");
-            s.data(ctx, "x", &[m, w], &host);
-            s.data_f32(ctx, "one", &[1], &[1.0f32]);
-            s.data_f32(ctx, "wv", &[1], &[w as f32]);
-            let xf = s.cast_node("xf", "x", &[m, w], true);
-            let mut cur = xf.clone();
-            if lvl >= 2 {
-                cur = s.mul2_f32("sq", &xf, &xf, &[m, w]);
-            }
-            if lvl >= 3 {
-                // 变体矩阵（N32CV）：1=ReduceSumD/axis 2=ReduceSumD/axes
-                // 3=ReduceSum/axes 4=ReduceSumD/axis+keep_dims
-                let v = envi("N32CV", 1);
-                let (opn, attrn): (&str, &str) = match v {
-                    2 => ("ReduceSumD", "axes"),
-                    3 => ("ReduceSum", "axes"),
-                    4 => ("ReduceSumD", "axis"),
-                    _ => ("ReduceSumD", "axis"),
-                };
-                s.g.add_op("rs", opn).unwrap();
-                s.g.set_input_desc("rs", "x", &[m, w], Dtype::Fp32).unwrap();
-                s.g.set_output_desc("rs", "y", &[m, 1], Dtype::Fp32).unwrap();
-                s.g.set_attr_int_list("rs", attrn, &[-1]).unwrap();
-                if v == 4 {
-                    s.g.set_attr_bool("rs", "keep_dims", true).unwrap();
-                }
-                s.wire("rs", "x", &cur);
-                cur = s.reg_out("rs", "y");
-            }
-            if lvl >= 4 {
-                s.g.add_op("rt", "Sqrt").unwrap();
-                s.g.set_input_desc("rt", "x", &[m, 1], Dtype::Fp32).unwrap();
-                s.g.set_output_desc("rt", "y", &[m, 1], Dtype::Fp32).unwrap();
-                s.wire("rt", "x", &cur);
-                cur = s.reg_out("rt", "y");
-            }
-            if lvl >= 5 {
-                cur = s.rdiv1("iv", &cur, "one", m);
-            }
-            if lvl >= 6 {
-                // TileD f32：[m,1] → [m,w]
-                s.g.add_op("it", "TileD").unwrap();
-                s.g.set_input_desc("it", "x", &[m, 1], Dtype::Fp32).unwrap();
-                s.g.set_output_desc("it", "y", &[m, w], Dtype::Fp32).unwrap();
-                s.g.set_attr_int_list("it", "multiples", &[1, w]).unwrap();
-                s.g.link("it", "x", &cur).unwrap();
-                let invt = s.reg_out("it", "y");
-                cur = s.mul2_f32("fin", &invt, &invt, &[m, w]);
-            }
-            if lvl >= 7 {
-                // RealDiv 广播 [m,w] ÷ [m,1]（rms32 生产路径用）
-                s.g.add_op("bd", "RealDiv").unwrap();
-                s.g.set_input_desc("bd", "x1", &[m, w], Dtype::Fp32).unwrap();
-                s.g.set_input_desc("bd", "x2", &[m, 1], Dtype::Fp32).unwrap();
-                s.g.set_output_desc("bd", "y", &[m, w], Dtype::Fp32).unwrap();
-                s.wire("bd", "x1", "xf");
-                s.wire("bd", "x2", "iv");
-                cur = s.reg_out("bd", "y");
-                let _ = cur.clone();
-            }
-            let outdims: Vec<i64> = if lvl <= 2 { vec![m, w] } else { vec![m, 1] };
-            let y = s.cast_node("y", &cur, &outdims, false);
-            s.finish(&[&y]);
-            println!("n32c lvl={lvl} 图构造完成，编译中");
-            ge_builder::fini().expect("fini");
-            println!("GE_N32C_COMPILE_OK lvl={lvl}");
             return;
         }
         // n32v：NORM32 生产链数值验证（须配 GEB_NORM32=1）——rms32 的
