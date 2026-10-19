@@ -354,6 +354,30 @@ impl GeGraph {
         Ok(())
     }
 
+    /// 动态输出端口分配（SplitD 同名 y×N——先分配再设 desc；CATGU mode2）
+    pub fn dyn_outputs(&self, op: &str, base: &str, n: i32) -> Result<()> {
+        type F = unsafe extern "C" fn(
+            *const std::os::raw::c_char,
+            *const std::os::raw::c_char,
+            i32,
+        ) -> i32;
+        let l = lib().map_err(|e| {
+            eprintln!("[ge_builder] {e}");
+            AclError { code: -1, op: "ge load" }
+        })?;
+        let f: Symbol<F> = unsafe { l.get(b"geb_dyn_outputs") }.map_err(|e| {
+            eprintln!("[ge_builder] dlsym geb_dyn_outputs: {e}");
+            AclError { code: -1, op: "ge dlsym" }
+        })?;
+        let o = CString::new(op).expect("op");
+        let b = CString::new(base).expect("base");
+        let rc = unsafe { f(o.as_ptr(), b.as_ptr(), n) };
+        if rc != 0 {
+            return Err(cerr("geb_dyn_outputs", rc));
+        }
+        Ok(())
+    }
+
     /// 动态输入端口数探测（诊断用）
     pub fn dyn_probe(&self, op: &str, base: &str) -> Result<i32> {
         type F = unsafe extern "C" fn(*const std::os::raw::c_char, *const std::os::raw::c_char) -> i32;
@@ -432,6 +456,35 @@ impl GeGraph {
 
     pub fn set_output_desc(&self, op: &str, port: &str, dims: &[i64], dtype: Dtype) -> Result<()> {
         self.set_desc(b"geb_set_output_desc", "geb_set_output_desc", op, port, dims, dtype)
+    }
+
+    /// 动态多输出算子的按位输出 desc（SplitD 同名 "y"×N 端口——走 C++
+    /// UpdateDynamicOutputDesc(name, index)；CATGU 抢救实验 2026-10-19）
+    pub fn set_output_desc_idx(&self, op: &str, port: &str, out_idx: i32, dims: &[i64], dtype: Dtype) -> Result<()> {
+        type F = unsafe extern "C" fn(
+            *const std::os::raw::c_char,
+            *const std::os::raw::c_char,
+            i32,
+            *const i64,
+            i32,
+            *const std::os::raw::c_char,
+        ) -> i32;
+        let l = lib().map_err(|e| {
+            eprintln!("[ge_builder] {e}");
+            AclError { code: -1, op: "ge load" }
+        })?;
+        let f: Symbol<F> = unsafe { l.get(b"geb_set_output_desc_idx") }.map_err(|e| {
+            eprintln!("[ge_builder] dlsym geb_set_output_desc_idx: {e}");
+            AclError { code: -1, op: "ge dlsym" }
+        })?;
+        let n = CString::new(op).expect("op");
+        let p = CString::new(port).expect("port");
+        let dt = dtype.as_c();
+        let rc = unsafe { f(n.as_ptr(), p.as_ptr(), out_idx, dims.as_ptr(), dims.len() as i32, dt.as_ptr()) };
+        if rc != 0 {
+            return Err(cerr("geb_set_output_desc_idx", rc));
+        }
+        Ok(())
     }
 
     /// 消费算子输入 desc（format 可指定，ND/FRACTAL_NZ）——NZ 权重直入

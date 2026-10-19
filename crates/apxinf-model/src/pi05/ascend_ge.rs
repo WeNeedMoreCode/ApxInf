@@ -4172,7 +4172,7 @@ pub fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e
                 (0..n_out).map(|i| s.g.output_size(i).unwrap()).collect();
             let pool_root = std::env::var("GEB_PREFIX_POOL").ok();
             if pool_root.is_some() {
-                println!("[prefix-pool] serve 池模式：per-L 静态 OM 换柄（lazy，cap 8）");
+                println!("[prefix-pool] serve 池模式：per-L 静态 OM 换柄（lazy，cap {}）", envi("GEB_POOL_CAP", 8));
             }
             let mask_bind = s.try_bind_of("padmask");
             st.pmech = Some(PrefixMech {
@@ -4189,7 +4189,9 @@ pub fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e
                 pool_root,
                 pool_graphs: std::collections::HashMap::new(),
                 pool_lru: Vec::new(),
-                pool_cap: 8,
+                // GEB_POOL_CAP（2026-10-19）：grid8 九桶全谱系连跑时 8<9 会
+                // LRU 驱逐重装（2.7s/次）——range supervisor 置 9
+                pool_cap: envi("GEB_POOL_CAP", 8) as usize,
                 rout_bytes,
                 mask_bind,
             });
@@ -4454,6 +4456,17 @@ pub fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e
     let int8_native = envi("GEB_INT8_NATIVE", 1) == 1;
     let dump_dir = std::env::var("GEB_INT8_DUMP").ok();
     let fi8sel = |pr: &str| int8 && int8_projs.contains(pr);
+    // GEB_FI8_CATGU=1（qmd 量化流水省流，2026-10-19）：gate/up 共享 mnorm
+    // 输入 → 权重沿 n 拼接（行序 [gate;up]）一发 qmd，每层每步省一条
+    // in-op 逐 token 量化流水（gud 子集 540→360 op/replan）。smooth 冲突
+    // （两矩阵 s_eff 不同）解法 = 公共因子 s_f = 逐列 max(s_gate,s_up)，
+    // 双矩阵按 s_f 重量化——数值代价注册时 print（rel err fused vs
+    // 各自最优），golden/行为面另行验收。x_scale 静态化三路全死
+    // （attr 忽略/编译拒/上游无 per-token 内核）后的量化侧最后杠杆。
+    let catgu = envi("GEB_FI8_CATGU", 0) >= 1 && fi8sel("gate") && fi8sel("up");
+    if catgu && !int8_native {
+        panic!("GEB_FI8_CATGU 需 GEB_INT8_NATIVE=1（native smooth 直入算子）");
+    }
     // (名, k, n)：k/v 的 n=256 与 down 的 k=4096 是小/宽 shape——qmd 在
     // M=50 的编译/性能未验，GEB_INT8_PROJS 子集可退
     const FPROJS: [(&str, i64, i64); 7] = [
@@ -4472,7 +4485,8 @@ pub fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e
                 .and_then(|w| w.action_layers.get(i))
                 .unwrap_or_else(|| panic!("GEB_FLOW_INT8 需真权重（层 {i} 缺）"));
             for (slot, &(pn, kk, nn)) in FPROJS.iter().enumerate() {
-                if !fi8sel(pn) {
+                if !fi8sel(pn) || (catgu && (pn == "gate" || pn == "up")) {
+                    // gate/up 在 catgu 下走 fused 注册（块级处理，见下）
                     continue;
                 }
                 let w32: Vec<f32> = match pn {
@@ -4497,6 +4511,84 @@ pub fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e
                     &mut s, ctx, &facs, &format!("flow/L{i:02}/{pn}"), &format!("F{i:02}_{pn}"),
                     &w32, kk, nn, int8_native, dump_dir.as_deref(),
                 ));
+            }
+            // catgu fused 注册：[gate;up] 行拼接 wq/scale + 公共 smooth。
+            // 仅 WCONST 路径（Data 模式合并会少两个 bind 槽，层内 18 槽
+            // 布局漂移——serve style 硬编码偏移依赖布局，见预注册注记）
+            if catgu {
+                let fg = facs.get(&format!("flow/L{i:02}/gate")).expect("int8 smooth 缺 flow gate");
+                let fu = facs.get(&format!("flow/L{i:02}/up")).expect("int8 smooth 缺 flow up");
+                assert_eq!(fg.s_eff.len(), AW as usize);
+                assert_eq!(fu.s_eff.len(), AW as usize);
+                let sf: Vec<f32> = (0..AW as usize).map(|j| fg.s_eff[j].max(fu.s_eff[j])).collect();
+                let wg: Vec<f32> = lay.mlp.gate.weight.to_f32_vec().unwrap();
+                let wu: Vec<f32> = lay.mlp.up.weight.to_f32_vec().unwrap();
+                // 重量化代价 print：fused(s_f) vs 各自最优(s_own) 的 dequant
+                // Frobenius rel err——smooth 融合的数值账，golden 前第一道闸
+                let relerr = |w: &[f32], wq: &[i8], sc: &[f32], s: &[f32]| -> f32 {
+                    // w 是 loader 原生 [k,n] 布局（quant_w8 内做转置）——参考值
+                    // 按 (c,r) 取，dequant ŵ = wq[r,c]·sc[r]/s[c]
+                    let (k, n) = (s.len(), w.len() / s.len());
+                    let (mut num, mut den) = (0f64, 0f64);
+                    for r in 0..n {
+                        for c in 0..k {
+                            let what = wq[r * k + c] as f32 * sc[r] / s[c];
+                            let d = (what - w[c * n + r]) as f64;
+                            num += d * d;
+                            den += (w[c * n + r] as f64).powi(2);
+                        }
+                    }
+                    (num / den).sqrt() as f32
+                };
+                let (wq_g, sc_g) = quant_w8(&wg, AW as usize, &sf);
+                let (wq_u, sc_u) = quant_w8(&wu, AW as usize, &sf);
+                let (bq_g, bsc_g) = quant_w8(&wg, AW as usize, &fg.s_eff);
+                let (bq_u, bsc_u) = quant_w8(&wu, AW as usize, &fu.s_eff);
+                if i == 0 {
+                    // sf=逐列 max ⇒ 偏离比恒 ≥1，只报上界（两矩阵各列占优
+                    // 不同——上界 = 吃亏深的那列的放大倍数）
+                    let mut rmax = 0f32;
+                    for j in 0..AW as usize {
+                        rmax = rmax
+                            .max(sf[j] / fg.s_eff[j])
+                            .max(sf[j] / fu.s_eff[j]);
+                    }
+                    println!(
+                        "[int8] catgu L00 公共因子偏离上界 s_f/s_own ≤ {rmax:.3}；rel err gate {:.4}%→{:.4}% / up {:.4}%→{:.4}%",
+                        relerr(&wg, &bq_g, &bsc_g, &fg.s_eff) * 100.0,
+                        relerr(&wg, &wq_g, &sc_g, &sf) * 100.0,
+                        relerr(&wu, &bq_u, &bsc_u, &fu.s_eff) * 100.0,
+                        relerr(&wu, &wq_u, &sc_u, &sf) * 100.0,
+                    );
+                }
+                let mut wqb: Vec<u8> = wq_g.iter().map(|&v| v as u8).collect();
+                let mut wq_u_b: Vec<u8> = wq_u.iter().map(|&v| v as u8).collect();
+                wqb.append(&mut wq_u_b);
+                let mut scb: Vec<u8> = sc_g.iter().flat_map(|v| v.to_le_bytes()).collect();
+                let mut sc_u_b: Vec<u8> = sc_u.iter().flat_map(|v| v.to_le_bytes()).collect();
+                scb.append(&mut sc_u_b);
+                if let Some(dir) = dump_dir.as_deref() {
+                    let _ = std::fs::create_dir_all(dir);
+                    std::fs::write(format!("{dir}/F{i:02}_gu.wq"), &wqb).expect("dump gu wq");
+                    std::fs::write(format!("{dir}/F{i:02}_gu.scale"), &scb).expect("dump gu scale");
+                }
+                let wconst8 = envi("GEB_INT8_WCONST", envi("GEB_WCONST", 0)) == 1;
+                assert!(wconst8, "GEB_FI8_CATGU 目前仅支持 WCONST 路径（Data 模式 binds 布局会漂）");
+                s.g.add_const_raw(&format!("F{i:02}_guwq"), &[2 * AINTER, AW], Dtype::Int8, &wqb).unwrap();
+                s.g.add_const_raw(&format!("F{i:02}_guws"), &[2 * AINTER], Dtype::Fp32, &scb).unwrap();
+                s.datas.insert(format!("F{i:02}_guwq"));
+                s.datas.insert(format!("F{i:02}_guws"));
+                // smooth 输入 = 1/s_f（乘法约定，同 reg_i8 native 分支的
+                // gear/静态注册二态）
+                let smf: Vec<f16> = sf.iter().map(|&v| f16::from_f32(1.0 / v)).collect();
+                let sm_n = if !s.gear_ps.is_empty() {
+                    s.const_f16(&format!("F{i:02}_gusm"), &[AW], &smf)
+                } else {
+                    s.data(ctx, &format!("F{i:02}_gusm"), &[AW], &smf)
+                };
+                fi8[i][4] = Some((format!("F{i:02}_guwq"), format!("F{i:02}_guws"), sm_n));
+                // [5] 同名标记：保层内 18 槽布局（is_some → 16B dummy bind）
+                fi8[i][5] = fi8[i][4].clone();
             }
         }
         println!("[int8] flow int8 预注册完成：{} 层 × {} 投影（native={}）", depth, fi8[0].iter().filter(|x| x.is_some()).count(), int8_native);
@@ -4788,10 +4880,61 @@ pub fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e
 
         // mlp
         let mnorm = s.ada(&format!("{}mn", tag), &res, "zeros", &format!("{}mscl", tag), &format!("{}msh", tag), &[HOR, AW]);
-        let gate = mm_or_qmd(&mut s, &format!("{}gate", tag), &mnorm, &[HOR, AW], fi8[i][4].as_ref(), &format!("{}gatewt", tag), AINTER, &[HOR, AINTER], int8_native);
-        let up = mm_or_qmd(&mut s, &format!("{}up", tag), &mnorm, &[HOR, AW], fi8[i][5].as_ref(), &format!("{}upwt", tag), AINTER, &[HOR, AINTER], int8_native);
-        let gact = s.gelu(&format!("{}gact", tag), &gate, &[HOR, AINTER], true);
-        let act = s.mul2(&format!("{}act", tag), &gact, &up, &[HOR, AINTER]);
+        // mlp：catgu 各分支直出 act（gelu(gate)⊙up），down 统一消费
+        let act = if catgu && fi8[i][4].is_some() {
+            // GEB_FI8_CATGU：[gate;up] 行序拼接权重一发 qmd → 列半切两半
+            //（每层每步省一条 in-op 逐 token 量化流水）。mode 1 = SliceD
+            //（2026-10-19 实测判死：消费者触发运行时视图物化，~1.78ms/次
+            // × 2/层步 = flow 7.8× 劣化——vision QKV3 时代同款机制复现）；
+            // mode 2 = SplitD 动态双输出（真算子候选，抢救实验）
+            let (wn, sn, mn) = fi8[i][4].as_ref().unwrap();
+            let y = s.qmd(
+                &format!("{}gu", tag), &mnorm, &[HOR, AW], wn, &[2 * AINTER, AW],
+                sn, Some(mn), None, 2 * AINTER, &[HOR, 2 * AINTER],
+            );
+            if envi("GEB_FI8_CATGU", 0) == 2 {
+                let sp = format!("{}gus", tag);
+                s.g.add_op(&sp, "SplitD").unwrap();
+                // 动态输出先分配（CreateOperator 不预建 y×N 端口——不分配
+                // 则 UpdateDynamicOutputDesc 拒绝，2026-10-19 实证）
+                s.g.dyn_outputs(&sp, "y", 2).unwrap();
+                s.g.set_input_desc(&sp, "x", &[HOR, 2 * AINTER], Dtype::Fp16).unwrap();
+                s.g.set_output_desc_idx(&sp, "y", 0, &[HOR, AINTER], Dtype::Fp16).unwrap();
+                s.g.set_output_desc_idx(&sp, "y", 1, &[HOR, AINTER], Dtype::Fp16).unwrap();
+                s.g.set_attr_int(&sp, "split_dim", 1).unwrap();
+                s.g.set_attr_int(&sp, "num_split", 2).unwrap();
+                s.wire(&sp, "x", &y);
+                // gelu(gate 半) ← SplitD out0；act = gelu ⊙ up 半(out1)。
+                // 动态输出按名不可达：gelu 输入走 link_idx(0)，mul x2 走
+                // link_idx(1)（x1 按名接 gelu）
+                let ga = format!("{}gact", tag);
+                s.g.add_op(&ga, "GeluV2").unwrap();
+                s.g.set_input_desc(&ga, "x", &[HOR, AINTER], Dtype::Fp16).unwrap();
+                s.g.set_output_desc(&ga, "y", &[HOR, AINTER], Dtype::Fp16).unwrap();
+                s.g.set_attr_str(&ga, "approximate", "tanh").unwrap();
+                s.g.link_idx(&ga, 0, &sp, 0).unwrap();
+                s.outports.insert(ga.clone(), "y");
+                let ac = format!("{}act", tag);
+                s.g.add_op(&ac, "Mul").unwrap();
+                s.g.set_input_desc(&ac, "x1", &[HOR, AINTER], Dtype::Fp16).unwrap();
+                s.g.set_input_desc(&ac, "x2", &[HOR, AINTER], Dtype::Fp16).unwrap();
+                s.g.set_output_desc(&ac, "y", &[HOR, AINTER], Dtype::Fp16).unwrap();
+                s.wire(&ac, "x1", &ga);
+                s.g.link_idx(&ac, 1, &sp, 1).unwrap();
+                s.outports.insert(ac.clone(), "y");
+                ac
+            } else {
+                let g = s.slice2(&format!("{}gus", tag), &y, &[HOR, 2 * AINTER], 0, AINTER);
+                let u = s.slice2(&format!("{}gus2", tag), &y, &[HOR, 2 * AINTER], AINTER, AINTER);
+                let gact = s.gelu(&format!("{}gact", tag), &g, &[HOR, AINTER], true);
+                s.mul2(&format!("{}act", tag), &gact, &u, &[HOR, AINTER])
+            }
+        } else {
+            let gate = mm_or_qmd(&mut s, &format!("{}gate", tag), &mnorm, &[HOR, AW], fi8[i][4].as_ref(), &format!("{}gatewt", tag), AINTER, &[HOR, AINTER], int8_native);
+            let up = mm_or_qmd(&mut s, &format!("{}up", tag), &mnorm, &[HOR, AW], fi8[i][5].as_ref(), &format!("{}upwt", tag), AINTER, &[HOR, AINTER], int8_native);
+            let gact = s.gelu(&format!("{}gact", tag), &gate, &[HOR, AINTER], true);
+            s.mul2(&format!("{}act", tag), &gact, &up, &[HOR, AINTER])
+        };
         let down = mm_or_qmd(&mut s, &format!("{}down", tag), &act, &[HOR, AINTER], fi8[i][6].as_ref(), &format!("{}downwt", tag), AW, &[HOR, AW], int8_native);
         let downb = if fi8[i][6].is_some() {
             down

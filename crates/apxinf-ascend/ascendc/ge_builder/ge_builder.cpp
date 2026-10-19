@@ -38,6 +38,7 @@
 #include <cstring>
 #include <iostream>
 #include <map>
+#include <mutex>
 
 extern "C" char **environ;
 #include <string>
@@ -68,6 +69,16 @@ struct GebModel {
     // an aclmdlCreateDesc/GetDesc round trip (the zero-tax runtime premise)
     std::vector<size_t> in_sizes;
     std::vector<size_t> out_sizes;
+    // dynamic gear (ge.dynamicDims OMs): gear_count>0 means the model takes
+    // one EXTRA trailing input (ascend_mbatch_shape_data, 4B x dynamic dims)
+    // and execution needs aclmdlSetInputDynamicDims before Execute. Per-gear
+    // full dims of all dynamic inputs (concatenated, input order) cached at
+    // CacheIo time; gear_buf is the lazily-allocated device slot for the
+    // shape-data input (kept for the model lifetime, single-threaded serve).
+    size_t gear_count = 0;
+    std::vector<std::vector<int64_t>> gear_dims;
+    void *gear_buf = nullptr;
+    size_t gear_buf_sz = 0;
 };
 
 std::vector<GebModel> g_models;
@@ -214,6 +225,34 @@ int CacheIo(GebModel &m) {
         }
         std::cerr << std::endl;
     }
+    // dynamic gear census (static OMs: gear_count stays 0). The per-gear
+    // entries carry the FULL dims of every dynamic input, concatenated in
+    // input order -- exactly the payload aclmdlSetInputDynamicDims expects.
+    m.gear_count = 0;
+    m.gear_dims.clear();
+    size_t gears = 0;
+    const aclError gc_rc = aclmdlGetInputDynamicGearCount(d, static_cast<size_t>(-1), &gears);
+    if (gc_rc != ACL_SUCCESS) {
+        std::cerr << "[geb] gear census: GetInputDynamicGearCount err=" << static_cast<int>(gc_rc)
+                  << std::endl;
+    } else if ((gears > 0) && (gears <= 128)) {
+        // GetInputDynamicDims 在真规模 OM（263 输入/14 动态输入/22 档）上
+        // 返回 500001（spike 小图正常——CANN 侧限制，未究明）。档位表由
+        // Rust 侧构图期自算（gear_payloads）——census 只认 GearCount，dims
+        // 查询失败不降级为静态
+        m.gear_count = gears;
+        std::vector<aclmdlIODims> gd(gears);
+        const aclError gd_rc = aclmdlGetInputDynamicDims(d, static_cast<size_t>(-1), gd.data(), gears);
+        if (gd_rc == ACL_SUCCESS && gd[0].dimCount > 0) {
+            for (size_t g = 0; g < gears; g++) {
+                m.gear_dims.emplace_back(gd[g].dims, gd[g].dims + gd[g].dimCount);
+            }
+        }
+        std::cerr << "[geb] gear census: " << gears << " gears (dims query rc="
+                  << static_cast<int>(gd_rc) << ")" << std::endl;
+    } else if (gears > 128) {
+        std::cerr << "[geb] gear census: gears=" << gears << " > 128, treated static" << std::endl;
+    }
     aclmdlDestroyDesc(d);
     return 0;
 }
@@ -346,6 +385,10 @@ extern "C" int geb_model_save(int64_t h, const char *path) {
 
 // load a persisted OM (no GE compile session needed -- pure ACL runtime)
 extern "C" int64_t geb_model_load(const char *path) {
+    // 供三段并行装载（冷启动 lazy）：g_models 增删非线程安全——装载全程
+    // 持锁（IO/aclmdlLoadFromMem 在锁内，ACL runtime 自身线程安全）
+    static std::mutex load_mu;
+    const std::lock_guard<std::mutex> lk(load_mu);
     FILE *f = fopen(path, "rb");
     if (f == nullptr) {
         std::cerr << "[geb] load: cannot open " << path << std::endl;
@@ -525,6 +568,8 @@ class OpDesc {
 public:
     graphStatus AddDynamicInputDesc(const std::string &name, const uint32_t num,
                                     const bool is_push_back);
+    graphStatus AddDynamicOutputDesc(const std::string &name, const uint32_t num,
+                                     const bool is_push_back);
 };
 }  // namespace ge
 
@@ -546,6 +591,31 @@ extern "C" int geb_dyn_inputs(const char *op_name, const char *base_name, int32_
     if (desc->AddDynamicInputDesc(std::string(base_name), static_cast<uint32_t>(n), true) !=
         ge::GRAPH_SUCCESS) {
         std::cerr << "[geb] dyn_inputs: op '" << op_name << "' AddDynamicInputDesc('" << base_name
+                  << "', " << n << ") failed" << std::endl;
+        return -4;
+    }
+    return 0;
+}
+
+// Register n dynamic output ports (same redeclare-and-link trick as inputs;
+// SplitD fused-qmd split needs y×2 — CATGU mode2 2026-10-19). Allocate
+// BEFORE any output desc/link on those ports.
+extern "C" int geb_dyn_outputs(const char *op_name, const char *base_name, int32_t n) {
+    GebModel *m = Cur();
+    if (m == nullptr) {
+        return -1;
+    }
+    ge::Operator *op = FindOp(*m, op_name, "dyn_outputs");
+    if (op == nullptr) {
+        return -2;
+    }
+    std::shared_ptr<ge::OpDesc> desc = ge::OpDescUtils::GetOpDescFromOperator(*op);
+    if (desc == nullptr) {
+        return -3;
+    }
+    if (desc->AddDynamicOutputDesc(std::string(base_name), static_cast<uint32_t>(n), true) !=
+        ge::GRAPH_SUCCESS) {
+        std::cerr << "[geb] dyn_outputs: op '" << op_name << "' AddDynamicOutputDesc('" << base_name
                   << "', " << n << ") failed" << std::endl;
         return -4;
     }
@@ -691,8 +761,8 @@ extern "C" int geb_set_output_desc(const char *op_name, const char *port, const 
     return 0;
 }
 
-extern "C" int geb_set_output_desc_idx(const char *op_name, int32_t out_idx, const int64_t *dims,
-                                       int32_t n_dims, const char *dtype) {
+extern "C" int geb_set_output_desc_idx(const char *op_name, const char *port, int32_t out_idx,
+                                       const int64_t *dims, int32_t n_dims, const char *dtype) {
     GebModel *m = Cur();
     if (m == nullptr) {
         return -1;
@@ -705,9 +775,13 @@ extern "C" int geb_set_output_desc_idx(const char *op_name, int32_t out_idx, con
     if (!MkDesc(dims, n_dims, dtype, td)) {
         return -3;
     }
-    if (op->UpdateOutputDesc(static_cast<uint32_t>(out_idx), td) != ge::GRAPH_SUCCESS) {
-        std::cerr << "[geb] set_output_desc_idx: op '" << op_name << "' rejected output " << out_idx
-                  << std::endl;
+    // 动态多输出（SplitD 同名 "y"×N）必须走 UpdateDynamicOutputDesc(name,
+    // index)——按 flat index 的 UpdateOutputDesc(idx) 被拒（2026-10-19
+    // CATGU mode2 实证 rc=-4）
+    if (op->UpdateDynamicOutputDesc(std::string(port), static_cast<uint32_t>(out_idx), td) !=
+        ge::GRAPH_SUCCESS) {
+        std::cerr << "[geb] set_output_desc_idx: op '" << op_name << "' rejected dyn output "
+                  << port << "[" << out_idx << "]" << std::endl;
         return -4;
     }
     return 0;
@@ -995,4 +1069,154 @@ extern "C" int geb_run(int64_t h, void *const *inputs, int32_t n_in, void *const
         return -4;
     }
     return 0;
+}
+
+// ---- dynamic gear (ge.dynamicDims OMs) ----
+
+// Gear census of a loaded model. Returns 0 for static OMs, N>0 for an
+// N-gear dynamic OM, negative on error.
+extern "C" int geb_gear_count(int64_t h) {
+    const GebModel *m = ByHandle(h);
+    if ((m == nullptr) || !m->loaded) {
+        return -1;
+    }
+    return static_cast<int>(m->gear_count);
+}
+
+// Full dims of all dynamic inputs for one gear (concatenated, input order --
+// the aclmdlSetInputDynamicDims payload). Returns dimCount, negative on error.
+extern "C" int geb_gear_dims(int64_t h, int32_t gear, int64_t *out_dims, int32_t cap) {
+    const GebModel *m = ByHandle(h);
+    if ((m == nullptr) || !m->loaded) {
+        return -1;
+    }
+    if ((gear < 0) || (static_cast<size_t>(gear) >= m->gear_count)) {
+        return -2;
+    }
+    const auto &gd = m->gear_dims[static_cast<size_t>(gear)];
+    const int32_t n = static_cast<int32_t>(gd.size());
+    if ((out_dims == nullptr) || (cap < n)) {
+        return n;  // capacity probe: caller re-calls with a big enough buffer
+    }
+    for (int32_t i = 0; i < n; i++) {
+        out_dims[i] = gd[static_cast<size_t>(i)];
+    }
+    return n;
+}
+
+// Gear-aware run. dyn_dims/n_dyn = full dims of all dynamic inputs in input
+// order (spike S2 recipe: ONE SetInputDynamicDims call on input 0 carrying
+// every dynamic input's dims). For dynamic OMs n_in counts the REAL inputs
+// only -- the trailing shape-data input is buffered and filled here. Static
+// OMs (gear_count==0): dyn_dims ignored, behaves exactly like geb_run.
+extern "C" int geb_run_gear(int64_t h, void *const *inputs, int32_t n_in, void *const *outputs,
+                            int32_t n_out, void *stream, const int64_t *dyn_dims, int32_t n_dyn) {
+    GebModel *m = ByHandle(h);
+    if ((m == nullptr) || !m->loaded) {
+        return -1;
+    }
+    const size_t real_in = m->gear_count > 0 ? m->in_sizes.size() - 1 : m->in_sizes.size();
+    if ((n_in < 0) || (static_cast<size_t>(n_in) != real_in)) {
+        std::cerr << "[geb] run_gear: n_in " << n_in << " != real inputs " << real_in << std::endl;
+        return -2;
+    }
+    if ((n_out < 0) || (static_cast<size_t>(n_out) != m->out_sizes.size())) {
+        std::cerr << "[geb] run_gear: n_out " << n_out << " != model " << m->out_sizes.size() << std::endl;
+        return -3;
+    }
+    if (m->gear_count > 0) {
+        if ((dyn_dims == nullptr) || (n_dyn <= 0)) {
+            std::cerr << "[geb] run_gear: dynamic OM needs dyn_dims" << std::endl;
+            return -5;
+        }
+    }
+    aclmdlDataset *in_ds = aclmdlCreateDataset();
+    for (int32_t i = 0; i < n_in; i++) {
+        (void)aclmdlAddDatasetBuffer(in_ds,
+                                     aclCreateDataBuffer(inputs[i], m->in_sizes[static_cast<size_t>(i)]));
+    }
+    if (m->gear_count > 0) {
+        // trailing shape-data input: cached device slot, filled by SetDims
+        const size_t gsz = m->in_sizes.back();
+        if (m->gear_buf == nullptr) {
+            if (aclrtMalloc(&m->gear_buf, gsz, ACL_MEM_MALLOC_HUGE_ONLY) != ACL_SUCCESS) {
+                m->gear_buf = nullptr;
+                std::cerr << "[geb] run_gear: gear buf malloc failed" << std::endl;
+                return -6;
+            }
+            m->gear_buf_sz = gsz;
+        }
+        (void)aclmdlAddDatasetBuffer(in_ds, aclCreateDataBuffer(m->gear_buf, gsz));
+    }
+    aclmdlDataset *out_ds = aclmdlCreateDataset();
+    for (int32_t i = 0; i < n_out; i++) {
+        (void)aclmdlAddDatasetBuffer(out_ds,
+                                     aclCreateDataBuffer(outputs[i], m->out_sizes[static_cast<size_t>(i)]));
+    }
+    aclError e = ACL_SUCCESS;
+    if (m->gear_count > 0) {
+        aclmdlIODims want{};
+        for (int32_t i = 0; (i < n_dyn) && (i < static_cast<int32_t>(ACL_MAX_DIM_CNT)); i++) {
+            want.dims[static_cast<size_t>(i)] = static_cast<size_t>(dyn_dims[i]);
+        }
+        want.dimCount = static_cast<size_t>(n_dyn < static_cast<int32_t>(ACL_MAX_DIM_CNT)
+                                                ? n_dyn
+                                                : static_cast<int32_t>(ACL_MAX_DIM_CNT));
+        e = aclmdlSetInputDynamicDims(m->model_id, in_ds, 0, &want);
+        if (e != ACL_SUCCESS) {
+            std::cerr << "[geb] run_gear: SetInputDynamicDims err=" << static_cast<int>(e) << std::endl;
+        }
+    }
+    if (e == ACL_SUCCESS) {
+        e = (stream != nullptr) ? aclmdlExecuteAsync(m->model_id, in_ds, out_ds,
+                                                     static_cast<aclrtStream>(stream))
+                                : aclmdlExecute(m->model_id, in_ds, out_ds);
+        if (e != ACL_SUCCESS) {
+            std::cerr << "[geb] execute err=" << static_cast<int>(e) << std::endl;
+        }
+    }
+    for (int32_t i = 0; i < n_in; i++) {
+        aclDestroyDataBuffer(aclmdlGetDatasetBuffer(in_ds, static_cast<size_t>(i)));
+    }
+    if (m->gear_count > 0) {
+        aclDestroyDataBuffer(aclmdlGetDatasetBuffer(in_ds, static_cast<size_t>(n_in)));
+    }
+    for (int32_t i = 0; i < n_out; i++) {
+        aclDestroyDataBuffer(aclmdlGetDatasetBuffer(out_ds, static_cast<size_t>(i)));
+    }
+    aclmdlDestroyDataset(in_ds);
+    aclmdlDestroyDataset(out_ds);
+    return (e == ACL_SUCCESS) ? 0 : -4;
+}
+
+// Output dims of the LAST executed gear (aclmdlGetCurOutputDims). Rank>=3
+// outputs with a dynamic non-last dim are laid out at MAX-gear stride --
+// consumers must honour that (spike v2 empirical).
+extern "C" int geb_cur_output_dims(int64_t h, int32_t idx, int64_t *out_dims, int32_t cap) {
+    GebModel *m = ByHandle(h);
+    if ((m == nullptr) || !m->loaded) {
+        return -1;
+    }
+    aclmdlDesc *d = aclmdlCreateDesc();
+    if (d == nullptr) {
+        return -2;
+    }
+    if (aclmdlGetDesc(d, m->model_id) != ACL_SUCCESS) {
+        aclmdlDestroyDesc(d);
+        return -3;
+    }
+    aclmdlIODims dims{};
+    const aclError e = aclmdlGetCurOutputDims(d, static_cast<size_t>(idx), &dims);
+    aclmdlDestroyDesc(d);
+    if (e != ACL_SUCCESS) {
+        return -4;
+    }
+    const int32_t n = static_cast<int32_t>(dims.dimCount);
+    if ((out_dims == nullptr) || (cap < n)) {
+        return n;
+    }
+    for (int32_t i = 0; i < n; i++) {
+        out_dims[i] = static_cast<int64_t>(dims.dims[static_cast<size_t>(i)]);
+    }
+    return n;
 }
