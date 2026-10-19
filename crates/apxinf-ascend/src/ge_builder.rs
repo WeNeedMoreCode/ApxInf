@@ -354,7 +354,8 @@ impl GeGraph {
         Ok(())
     }
 
-    /// 动态输出端口分配（SplitD 同名 y×N——先分配再设 desc；CATGU mode2）
+    /// 动态输出端口分配（多输出 legacy 算子的同名 y×N 端口——CreateOperator
+    /// 不预建动态输出，须先本调用分配再设 desc/接线）
     pub fn dyn_outputs(&self, op: &str, base: &str, n: i32) -> Result<()> {
         type F = unsafe extern "C" fn(
             *const std::os::raw::c_char,
@@ -458,8 +459,9 @@ impl GeGraph {
         self.set_desc(b"geb_set_output_desc", "geb_set_output_desc", op, port, dims, dtype)
     }
 
-    /// 动态多输出算子的按位输出 desc（SplitD 同名 "y"×N 端口——走 C++
-    /// UpdateDynamicOutputDesc(name, index)；CATGU 抢救实验 2026-10-19）
+    /// 动态多输出算子的按位输出 desc（同名 "y"×N 端口走 C++
+    /// UpdateDynamicOutputDesc(name, index)——flat index 版 UpdateOutputDesc
+    /// 对动态输出端口被拒）
     pub fn set_output_desc_idx(&self, op: &str, port: &str, out_idx: i32, dims: &[i64], dtype: Dtype) -> Result<()> {
         type F = unsafe extern "C" fn(
             *const std::os::raw::c_char,

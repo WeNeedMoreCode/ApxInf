@@ -236,10 +236,11 @@ int CacheIo(GebModel &m) {
         std::cerr << "[geb] gear census: GetInputDynamicGearCount err=" << static_cast<int>(gc_rc)
                   << std::endl;
     } else if ((gears > 0) && (gears <= 128)) {
-        // GetInputDynamicDims 在真规模 OM（263 输入/14 动态输入/22 档）上
-        // 返回 500001（spike 小图正常——CANN 侧限制，未究明）。档位表由
-        // Rust 侧构图期自算（gear_payloads）——census 只认 GearCount，dims
-        // 查询失败不降级为静态
+        // aclmdlGetInputDynamicDims returns 500001 on full-scale OMs (works
+        // on small spikes -- CANN-side limitation, root cause not traced).
+        // The gear table is computed Rust-side at graph-build time instead;
+        // the census only trusts GearCount and does not degrade to static
+        // when the dims query fails.
         m.gear_count = gears;
         std::vector<aclmdlIODims> gd(gears);
         const aclError gd_rc = aclmdlGetInputDynamicDims(d, static_cast<size_t>(-1), gd.data(), gears);
@@ -597,9 +598,10 @@ extern "C" int geb_dyn_inputs(const char *op_name, const char *base_name, int32_
     return 0;
 }
 
-// Register n dynamic output ports (same redeclare-and-link trick as inputs;
-// SplitD fused-qmd split needs y×2 — CATGU mode2 2026-10-19). Allocate
-// BEFORE any output desc/link on those ports.
+// Register n dynamic output ports (same redeclare-and-link trick as inputs).
+// Multi-output legacy ops (e.g. SplitD with a shared "y"×N port) need this
+// BEFORE any output desc/link on those ports -- CreateOperator does not
+// pre-create them.
 extern "C" int geb_dyn_outputs(const char *op_name, const char *base_name, int32_t n) {
     GebModel *m = Cur();
     if (m == nullptr) {
@@ -775,9 +777,9 @@ extern "C" int geb_set_output_desc_idx(const char *op_name, const char *port, in
     if (!MkDesc(dims, n_dims, dtype, td)) {
         return -3;
     }
-    // 动态多输出（SplitD 同名 "y"×N）必须走 UpdateDynamicOutputDesc(name,
-    // index)——按 flat index 的 UpdateOutputDesc(idx) 被拒（2026-10-19
-    // CATGU mode2 实证 rc=-4）
+    // Dynamic multi-output ports (shared name "y"×N) require
+    // UpdateDynamicOutputDesc(name, index); the flat-index
+    // UpdateOutputDesc(idx) is rejected for them.
     if (op->UpdateDynamicOutputDesc(std::string(port), static_cast<uint32_t>(out_idx), td) !=
         ge::GRAPH_SUCCESS) {
         std::cerr << "[geb] set_output_desc_idx: op '" << op_name << "' rejected dyn output "
