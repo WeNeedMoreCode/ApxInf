@@ -3,7 +3,7 @@
 //! The aclmdlRI (model Runtime Instance) flow maps 1:1 onto CUDA Graphs
 //! minus instantiation: capture on a non-default stream, end produces an
 //! executable RI handle, replay is one async launch. Verified end-to-end on
-//! 310P3 / CANN 9.0.1 (see dev_logs/aclgraph_probe/): all three capture
+//! 310P3 / CANN 9.0.1: all three capture
 //! modes work; `memsetAsync` is a capturable payload. CANN 8.5.1 rejects
 //! `aclmdlRICaptureBegin` with 207000, so this module is only usable in the
 //! 9.0.1+ container.
