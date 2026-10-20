@@ -1,14 +1,14 @@
-//! GE 三段 OM（vision/prefix/flow）执行器——**crate 库面**（原 ge_model_probe
-//! 探针于 2026-09-23 下沉）：三段建图/对拍/bench、E2eStage、三段 per-frame
+//! GE 三段 OM（vision/prefix/flow）执行器——**crate 库面**（自 ge_model_probe
+//! 探针下沉而来）：三段建图/对拍/bench、E2eStage、三段 per-frame
 //! 机械（VisionMech/PrefixMech/FlowMech，含 GEB_SERVE_FAST 设备直连）、
 //! spool serve_loop、**GeServe 进程内直调门面**（④C；PyO3/serve 同源帧实现）。
 //! 探针驱动（env 分发/GEB_CKPT 加载）在 examples/ge_model_probe.rs。
 //!
-//! C2 三段 OM 全量探针：vision / prefix / flow 三段各自声明为 GE 静态
+//! 三段 OM 全量验证：vision / prefix / flow 三段各自声明为 GE 静态
 //! OM（ge_builder FFI），与 eager aclnn 组合同输入同序列对拍 + bench。
 //! flow 段是单步 OM（10 步 flow 由调用方执行 10 次换绑定）。
 //!
-//! 算子契约（310P opp proto 头文件取证 2026-09-19）：
+//! 算子契约（310P opp proto 头文件实证）：
 //!   AddLayerNorm  x1/x2/gamma/beta(/bias)→y/mean/rstd/x, epsilon(Float)
 //!   GeluV2        x→y, approximate(String: "none"=exact / "tanh")
 //!   GatherV2D     x/indices→y, axis(Int attr；310P 实现 axis 只支持 0)
@@ -17,7 +17,7 @@
 //!   BroadcastToD  x→y, shape(ListInt)  [行广播：bias / ada-norm shift]
 //!   Reshape       x + shape(张量输入) → y   [rope flat 桥 / rank-3 桥]
 //!   MatMulV2(transpose_x2)/PromptFlashAttention(BSH rank-3)/AddRmsNorm/
-//!   Squeeze/Add/Mul —— C1 已验证（ge_layer_probe）
+//!   Squeeze/Add/Mul —— 已验证（单层探针）
 //!
 //! 图内设计要点：
 //!   - 权重 host 预转置 [n,k] 物理 + MatMulV2 transpose_x2=true（NzCache
@@ -47,7 +47,7 @@
 //!   向量等运行时输入保持合成（两路同值对拍不受影响）。
 //!   ⚠ GEB_LOAD 真 OM（*_real.om）必须配 GEB_CKPT——权重烤在 OM 里，但
 //!   eager 参考仍从 binds 取权重，缺 GEB_CKPT 时对拍错权重无意义
-//!   GEB_SEG=e2e：M3 三段链式 e2e（vision→prefix→flow 10 步换绑）——x0 真
+//!   GEB_SEG=e2e：三段链式 e2e（vision→prefix→flow 10 步换绑）——x0 真
 //!   嵌入组装（vision_out ‖ token_embedding 查表，embed_prefix 同序）、
 //!   styles 真值（time_mlp(sinusoidal(t))→style→ascl=1+s0/ash=s1）、pk/pv =
 //!   prefix OM 36 输出直连（host 中转）。GEB_E2E_GOLDEN=<safetensors> 对拍
@@ -90,10 +90,10 @@ pub fn envi(k: &str, d: i64) -> i64 {
 }
 
 // ---------------------------------------------------------------------------
-// 动态分档（ge.dynamicDims；spike v1/v2 实证配方，2026-10-10）：
+// 动态分档（ge.dynamicDims；实证配方）：
 //   GEB_DYN_LLIST="137,138,...,157,200" = L 档表。构图期所有含 p 的 desc
 //   维与 Reshape shape Const 内容一律写 -1（Const 全档共享，内容必须 gear
-//   不变；-1 由分支推理按档解析——spike v2 HF 链 0.6% 三档验证）；rope
+//   不变；-1 由分支推理按档解析——HF 参考链 0.6% 三档验证）；rope
 //   表/swap 索引等 L 长度张量注册为 Data[-1]（内容逐行 p 无关，p_max 全
 //   量上流即前缀截断语义）；L 相关 Const（qswap_c）转 Data。运行期按请求
 //   选档：aclmdlSetInputDynamicDims 一次调用带全部动态输入的维（S2 定式）。
@@ -116,8 +116,8 @@ static GEAR_MODE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
 /// 进程级 gear 模式开关（env 读一次；构图/执行两侧共用）。
 /// GEB_PREFIX_POOL 例外：池模式下压成 false——prefix 组装须与静态桶 OM 的
-/// 接口一致（gear 折叠 rows==1 bias 少注册 90 个 Data，n_in 170!=260 实证
-/// 2026-10-15）；flow 接口两模式同形（rope 恒 Data）不受影响，但
+/// 接口一致（gear 折叠 rows==1 bias 少注册 90 个 Data，n_in 170!=260 实证）；
+/// flow 接口两模式同形（rope 恒 Data）不受影响，但
 /// set_rope_for 的早退门按 flows 池判（见彼处）。
 pub fn gear_mode() -> bool {
     *GEAR_MODE.get_or_init(|| dyn_llist().is_some() && std::env::var("GEB_PREFIX_POOL").is_err())
@@ -138,7 +138,7 @@ pub fn lp_to_p(l: i64) -> i64 {
     VT + l - envi("GEB_PREFIX_DROP_EMPTY", 0)
 }
 
-/// Range padding 网格映射（GEB_POOL_GRID=stride，2026-10-16）：请求真 L →
+/// Range padding 网格映射（GEB_POOL_GRID=stride）：请求真 L →
 /// 桶界 P（向上取整到 stride 倍数，clamp [MIN, MAX]）。无 env = 恒等（精确
 /// 桶现行为）。桶界与真长的差行由 GEB_ATTN_MASK 的 softmax 加性 mask 遮蔽
 /// ——表外 L 根除（任意 L ≤ MAX 均有归属），单任务 eval 从 ~4 桶缩到 1 桶。
@@ -168,7 +168,7 @@ pub fn erf(x: f32) -> f32 {
 }
 
 /// splitmix64 单步（LCG 高 16 位 mod 200 有短周期结构——vision 探针
-/// LayerNorm 行方差塌缩 → rstd 放大 385× 的教训，2026-09-19）
+/// LayerNorm 行方差塌缩 → rstd 放大 385× 的教训）
 pub fn mix64(z: &mut u64) -> u64 {
     *z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
     let mut x = *z;
@@ -259,7 +259,7 @@ pub fn wbuf_t(ctx: &AscendContext, host: &[f16], rows: i64, cols: i64) -> Device
 }
 
 // ---------------------------------------------------------------------------
-// C2 生产化：prefix int8（GEB_PREFIX_INT8）——7 投影 mm → QuantMatmulDequant
+// 生产化：prefix int8（GEB_PREFIX_INT8）——7 投影 mm → QuantMatmulDequant
 // ---------------------------------------------------------------------------
 
 /// GEB_PREFIX_INT8：prefix 7 投影换 QuantMatmulDequant（int8 ND [n,k] +
@@ -283,7 +283,7 @@ pub fn flow_int8() -> bool {
 /// 由 smooth_calib_v1.npz（torch 域）经 convert_smooth_engine.py v2 转换
 /// （g 回图方案）：int8 层 AddRmsNorm gamma 用 (1+g) 真值（loader fold 的
 /// 原值替代源），激活侧回 torch 域——纯引擎域 s_eff 会因 L00 近零 fold
-/// 爆到 ±e7（f16 行不可表示，2026-09-28 取证）。
+/// 爆到 ±e7（f16 行不可表示，实测）。
 pub struct Int8Smooth {
     /// 权重侧吸收因子 f32[k]（= s_npz/(1+g)，仅 f32 权重量化用）
     pub s_eff: Vec<f32>,
@@ -371,10 +371,10 @@ pub fn quant_w8(w32: &[f32], k: usize, s_eff: &[f32]) -> (Vec<i8>, Vec<f32>) {
 }
 
 /// host LayerNorm 参考（f32 计算）：aclnnAddLayerNorm 在 [768,1152] 有
-/// kernel 级放大（2026-09-19），eager 参考路径的 LN 用 host 计算。
+/// kernel 级放大（实测），eager 参考路径的 LN 用 host 计算。
 /// ⚠ 入参 stream 先同步——同步 d2h（aclrtMemcpy）不等待 compute 流上的
 /// 生产 kernel，不同步则读到跑赢/滞后的数据（eager 全 device kernel 时
-/// 确定性错排 98.2% 取证；PFA 模式被 host 回调串行化掩盖）。
+/// 确定性错排 98.2%；PFA 模式被 host 回调串行化掩盖）。
 pub fn host_ln(
     ctx: &AscendContext, stream: &AscendStream, x: &DeviceBuffer, g: &[f16], b: &[f16], rows: i64, cols: i64,
 ) -> DeviceBuffer {
@@ -478,7 +478,7 @@ pub struct Seg {
     /// binds 平行名表（bind_of 用）。⚠ names/shapes 只覆盖 Data 输入——
     /// WCONST 权重（wt Const 分支）与 i8 占位槽只 push binds 不进 names，
     /// 两表历史上不对齐（bind_of 恰只查头部 Data 输入而幸存）；bind_names
-    /// 与 binds 严格平行，按名定位不再依赖注册顺序（2026-10-16 c1/c2 事故）
+    /// 与 binds 严格平行，按名定位不再依赖注册顺序（历史事故修复）
     pub bind_names: Vec<String>,
     /// 图输入在 binds 里的下标（GEB_WCONST 时权重是 Const 不占图输入，
     /// binds 仍全量持上传副本供 eager/层基址——索引两模式恒同）
@@ -503,7 +503,7 @@ pub struct Seg {
     /// 每档 S2 payload（gear 模式非空；静态模式空 = run 等价）
     pub gear_payloads: Vec<Vec<i64>>,
     /// 每档纯 -1 位值（ge.dynamicDims 选项串专用——atc 语义只要 -1 位的
-    /// 值；payload 的静态尾维混进选项会让编译 rc=-7，2026-10-10 取证）
+    /// 值；payload 的静态尾维混进选项会让编译 rc=-7，实测）
     gear_optvals: Vec<Vec<i64>>,
 }
 
@@ -555,7 +555,7 @@ impl Seg {
 
     /// 定值动态输入：进档表但每档恒值（内容静态却不能 Const 的输入——
     /// legacy 算子 Const 输入墙 rc=-7，如 QMD 的 smooth 因子/gamma；全
-    /// 动态输入集是 SetInputDynamicDims 档位匹配的前提，spike v3 定罪）
+    /// 动态输入集是 SetInputDynamicDims 档位匹配的前提，实测定罪）
     pub fn set_gear_fix(&mut self, name: &str, v: i64) {
         self.gear_fix.insert(name.to_string(), v);
     }
@@ -575,7 +575,7 @@ impl Seg {
     }
 
     /// 每档 S2 payload：全部含 -1 维输入的**完整 dims**（动态位 = mul×p，
-    /// 静态尾维原样；spike v2 S2 定式——SetInputDynamicDims 一次调用带全部
+    /// 静态尾维原样；S2 定式——SetInputDynamicDims 一次调用带全部
     /// 动态输入的全维）。ge.dynamicDims 选项串仍是纯 -1 位值（atc 语义）
     fn compose_gear_payloads(&mut self) {
         self.gear_payloads.clear();
@@ -709,7 +709,7 @@ impl Seg {
         name.to_string()
     }
 
-    /// int8 Data 输入（C2 int8 probe：QuantMatmulDequant 的量化权重/scale）
+    /// int8 Data 输入（int8 探针：QuantMatmulDequant 的量化权重/scale）
     fn data_i8(&mut self, ctx: &AscendContext, name: &str, dims: &[i64], host: &[i8]) -> String {
         let bytes: Vec<u8> = host.iter().map(|&v| v as u8).collect();
         let buf = upload_bytes(ctx, &bytes);
@@ -727,7 +727,7 @@ impl Seg {
     /// Const shape 张量（非图输入，编译期常量折叠）。⚠ shape 类输入用
     /// data_i32（Data）会让消费算子（Reshape/LayerNormV4）输出 desc 变
     /// unknown → DynamicShapePartitioner 拆子图 → unknown 部分走 host
-    /// 调度（每边界 ~20ms 停顿；vision_ma OM 3220 个 unknown 标记取证）
+    /// 调度（每边界 ~20ms 停顿；vision OM 3220 个 unknown 标记实证）
     fn const_i32(&mut self, name: &str, vals: &[i32]) -> String {
         self.g.add_const_i32(name, vals).unwrap();
         self.datas.insert(name.to_string());
@@ -951,8 +951,8 @@ impl Seg {
     }
 
     /// fp32 变体（GEB_NORM32）：torch GemmaRMSNorm 语义对齐——方差在
-    /// fp32 域算（norm16 对照实验定罪：去 fp32 上浮 = 行为 0/10 开关，
-    /// 2026-09-22）。入参全 fp32，出 y fp32（调用方 Cast 回 f16 或直用）
+    /// fp32 域算（norm16 对照实验定罪：去 fp32 上浮 = 行为 0/10 开关）。
+    /// 入参全 fp32，出 y fp32（调用方 Cast 回 f16 或直用）
     fn addrms_f32(&mut self, name: &str, x: &str, zeros: &str, gamma: &str, dims: &[i64]) -> String {
         self.g.add_op(name, "AddRmsNorm").unwrap();
         self.g.set_input_desc(name, "x1", dims, Dtype::Fp32).unwrap();
@@ -1033,11 +1033,11 @@ impl Seg {
         self.reg_out(name, "y")
     }
 
-    /// NORM32 核心 v2（f16 域 + MatMul 立方体 fp32 累加，2026-09-22
-    /// n32v tap 矩阵定案）：310P tbe 的 ReduceSumD/ReduceSum f32 desc
-    /// 均为假支持——FE 混精度回退跑 f16 累加，行和 >65504 饱和（t4/t7
-    /// 实测 92% 偏差）；Cast f32 是真语义（t9 逐位）。方差精度改走 mm
-    /// 的 cube fp32 累加（t8 实测 0.05% = f16 量化级）：
+    /// NORM32 核心 v2（f16 域 + MatMul 立方体 fp32 累加，tap 矩阵定案）：
+    /// 310P tbe 的 ReduceSumD/ReduceSum f32 desc 均为假支持——FE 混精度
+    /// 回退跑 f16 累加，行和 >65504 饱和（实测 92% 偏差）；Cast f32 是
+    /// 真语义（逐位一致）。方差精度改走 mm 的 cube fp32 累加（实测
+    /// 0.05% = f16 量化级）：
     ///   xs=x·s（防 outlier 平方溢出）→ sq=xs² → ssum=mm(sq,onesᵀ)
     ///   → inv=rsqrt(ssum)·k（k=s·√w）→ 1-D Tile 广播 → x·invb·γ
     /// 全程 f16 kernel；torch GemmaRMSNorm 对齐的关键是方差不饱和/
@@ -1073,12 +1073,11 @@ impl Seg {
         self.wire(&ik, "x1", &rs);
         self.g.link(&ik, "x2", &kc).unwrap();
         let ik = self.reg_out(&ik, "y");
-        // 广播（t14 形态）：[rows,1] → Reshape [1,rows] → TileD
+        // 广播（行式形态）：[rows,1] → Reshape [1,rows] → TileD
         // multiples=[w,1]（dim0 整行复制——生产 bias/γ 链同款 kernel）
         // → [w,rows] → TransposeD(1,0) → [rows,w]。⚠ 连续平铺方向
         // （rank-1 [rows] 或 [1,rows]+[1,w] flat tile）的 TileD kernel
-        // 在 310P f16 散点腐蚀 ~8%（n32v t11/t13 逐位同错定罪，
-        // 2026-09-22）；t14 = 0.08% 干净
+        // 在 310P f16 散点腐蚀 ~8%（逐位同错定罪）；行式形态 = 0.08% 干净
         let bshp = format!("{name}_bshp");
         self.const_i32(&bshp, &[1, rows as i32]);
         let br1 = self.reshape(&format!("{name}_br1"), &ik, &[rows, 1], &bshp, &[1, rows]);
@@ -1169,8 +1168,8 @@ impl Seg {
 
     /// LayerNormV4（vision SigLIP norm）。⚠ aclnnAddLayerNorm/GE AddLayerNorm
     /// 在 [768,1152] 大 shape 输出 ~100× 放大（行方差正常、kernel 级行为，
-    /// 2026-09-19 trace 取证）——换 LayerNormV4（normalized_shape 张量输入）。
-    /// ⚠ mean/rstd 是 REQUIRED 输出且死端会让 y 爆（lnv4c 取证，与
+    /// trace 取证）——换 LayerNormV4（normalized_shape 张量输入）。
+    /// ⚠ mean/rstd 是 REQUIRED 输出且死端会让 y 爆（探针取证，与
     /// AddRmsNorm 死端无害相反）——每个 LN 实例记入 ln_aux，finish 时
     /// 绑成 aux 图输出（parity 只对拍主输出）。
     fn addln(&mut self, name: &str, x: &str, gamma: &str, beta: &str, nsh: &str, dims: &[i64]) -> String {
@@ -1386,7 +1385,7 @@ impl Seg {
 
     /// GQA 版（ma2 验证 0.24%）：k3/v3 [1,skv,d] TileD 广播到 bh 头。
     /// q3 [bh,sq,d]。返回 [bh,sq,d]。
-    /// mask（GEB_ATTN_MASK，range padding 2026-10-16）：Some = softmax 前
+    /// mask（GEB_ATTN_MASK，range padding）：Some = softmax 前
     /// 加性 mask 广播 Add（x2 [1,1,skv]——pad 键列大负数，真列 0）。数学上
     /// 精确（x+0 恒等 + exp(-30000+max) 下溢恰 0），真行输出与精确 L 版等价
     fn attn_manual_gqa(
@@ -1446,7 +1445,7 @@ impl Seg {
 
     /// token 主序 [views*s, h*d] → 头主序 [views*h, s, d]（bmm 布局）。
     /// ⚠ 直接 Reshape 是错排（[768,1152]→[48,256,72] 把头/序混排——
-    /// d1 manual 98.2% 取证）：正确变换 = Reshape[views,s,h,d] →
+    /// manual 对拍 98.2% 实证）：正确变换 = Reshape[views,s,h,d] →
     /// TransposeD(0,2,1,3) → Reshape[views*h,s,d]。
     fn headsplit(
         &mut self, name: &str, x: &str, t: i64, views: i64, s: i64, h: i64, d: i64,
@@ -1673,7 +1672,7 @@ pub fn parity_and_bench(
 
     // 对拍（主输出——LayerNormV4 的 mean/rstd aux 输出跳过）。断言用
     // 相对误差：GE 静态 OM 与 eager aclnn 允许不同 tiling 变体（这正是
-    // C 路线的性能来源），单算子/小图逐位一致（C1 验证），全量多层图
+    // C 路线的性能来源），单算子/小图逐位一致（已验证），全量多层图
     // 是稳定的变体差（prefix 18 层累计 ~15% 内）
     let mut worst = 0f32;
     let mut worst_rel = 0f32;
@@ -1740,7 +1739,7 @@ pub fn parity_and_bench(
 }
 
 // ---------------------------------------------------------------------------
-// M3 e2e：三段 OM 接真实推理链（GEB_SEG=e2e，进程内链式、host 中转）
+// e2e：三段 OM 接真实推理链（GEB_SEG=e2e，进程内链式、host 中转）
 //   组装口径全对齐 ascend_runtime（M2 eager 全链，CUDA 镜像同源）：
 //   x0 = vision_out ‖ token_embedding[token_ids]（视觉前语言后）
 //   state 不进 prefix——π0.5 走 state 离散化进 prompt（pi05_prompt）
@@ -1805,10 +1804,10 @@ impl VisionMech {
     /// （replay 同式）
     fn one_frame(&mut self, ctx: &AscendContext, stream: &AscendStream, patches: &[f16]) -> Vec<f16> {
         assert_eq!(patches.len() * 2, self.s.binds[0].len(), "serve patches 尺寸不符");
-        // 流水化热路径（2026-09-24 C1）：零拷贝字节视图（LE 主机上
+        // 流水化热路径：零拷贝字节视图（LE 主机上
         // to_le_bytes ≡ raw bytes，wbuf_t 同款 reinterpret）+ 三段全挂流
         // （h2d → run → d2h 同 stream FIFO，host 只等最后一次 sync）。
-        // 字节流路径与逐元素转换版完全一致 ⇒ 数值 bit 恒等；E4 分解定罪
+        // 字节流路径与逐元素转换版完全一致 ⇒ 数值 bit 恒等；分解定罪
         // 的 d2h 3.4ms + dlconv 5.1ms（1.57M 元素 chunks_exact）就此消除。
         // 计时：enq 三段 + wait。
         let tim = serve_timing();
@@ -1858,7 +1857,7 @@ pub struct PrefixMech {
     /// gear 模式：L → 档下标（静态模式空 = 固定 L 单桶）
     gear_of_l: std::collections::HashMap<i64, usize>,
     /// GEB_PREFIX_POOL：per-L 静态 prefix OM 池（换柄执行，routs 全 L 共用
-    /// ——max 物化、无跨请求状态）。T4R 根因修复，见 compose 处注记
+    /// ——max 物化、无跨请求状态）。根因修复，见 compose 处注记
     pool_root: Option<String>,
     pool_graphs: std::collections::HashMap<i64, ge_builder::GeGraph>,
     pool_lru: Vec<i64>,
@@ -2383,14 +2382,14 @@ pub fn silu_f32(x: f32) -> f32 {
 }
 
 /// GEB_NORM32：torch GemmaRMSNorm 语义对齐开关——方差 fp32 域。
-/// norm16 对照定罪 fp32 上浮 = 行为开关（2026-09-22）；AddRmsNorm 的
+/// norm16 对照定罪 fp32 上浮 = 行为开关；AddRmsNorm 的
 /// fp32 desc 是假支持（GE 自动 Cast 归一回 f16 kernel，arm32 单算
 /// f32/f16 输出逐位同）——只能组合手搓。
 pub fn norm32_enabled() -> bool {
     std::env::var("GEB_NORM32").is_ok()
 }
 
-/// GEB_SERVE_FAST：serve 段间设备直连开关（2026-09-23 性能轮 A+B）——
+/// GEB_SERVE_FAST：serve 段间设备直连开关（性能轮实测净收益）——
 /// prefix 36 路 kv 异步 d2d 直连（零 host 中转）、flow x 设备驻留
 /// （逐步 d2h→h2d 换同流 d2d）、10 步去 per-step sync、styles 设备
 /// 驻留（每步独立视图一次上传）。数值 bit 级恒等：同一字节流 + 同流
@@ -2401,7 +2400,7 @@ pub fn serve_fast() -> bool {
 }
 
 /// GEB_SERVE_TIMING：serve 热路径段内分步计时（conv/h2d/run/sync/dl）——
-/// C1 段 glue 归因（2026-09-24）。只加 Instant 戳不改数据流，数值恒等。
+/// 段间 glue 开销归因用。只加 Instant 戳不改数据流，数值恒等。
 pub fn serve_timing() -> bool {
     std::env::var("GEB_SERVE_TIMING").is_ok()
 }
@@ -2436,7 +2435,7 @@ pub fn e2e_conditioning(real: &Pi05Weights, te: &[f32]) -> Vec<f32> {
 
 /// style 投影 [ADIM,3W] → (scale=1+s0, shift=s1, gate=s2)。第三段 gate 是
 /// openpi `_gated_residual` 的分支门控（residual + branch·gate，无激活直出
-/// f16 cast）——2026-09-23 定罪：引擎此前整体未消费该段，flow 输出 v 近随
+/// f16 cast）——定罪：引擎此前整体未消费该段，flow 输出 v 近随
 /// 机、闭环 0/10 的主因
 pub fn e2e_style_pair(w: &LinearWeights, cond: &[f32], width: usize) -> (Vec<f16>, Vec<f16>, Vec<f16>) {
     let raw = host_lin_f32(w, cond, cond.len());
@@ -2753,7 +2752,7 @@ pub fn serve_loop(be: &AscendBackend, st: &mut E2eStage, dir: &str, tokens: usiz
     // 清残留（上次运行的 req/resp/ready 会混淆 seq 与就绪判定）。
     // ⚠ 只删协议文件：pid 是 supervisor 的活体判定依据、stdout.log 是
     // 本进程重定向目标——全删会让 supervisor 判死重复 spawn（双 engine
-    // 抢同一 spool 目录，2026-09-22 实踩）
+    // 抢同一 spool 目录——实测踩过）
     for e in std::fs::read_dir(dir).expect("serve spool read") {
         let p = e.expect("dir entry").path();
         let Some(name) = p.file_name().and_then(|n| n.to_str()) else { continue };
@@ -2878,11 +2877,11 @@ pub fn seg_vision(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e
     let qkvw = vqd * 3;
     // GEB_ATTN=manual：手工 attention（bmm+softmax+bmm 全静态，ma 验证）。
     // 默认 pfa（PromptFlashAttention——静态 OM 里走 InnerPFA host 回调，
-    // ~20ms/层停顿，见 C2 性能攻坚 profile 取证）
+    // ~20ms/层停顿，profile 取证）
     let attn_manual = std::env::var("GEB_ATTN").map(|v| v == "manual").unwrap_or(false);
     let vscale = if attn_manual { 1.0f32 / (V_HD as f32).sqrt() } else { 1.0 };
     // GEB_QKV3：q/k/v 独立投影（3×mm + 独立权重输入），替代融合 qkv mm +
-    // SliceD×3。msprof 取证（C2 攻坚第二轮）：切片视图下游（TransposeD/
+    // SliceD×3。msprof 取证：切片视图下游（TransposeD/
     // PFA）每层触发 3 次运行时 MemcopyAsync 物化（~1.77MB/次）+ 每次前
     // ~4.5-12ms host 停顿 = vision ~450ms 空隙的主源（81 次/执行）
     let qkv3 = std::env::var("GEB_QKV3").is_ok();
@@ -2938,7 +2937,7 @@ pub fn seg_vision(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e
     // ---- 层循环 ----
     // eager 参考的 qkv 走三个独立 matmul（fused 输出 [m, q|k|v] 列交织，
     // take_rows 的 flat 切分在交织布局下数学错误——生产 eager 的该切分
-    // 是 C2 取证发现的 bug，GE 侧 SliceD 通道切分才是对的；eager 参考以
+    // 是对拍取证发现的 bug，GE 侧 SliceD 通道切分才是对的；eager 参考以
     // 独立投影保持数学正确）。独立 buffer 段函数持有，不进图输入。
     let mut eager_qkv: Vec<(DeviceBuffer, DeviceBuffer, DeviceBuffer, DeviceBuffer, DeviceBuffer, DeviceBuffer)> = Vec::new();
     // norm gamma/beta 的 host 副本（eager 参考 host LN 用）
@@ -3167,7 +3166,7 @@ pub fn seg_vision(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e
         let mut mx = |tag: &str, buf: &DeviceBuffer| {
             if trace {
                 // d2h memcpy 非流序——先同步再读，否则竞态脏读（l0 out head
-                // 全 0 取证：大 kernel 后下载抢跑）
+                // 全 0 实证：大 kernel 后下载抢跑）
                 drop(stream.synchronize());
                 let n = buf.len() / 2;
                 let h = download_f16(ctx, buf, n);
@@ -3309,7 +3308,7 @@ fn reg_i8(
     }
     // GEB_INT8_WCONST=1（默认随 GEB_WCONST）：wq/ws 烤 Const——int8 Data
     // 权重每执行付 ND→NZ TransData 税（实测 prefix 129.5ms 反比 f16 105 慢
-    // ~25ms ≈ 2GB/63GB/s，2026-09-28 serve 实测；Const 编译期定型免税，
+    // ~25ms ≈ 2GB/63GB/s（serve 实测）；Const 编译期定型免税，
     // f16 wt() 同理）。smooth 行体量小（[k] f16），保持 Data 无妨
     let wconst8 = envi("GEB_INT8_WCONST", envi("GEB_WCONST", 0)) == 1;
     let (wq_n, ws_n) = if wconst8 {
@@ -3328,11 +3327,11 @@ fn reg_i8(
     };
     let sm_n = if native {
         let smf: Vec<f16> = f.smooth.iter().map(|&v| f16::from_f32(v)).collect();
-        // gear 模式两难与解：纯静态 Data 毒化 SetDims 档位匹配（spike v3
-        // 定罪）；定值动态维又会撑爆 payload 的 ACL_MAX_DIM_CNT=128（全深
+        // gear 模式两难与解：纯静态 Data 毒化 SetDims 档位匹配（实测定罪）；
+        // 定值动态维又会撑爆 payload 的 ACL_MAX_DIM_CNT=128（全深
         // 18 层×9 输入 + 基础 24 = 186 维）。缺省（=1）走 Const——此前
         // 「Const 撞 legacy 墙 rc=-7」实为 dynamicDims 选项串 bug 的误判
-        // （fix11 前选项被 payload 静态尾维污染，与 Const 无关）
+        // （旧版选项被 payload 静态尾维污染，与 Const 无关）
         if !s.gear_ps.is_empty() {
             s.const_f16(&format!("{dump_tag}sm"), &[k], &smf)
         } else {
@@ -3347,7 +3346,7 @@ fn reg_i8(
         }
     };
     // bias 折入算子实验已毙：int32 Const 输入 aclgrphBuildModel rc=-7
-    // （legacy 算子 bias 分支不可用，2026-09-28）。改为调用方直接砍 bias op
+    // （legacy 算子 bias 分支不可用，实测）。改为调用方直接砍 bias op
     //（Gemma 投影 bias≡0 + int8 已 assert 真权重——语义零损失）
     (wq_n, ws_n, sm_n)
 }
@@ -3394,7 +3393,7 @@ pub fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e
     let stream = be.stream();
     let depth = envi("GEB_DEPTH_PREFIX", envi("GEB_DEPTH", 18)) as usize;
     let tokens = envi("GEB_TOKENS", 64);
-    // GEB_PREFIX_DROP_EMPTY：尾部空视图行数（9/10 语义根因修复，2026-09-21）。
+    // GEB_PREFIX_DROP_EMPTY：尾部空视图行数（9/10 语义根因修复）。
     // golden_gen 按 LIBERO 语义只喂 2 真实视图，empty_camera 走 missing 路径
     // （-1 pad 图进 SigLIP 但 pad_mask=0）：make_att_2d_masks 的 pad_2d 把该
     // 256 个 key 对所有人遮蔽，position_ids=cumsum(pad)-1 使文本位置塌缩到
@@ -3410,7 +3409,7 @@ pub fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e
     // （qswap_c/kswap_c）在 gear 模式转 Data[-1]。档表 p 值喂 Seg，finish
     // 合成 ge.dynamicDims + 每档 S2 payload
     // GEB_PREFIX_POOL：prefix 段改静态组装 + per-L 静态 OM 池换柄执行——
-    // T4R 2026-10-15 判决：动态图结构（-1 维 Reshape / rope·qswap Data 化）
+    // 判决：动态图结构（-1 维 Reshape / rope·qswap Data 化）
     // 使 int8 逐层漂移 3×（真帧互差 13.1% actions 级；2 档对照证伪
     // range-tiling 假设）；llist 仍留给 flow 池与客户端校验
     let gear_ll = if std::env::var("GEB_PREFIX_POOL").is_ok() {
@@ -3449,7 +3448,7 @@ pub fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e
     let attn_manual = std::env::var("GEB_ATTN_PREFIX").or_else(|_| std::env::var("GEB_ATTN"))
         .map(|v| v == "manual").unwrap_or(false);
     let pscale = if attn_manual { 1.0f32 / (HD as f32).sqrt() } else { 1.0 };
-    // GEB_PREFIX_INT8（C2 生产化）：7 投影 → QuantMatmulDequant。因子文件
+    // GEB_PREFIX_INT8（生产化）：7 投影 → QuantMatmulDequant。因子文件
     // = GEB_INT8_SMOOTH（默认 pyo3_check/smooth_calib_v1_engine.safetensors，
     // torch 域 npz 经 Gemma 1+g fold 校正转换）。GEB_INT8_PROJS 子集分阶段
     // bring-up（默认全 7）；GEB_INT8_NATIVE=0 回退 TileD+Mul 行预乘。
@@ -3501,7 +3500,7 @@ pub fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e
         }
         _ => None,
     };
-    // GEB_E2E_PAD_TOKENS（range padding 对拍 2026-10-16）：golden 真长 <
+    // GEB_E2E_PAD_TOKENS（range padding 对拍）：golden 真长 <
     // GEB_TOKENS（桶界）——token 补 0 到桶界（pad 行由 padmask 遮蔽），
     // 真长供 padmask 填充。cmp_mid 截断比前缀 = 真行对拍
     let pad_true_l = envi("GEB_E2E_PAD_TOKENS", 0);
@@ -3566,7 +3565,7 @@ pub fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e
         let zh = vec![f16::from_f32(0.0); (p * PW) as usize];
         s.data(ctx, "zeros", &[gd(p), PW], &zh);
     }
-    // GEB_ATTN_MASK（range padding 2026-10-16）：softmax 加性 mask 输入
+    // GEB_ATTN_MASK（range padding）：softmax 加性 mask 输入
     // [1,1,p]——bake 内容占位全 0（无 pad），serve/probe 侧按真 L 填充
     //（行 [vis+L, vis+P) = -30000；f16 域禁 -inf）。全层共用一只 Data
     let attn_mask_n: Option<String> = if envi("GEB_ATTN_MASK", 0) == 1 {
@@ -3612,7 +3611,7 @@ pub fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e
     s.data(ctx, "kcos2", &[gd(p), KVD], &kc2);
     s.data(ctx, "ksin2", &[gd(p), KVD], &ks2);
     // Reshape shape 张量（rank-3 桥；Const 内容 gear 不变——p 位写 -1，
-    // 分支推理按档解析，spike v2 HF 链实证）
+    // 分支推理按档解析，HF 参考链实证）
     s.const_i32("shp_q3", &[1, gd(p) as i32, QD as i32]);
     s.const_i32("shp_k3", &[1, gd(p) as i32, KVD as i32]);
     s.const_i32("shp_v3", &[1, gd(p) as i32, KVD as i32]);
@@ -3623,7 +3622,7 @@ pub fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e
     s.const_i32("shp_mflat", &[gd(p) as i32, QD as i32]);
     // GEB_ROPEFLAT：flat 版 rope（换视图行交换，免列切视图物化）。
     // swap 索引：静态 Const 折叠；gear 模式转 Data[-1]（Const 全档共享而
-    // 长度随档变；Data 逐档特化 desc，内容 r^1 逐行 p 无关——spike v2 P2）
+    // 长度随档变；Data 逐档特化 desc，内容 r^1 逐行 p 无关——实证）
     let ropeflat = std::env::var("GEB_ROPEFLAT").is_ok();
     if gear_ll.is_some() {
         s.data_i32(ctx, "qswap_c", &[gd(qf.0)], &qi);
@@ -3698,7 +3697,7 @@ pub fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e
         let (g1_h, g1_t): (Vec<f16>, &[f32]) = if qkv_i8 {
             // int8 组：norm 回 torch 域（gamma = (1+g) 真值，loader fold 的
             // 替代源）——smooth 行 = s_npz 与 npz 权重面同锚（纯引擎域 s_eff
-            // 因 L00 近零 fold 会爆 f16，2026-09-28 取证）
+            // 因 L00 近零 fold 会爆 f16，实测）
             let g = &i8norms[&format!("prefix/L{:02}", lay_i)][0];
             assert_eq!(g.len(), PW as usize, "g1 长度不符");
             (g.iter().map(|&v| f16::from_f32(v)).collect(), g)
@@ -4032,7 +4031,7 @@ pub fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e
         // GEB_E2E_DUMP_MID=<dir>：prefix 全部输出原始 f16 落盘——含 36 路 kv
         //（slot{2i}=k_l{i} / slot{2i+1}=v_l{i}，行数 = 可见 Pv）+ 调试槽位
         //（GEB_DBG_MID 烤的 OM 才有；槽值可能被复用覆写，判读用「值匹配
-        // 教科书哪级」而非槽序）。T4R 用法：static 侧 dump → 合并进 golden
+        // 教科书哪级」而非槽序）。用法：static 侧 dump → 合并进 golden
         // → dyn 跑时 cmp_mid 打的即逐层 dyn-vs-static 互差
         if let Ok(dir) = std::env::var("GEB_E2E_DUMP_MID") {
             std::fs::create_dir_all(&dir).expect("dump dir");
@@ -4157,7 +4156,7 @@ pub fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e
         }
         // GEB_INT8_RUN=1：活图直跑 vs 存后重载跑（同 binds）——OM 序列化
         // desc（int8/f32 Data 输入）疑点隔离：probe 活图干净而 e2e 重载
-        // 后全炸（2026-09-28 ladder 定位：gate/down 单投影同炸、布局桥
+        // 后全炸（ladder 定位：gate/down 单投影同炸、布局桥
         // N2/N3 干净 ⇒ 嫌疑集中 save/load 往返）
         if std::env::var("GEB_INT8_RUN").is_ok() {
             let run_once = |s: &mut Seg, tag: &str| {
@@ -4243,7 +4242,7 @@ pub fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e
     // 动态分档：与 prefix 段同源（pk/pv 36 路 [-1,KVD]）——但生产 HYBRID
     // 拓扑下 flow 不走 gear（styles 是运行期内容的静态 Data 输入，无法
     // Const 化，而静态 Data 混入动态集会让 SetInputDynamicDims 档位匹配
-    // 失败——spike v3 定罪）：flow 用 per-L 静态 OM 池（GEB_FLOW_POOL，
+    // 失败——实测定罪）：flow 用 per-L 静态 OM 池（GEB_FLOW_POOL，
     // 现存 tl{L}_i8 资产），图按 p_max 构造 binds。GEB_DYN_LLIST_FLOW 仅供
     // gear 化 flow 的隔离实验
     let gear_ll = std::env::var("GEB_DYN_LLIST_FLOW").ok().and_then(|_| dyn_llist());
@@ -4366,7 +4365,7 @@ pub fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e
     };
     // GEB_FLOW_PROJS：flow 段独立子集（缺省回落 GEB_INT8_PROJS——两段共享
     // 同名 env 会在子集实验时把 prefix 段一起切掉，OM 输入数不匹配 rc=-2
-    // 取证 2026-09-30）
+    // 实测）
     let int8_projs: std::collections::HashSet<String> = std::env::var("GEB_FLOW_PROJS")
         .or_else(|_| std::env::var("GEB_INT8_PROJS"))
         .unwrap_or_else(|_| "q,k,v,o,gate,up,down".into())
@@ -4423,8 +4422,8 @@ pub fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e
         }
         println!("[int8] flow int8 预注册完成：{} 层 × {} 投影（native={}）", depth, fi8[0].iter().filter(|x| x.is_some()).count(), int8_native);
     }
-    // 层权重 12 项（GEB_QKV3: 16 项）+ 尾部 agate/mgate 两项（2026-09-23
-    // gate 通路补全）：ascl ash [qkvwt qkvb | qw kw vw qb kb vb] outwt outb
+    // 层权重 12 项（GEB_QKV3: 16 项）+ 尾部 agate/mgate 两项（gate 通路
+    // 补全）：ascl ash [qkvwt qkvb | qw kw vw qb kb vb] outwt outb
     // mscl msh gatewt upwt downwt downb agate mgate（eager qkv 独立投影）
     let mut eager_qkv: Vec<(DeviceBuffer, DeviceBuffer, DeviceBuffer, DeviceBuffer, DeviceBuffer, DeviceBuffer)> = Vec::new();
     let mut layer_bases = Vec::with_capacity(depth);
@@ -4603,7 +4602,7 @@ pub fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e
     let mut normed = s.ada("l0ada", &ain, "zeros", "l0_ascl", "l0_ash", &[HOR, AW]);
     // ⚠ 残差流（未归一化 x）双轨携带——cuda bf16_executor 语义：attention
     // 残差基是 input 本体（fused::adaptive_gate_residual_rms_bf16(
-    // projection, input)），normed 只喂 qkv。2026-09-23 定罪：本段曾以
+    // projection, input)），normed 只喂 qkv。定罪：本段曾以
     // normed 作残差基（两处镜像同 bug，组件 parity 全绿因为参考 eager 同
     // 错）——18 层累积 → v 输出近随机、闭环 0/10；step0_x1 仅 11.5% 是
     // dt=0.1 对 v 误差的掩盖（Δx1=0.1·Δv ⇒ v 已 ~100% 错）
@@ -4825,8 +4824,8 @@ pub fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e
         if let Ok(pool_root) = std::env::var("GEB_FLOW_POOL") {
             let ls = dyn_llist().unwrap_or_else(|| panic!("GEB_FLOW_POOL 需 GEB_DYN_LLIST 档表"));
             // 串行装载（22 只 × ~500MB ≈ 1-2min）。22 线程并行实测崩进程
-            //（aclmdlLoadFromMem 并发上限 <22——3 线程的 OM 预载活；2026-10-12
-            // chip0 crash-loop 取证）。有界并行留待验证
+            //（aclmdlLoadFromMem 并发上限 <22——3 线程的 OM 预载活；
+            // crash-loop 实测）。有界并行留待验证
             let t0p = std::time::Instant::now();
             for &l in &ls {
                 let p = format!("{pool_root}/tl{l}_i8/flow_real.om");
@@ -4873,7 +4872,7 @@ pub fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e
         }
         // styles 预计算缓存：10 步 time 调度固定（1+step·dt）⇒ styles 跨调用
         // 不变，生产口径一次性算 + 常驻（每步 host 现算 ≈173ms/步 是 glue 大头，
-        // 2026-09-21 bring-up 计时定罪）。cond 对拍/替入诊断（bisect）保留在此
+        // bring-up 计时定罪）。cond 对拍/替入诊断（bisect）保留在此
         let tpre = std::time::Instant::now();
         let style_cache: Vec<Vec<Vec<f16>>> = (0..cfg.num_flow_steps)
             .map(|step| {
@@ -4990,7 +4989,7 @@ pub fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e
             );
         }
         st.actions = x;
-        // GEB_E2E_DUMP_MID 同目录落 actions（f16 raw [50,ADIM]——T4R 互差的
+        // GEB_E2E_DUMP_MID 同目录落 actions（f16 raw [50,ADIM]——互差的
         // golden 合并原料：static actions 并进 golden_actions 后，dyn 跑的
         // GOLDEN PARITY 即 actions 级 dyn-vs-static 互差）
         if let Ok(dir) = std::env::var("GEB_E2E_DUMP_MID") {
@@ -6361,7 +6360,7 @@ pub fn optest(be: &AscendBackend, which: &str, real: Option<&Pi05Weights>) {
             println!("bc4 numeric: ge |max|={gm:.3} max_diff={md:.5}");
         }
         // wgt: NZ 权重税裁决——同 mm（[m,k]×[n,k]ᵀ, transpose_x2）三种权重
-        // 形态对拍 + bench。背景（C2 收尾 flow profile）：TransData 占 54%
+        // 形态对拍 + bench。背景（flow profile）：TransData 占 54%
         // = GE 对每个 ND Data 权重每执行插一次设备侧 ND→FRACTAL_NZ 转换
         // （8MB ≈ 130µs @~63GB/s）；torch_npu 的 TransData 100ms 同源税，
         // TorchAir 378ms 靠权重入图逃掉。
@@ -6439,7 +6438,7 @@ pub fn optest(be: &AscendBackend, which: &str, real: Option<&Pi05Weights>) {
                 );
             }
         }
-        // arm: AddRmsNorm 真数据单算（2026-09-21 跨度收口）——x = golden res0
+        // arm: AddRmsNorm 真数据单算（跨度收口）——x = golden res0
         // （层 0 o_proj+残差真值，712×2048），x2=zeros、gamma=ones（fold 约定），
         // GE 图 AddRmsNorm vs aclnn eager add_rms_norm_fp16；落盘供 f64 对拍
         "arm" => {
@@ -6487,7 +6486,7 @@ pub fn optest(be: &AscendBackend, which: &str, real: Option<&Pi05Weights>) {
         // arm32：AddRmsNorm fp32 入参试探——(1) 310P kernel 收不收 fp32；
         // (2) 内部方差是否真 fp32（对拍 host fp32 参考 = torch GemmaRMSNorm
         // ._norm 同式；f32 随机输入的方差在 f16 域会显著失真，max_diff
-        // 量级直接分辨）。norm16 对照定罪 fp32 上浮 = 行为开关（2026-09-22）
+        // 量级直接分辨）。norm16 对照定罪 fp32 上浮 = 行为开关
         "arm32" => {
             let (m, w) = (712i64, 2048i64);
             let mut seed = 0xA7231u32;
@@ -6576,7 +6575,7 @@ pub fn optest(be: &AscendBackend, which: &str, real: Option<&Pi05Weights>) {
         }
         // n32v：NORM32 生产链数值验证（须配 GEB_NORM32=1）——rms32 的
         // Sqrt 漏倒数 bug 正是"只验证编译"漏掉的（NORM32 下 parity 跳过，
-        // 2026-09-22 定罪后补的数值裁判）。三级 tap 二分一次跑全：
+        // 定罪后补的数值裁判）。三级 tap 二分一次跑全：
         //   t1 = Cast 对（x→f32→f16 恒等）——FE 曾报 dst_type GetInt
         //        失败，Cast 语义是头号嫌疑
         //   t2 = 广播倒数链（xf²→ReduceSum→÷w→Rsqrt→Tile 广播）
@@ -6906,7 +6905,7 @@ pub fn optest(be: &AscendBackend, which: &str, real: Option<&Pi05Weights>) {
             println!("GE_N32V_OK");
             return;
         }
-        // oproj: 真数据单算裁决（2026-09-21 定位收口）——norm2 级 2.82% 通道
+        // oproj: 真数据单算裁决（定位收口）——norm2 级 2.82% 通道
         // 结构误差产自 {o_proj mm + res + addrms} 跨度，err_struct 已洗 addrms
         // （无行缩放分量）。本模式：golden m0_vis(712×2048) × L0 o_proj 真权重，
         // GE 图 cst（Const 烤入 = 生产 WCONST 路径）/ nd（Data）两形态 vs
@@ -6963,7 +6962,7 @@ pub fn optest(be: &AscendBackend, which: &str, real: Option<&Pi05Weights>) {
                 std::fs::write(format!("/tmp/oproj_ge{variant}.f16"), &bytes).expect("dump ge");
             }
         }
-        // attn: manual attention 链孤立对拍（2026-09-21 M3 第一动作）。
+        // attn: manual attention 链孤立对拍（e2e 定位第一动作）。
         // 裁决"槽与消费值不一致"：全图 m0 槽回读 0.52% 但 norm2 级 2.82%，
         // oproj 单算（干净上传 buffer）已证 GE mm 逐位 0.000% ⇒ 嫌疑只剩
         // ① 图内 attention 链真实输出本就 2.8% 级（槽值被覆写美化）或
@@ -7278,7 +7277,7 @@ pub fn optest(be: &AscendBackend, which: &str, real: Option<&Pi05Weights>) {
                 }
             }
         }
-        // wmm: 宽 N mm 隔离矩阵（gate 单算，2026-09-21）——attn 最小图已把
+        // wmm: 宽 N mm 隔离矩阵（gate 单算）——attn 最小图已把
         // 漂移钉到 gate/up 段（act 20.8%，垫 M 后 3.05%，f16 累加模拟仅
         // 0.145% ⇒ 非精度）。一次裁决四变量：M∈{712,720} × 权重{Const,Data}
         // × {全宽 N=16384, 拆半 8192×2} + eager aclnn（内部自动垫 M）。
@@ -7498,7 +7497,7 @@ pub fn optest(be: &AscendBackend, which: &str, real: Option<&Pi05Weights>) {
                 std::fs::write(format!("/tmp/wmm3_{dn}.f16"), &bytes).expect("dump");
             }
         }
-        // wmm4: addrms 值域 vs 输入来源裁决（norm 模式已定罪 l1n1 的
+        // wmm4: addrms 值域 vs 输入来源裁决（norm 模式已定罪层 1 的
         // AddRmsNorm：12.9% 值级误差；但 n2-on-res0(|max|559，平方同样
         // >f16) 干净 ⇒ f16 平方饱和解释不了区分度）。golden h1_vis 作
         // Data 直喂 [addrms→k mm→bias]：净 ⇒ 病在"在图中间量作输入"；
@@ -7602,7 +7601,7 @@ pub fn optest(be: &AscendBackend, which: &str, real: Option<&Pi05Weights>) {
                 std::fs::write(format!("/tmp/wmm5_{dn}.f16"), &bytes).expect("dump");
             }
         }
-        // qmd: C2 int8/w8a8 单算 probe（2026-09-24）——310P 注册表命中
+        // qmd: int8/w8a8 单算 probe——310P 注册表命中
         // QuantMatmulDequant（x f16 / quantized_weight int8 / weight_scale
         // f32 → y f16，fused 激活量化→int8 cube→反量化）。三连判决：
         // ① 编译过否（注册表存在 ≠ 预编译 kernel）② 数值（vs 同形 f16
@@ -7617,7 +7616,7 @@ pub fn optest(be: &AscendBackend, which: &str, real: Option<&Pi05Weights>) {
             let m = envi("GEB_QMD_M", 832);
             let k = envi("GEB_QMD_K", 2048);
             // GEB_QMD_N：输出维覆盖（合成链）——n=256（KVD，k/v 投影）的
-            // legacy kernel 分支疑点（2026-09-28：生产 k-only 复现 1300×）
+            // legacy kernel 分支疑点（生产 k-only 复现 1300×）
             let n = envi("GEB_QMD_N", 8192);
             let tw = std::env::var("GEB_QMD_TW").unwrap_or_else(|_| "1".into()) == "1";
             let mut seed = 0xC2C2u32;
@@ -7668,7 +7667,7 @@ pub fn optest(be: &AscendBackend, which: &str, real: Option<&Pi05Weights>) {
                 (x, w, p, n2)
             } else {
                 // rand_f16 的第三参是除数（值域 U(±100/div)）——div=1 时 y 饱和
-                // 65504（C1 探针数据教训同源），div=100 → U(±1) 健康
+                // 65504（探针数据教训同源），div=100 → U(±1) 健康
                 (
                     rand_f16((m * k) as usize, &mut seed, 100.0),
                     rand_f16((n * k) as usize, &mut seed, 100.0), // 逻辑 [n,k] 行=输出通道

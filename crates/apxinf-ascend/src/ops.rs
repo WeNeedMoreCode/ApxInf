@@ -12,7 +12,7 @@ const CUBE_MATH_KEEP_DTYPE: i8 = 1;
 
 /// M alignment for the aclnn matmul kernels on 310P3: with wide N
 /// (>=12288), any M that is not a multiple of 16 trips an aicore tiling
-/// fault (507015 at sync) on BOTH descriptors (m-ladder probe 2026-09-18:
+/// fault (507015 at sync) on BOTH descriptors (m-ladder probe:
 /// 812/820/828 x N16384/32768 all fault, 832 all correct; N<=8192 is
 /// immune). Zero-pad M up to the next multiple, slice the real rows back.
 const MATMUL_M_ALIGN: i64 = 16;
@@ -201,7 +201,7 @@ pub fn cat_fp16(
     // Ownership: aclDestroyTensorList releases the child descriptors too;
     // dropping our AclTensor wrappers as well would double-destroy and
     // corrupt the process's acl tensor registry (later ops segfault in
-    // their plan phase -- bisected 2026-09-17).
+    // their plan phase -- bisected).
     std::mem::forget(descs);
     unsafe { ffi::aclDestroyTensorList(list) };
     Ok(out)
@@ -300,7 +300,7 @@ pub fn bias_add_fp16(
 
 /// Row-broadcast gate multiply: y[r,:] = x[r,:] * gate[:] (gate [1, cols]).
 /// The ada-norm gate path of openpi's `_gated_residual` (residual + branch*gate)
-/// -- 2026-09-23: the engine previously dropped the third chunk of dense(cond)
+/// -- the engine previously dropped the third chunk of dense(cond)
 /// entirely; this op restores it for the eager mirror.
 pub fn gate_mul_fp16(
     ctx: &AscendContext,
@@ -491,7 +491,7 @@ pub fn rope_rotate_half_fp16(
 /// (even rows = first half channels), so rotate-half becomes a
 /// neighbouring-row swap -- an axis-0 gather on contiguous rows instead
 /// of the axis-1 channel gather that cost 6.5ms per language layer on
-/// 310P3 (49x its bandwidth floor, msprof 2026-09-19). cos/sin pos
+/// 310P3 (49x its bandwidth floor, msprof). cos/sin pos
 /// tables take the same flat view: cos repeats over halves host-side and
 /// sin carries the folded signs, so the flattened layouts line up.
 /// swap_idx: i32 [rows*2] = 1,0,3,2,...
@@ -528,7 +528,7 @@ pub fn rope_rotate_half_flat_fp16(
 }
 
 /// out = self + 1.0 * t1 * t2, elementwise fp16 via aclnnAddcmul.
-/// ⚠ Measured a wash vs mul+add on 310P3 (2026-09-19: parity drifts to
+/// ⚠ Measured a wash vs mul+add on 310P3 (parity drifts to
 /// 0.048 from the different fp16 accumulation order, no time win) --
 /// kept for reference, not used by production paths.
 #[allow(dead_code)]
@@ -562,7 +562,7 @@ pub fn addcmul_fp16(
 /// GeGLU on a fused [rows, 2*cols] projection: splits along dim 1 and
 /// computes gelu(first half) * second half in one kernel. `tanh_approx`
 /// mirrors the GeluV2 selector (PaliGemma mlp uses tanh).
-/// ⚠ HANGS on 310P3 (2026-09-19: two-stage call never returns; torch_npu
+/// ⚠ HANGS on 310P3 (two-stage call never returns; torch_npu
 /// ships no dispatch for it and GE graphs never fuse it) -- do not wire
 /// into production paths on this SoC.
 #[allow(dead_code)]

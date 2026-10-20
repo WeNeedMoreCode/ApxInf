@@ -911,7 +911,7 @@ impl GeGraph {
         Ok(())
     }
 
-    // ---- 动态分档（ge.dynamicDims OM；spike v1/v2 实证配方）----
+    // ---- 动态分档（ge.dynamicDims OM；实证配方）----
 
     /// 档数（静态 OM = 0）。
     pub fn gear_count(&self) -> Result<usize> {
@@ -957,7 +957,7 @@ impl GeGraph {
     }
 
     /// 档位执行：dyn_dims = 全部动态输入的维（拼接序；多动态输入必须一次
-    /// 调用带全维——单输入单独调会 145012，spike v2 S2 定式）。静态 OM
+    /// 调用带全维——单输入单独调会 145012，S2 定式）。静态 OM
     /// （档数 0）等价 run（dyn_dims 忽略）——调用方可无分支切换。
     pub fn run_gear(
         &self,
@@ -1009,7 +1009,7 @@ impl GeGraph {
     }
 
     /// 最近一次执行档的输出维（rank≥3 且非末维动态时消费按最大档 stride，
-    /// spike v2 实证）。
+    /// 实证）。
     pub fn cur_output_dims(&self, idx: usize) -> Result<Vec<i64>> {
         type F = unsafe extern "C" fn(i64, i32, *mut i64, i32) -> i32;
         let l = lib().map_err(|e| {

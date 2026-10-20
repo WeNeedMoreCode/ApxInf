@@ -897,10 +897,10 @@ mod ge_serve_py {
     fn ge_init_once() -> PyResult<()> {
         // ⚠ 只能在 allow_threads（无 GIL）区内调用：te 的 py_decouple
         // static path 在 PyGILState_Check()!=0 时 TE_PyEval_SaveThread()
-        // 会偷走调用者的 GIL（GIL 劫持 = open 尾 SEGV 真凶，gdb 定罪
-        // 2026-09-24）。并行编译 forkserver 默认关闭：python 宿主内它与
+        // 会偷走调用者的 GIL（GIL 劫持 = open 尾 SEGV 真凶，gdb 定罪）。
+        // 并行编译 forkserver 默认关闭：python 宿主内它与
         // multiprocessing 相克，是 open 中途静默死亡的必要条件（判决实验
-        // 见 summary/2026-09-24_pyhost-ge-survival-hunt）。
+        // 归档在本地工作日志）。
         if std::env::var("MIN_COMPILE_RESOURCE_USAGE_CTRL")
             .unwrap_or_default()
             .is_empty()
@@ -964,8 +964,7 @@ mod ge_serve_py {
             // 宿主内 dlsym 命中宿主符号）在 PyGILState_Check()!=0 时
             // TE_PyEval_SaveThread() 会偷走 PyO3 持有的 GIL 并存走 thread
             // state；open 完成后 into_py 分配 python 对象时 pymalloc
-            // get_state() 读烂状态直接 SEGV（gdb 栈定罪 2026-09-24，见
-            // summary/2026-09-24_pyhost-ge-survival-hunt）。无 GIL 进入 ⇒
+            // get_state() 读烂状态直接 SEGV（gdb 栈定罪）。无 GIL 进入 ⇒
             // te 不触发 SaveThread，其内部 python 调用自走
             // PyGILState_Ensure/Release，宿主线程状态全程完好。
             let (backend, serve) = py.allow_threads(|| -> PyResult<(AscendBackend, GeServe)> {
@@ -973,7 +972,7 @@ mod ge_serve_py {
                 // serve-min（GEB_CKPT_SERVE_MIN=1）：零物化骨架 + Data 源真值
                 // 的选择性加载（与 probe 驱动同 env 约定）。PyO3 open 只有
                 // GEB_LOAD 面（不 bake），无 GEB_SAVE 护栏需求；inproc 全链
-                // 冷启动由此砍掉 ckpt 数学段的大头（2026-10-13）。
+                // 冷启动由此砍掉 ckpt 数学段的大头。
                 let real = if std::env::var("GEB_CKPT_SERVE_MIN").is_ok() {
                     Pi05Weights::from_safetensors_serve(&Pi05Config::default(), &ckpt)
                 } else {

@@ -89,7 +89,7 @@ pub struct AscendCaches {
     pos_idx: std::collections::HashMap<(i64, i64, i64), Arc<DeviceBuffer>>,
     /// Gathered rope cos/sin rows [tokens*heads, d] keyed by (tokens,
     /// heads, offset, theta bits, d) -- pure constants; re-gathering per
-    /// layer cost 0.4-6.5ms each (msprof 2026-09-19).
+    /// layer cost 0.4-6.5ms each (msprof).
     rope_pos: std::collections::HashMap<(i64, i64, i64, u32, i64), (Arc<DeviceBuffer>, Arc<DeviceBuffer>)>,
     /// Neighbour-swap index (1,0,3,2,...) for the flat rotate-half
     /// gather, keyed by flat row count.
@@ -134,7 +134,7 @@ impl Default for AscendCaches {
 /// mat2 descriptor works in isolation but reads WRONG DATA (rel 0.79)
 /// after an AddRmsNorm has run, while the transposed-b view ([k, n]
 /// shape over physical [n, k], stride [1, k] -- torch's `a @ w.t()`
-/// layout) is both immune and numerically correct (probe 2026-09-18).
+/// layout) is both immune and numerically correct (probe).
 /// So every linear weight is host-transposed once at first use and the
 /// matmul runs through the transposed path.
 pub struct NzCache {
@@ -439,7 +439,7 @@ fn apply_rope_rows(
         }
     };
     // flat-view rotate-half: axis-0 contiguous row swap instead of the
-    // axis-1 channel gather (6.5ms per language layer, msprof 2026-09-19)
+    // axis-1 channel gather (6.5ms per language layer, msprof)
     acl(aops::rope_rotate_half_flat_fp16(ctx, stream, x, rows, d, &cos_pos, &sin_pos, &swap_idx))
 }
 
@@ -802,7 +802,7 @@ fn zeros_scale_buf(be: &AscendBackend, cache: &mut AscendCaches, cols: usize) ->
 
 /// `_gated_residual` 的 gate 广播矩阵（style 第三段 s2 → [rows, cols] 复制，
 /// 按 (style 指针, rows) 缓存，跨步恒定）。M2 期 eager 残差裸加是技术债
-/// （GE flow 的 gatew 2026-09-23 补齐时 eager 未跟）——2026-09-28 对齐：
+/// （GE flow 的 gatew 补齐时 eager 未跟）——对齐：
 /// residual + branch·gate（与 GE flow 段 agate/mgate 同源）。
 fn style_gate_mat(
     be: &AscendBackend,
@@ -960,7 +960,7 @@ pub fn action_layer_ascend(
     let proj = bias_add(be, &proj, weights.output.bias.as_ref(), tokens, width)?;
     // 残差基 = input 本体（cuda bf16_executor 语义：fused::
     // adaptive_gate_residual_rms_bf16(projection, input)）——曾误用
-    // normalized 作残差基，2026-09-23 与 ge_model_probe flow 段同源定罪。
+    // normalized 作残差基，与 ge_model_probe flow 段同源定罪。
     // 分支 ×gate（attention style 第三段；_gated_residual 全语义）
     let agate = style_gate_mat(be, cache, attention_style, tokens, width)?;
     let gated = aq::mul(be, &proj, &agate, &[tokens, width])?;

@@ -259,8 +259,8 @@ impl Pi05Weights {
     /// compilation, and the probe driver refuses `GEB_CKPT_SERVE_MIN` on a bake
     /// (`GEB_SAVE`) path so placeholder weights can't silently reach an OM.
     /// Cuts the 61s single-threaded from_map math over 812 tensors to ~2s
-    /// (2026-10-12 cold-start breakdown: io/copy 5.5s is untouched). The
-    /// 2026-10-13 follow-up zeroes the skeleton fill (`synthetic_skeleton`:
+    /// (cold-start breakdown: io/copy 5.5s is untouched). The
+    /// follow-up zeroes the skeleton fill (`synthetic_skeleton`:
     /// placeholders are never read, and untouched zero pages cost no RSS)
     /// and parallelizes the 39 style transposes that then dominate.
     pub fn from_map_serve(config: &Pi05Config, mut tensors: HashMap<String, Tensor>) -> Result<Self> {
@@ -308,7 +308,7 @@ impl Pi05Weights {
         weights.action_in.bias = take_opt(&mut tensors, "action_in_proj.bias");
         weights.action_out.bias = take_opt(&mut tensors, "action_out_proj.bias");
         // vision 段 Data 输入源（binds 物化消费——mm 权重仍占位：WCONST
-        // 烤入 OM 不走 binds；2026-10-12 tmp 桶 vis_head 分岔定位的补遗：
+        // 烤入 OM 不走 binds；tmp 桶 vis_head 分岔定位的补遗：
         // patch/pos/LN/qkv/fc bias 全部经 s.data() 进 binds）
         let vp = format!("{ROOT}.paligemma.model.vision_tower.vision_model");
         weights.vision.patch_embedding.bias =

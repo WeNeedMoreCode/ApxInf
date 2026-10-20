@@ -304,7 +304,7 @@ extern "C" {
     // aclnnGelu core-dumps and aclnnFastGelu returns 161002
     // ("not implemented, dtype support list []") on every dtype and both
     // CANN 8.5.1/9.0.1 -- those op binaries simply do not ship for this
-    // SoC (proven via CANN debug logs, 2026-09-17).
+    // SoC (proven via CANN debug logs).
     pub fn aclnnGeluV2GetWorkspaceSize(
         x: *mut c_void,
         approximate: i64,
@@ -321,7 +321,7 @@ extern "C" {
 
     // aclnnop/aclnn_addcmul.h: out = self + value * tensor1 * tensor2
     // (torch Addcmul). Lets ada-norm fold its scale-mul and shift-add
-    // into one kernel (msprof 2026-09-19: the separate add was 78ms/infer).
+    // into one kernel (msprof: the separate add was 78ms/infer).
     pub fn aclnnAddcmulGetWorkspaceSize(
         selfT: *mut c_void,
         tensor1: *mut c_void,
@@ -448,8 +448,7 @@ extern "C" {
     // acl_rt.h -- ACLGraph (model Runtime Instance): capture/replay, the
     // Ascend counterpart of CUDA Graphs. Runtime-gated by CANN version:
     // symbols exist in 8.5.1 but capture is rejected (aclError 207000);
-    // verified working on 310P3 under CANN 9.0.1 (probe
-    // dev_logs/aclgraph_probe/, 2026-09-17).
+    // verified working on 310P3 under CANN 9.0.1.
     pub fn aclmdlRICaptureBegin(stream: *mut c_void, mode: i32) -> i32;
     pub fn aclmdlRICaptureEnd(stream: *mut c_void, modelRI: *mut *mut c_void) -> i32;
     pub fn aclmdlRICaptureGetInfo(

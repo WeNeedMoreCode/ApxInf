@@ -35,7 +35,7 @@ pub struct AscendContext {
     /// Reuse pool for short-lived scratch buffers that feed async ops.
     /// aclrtFree does not wait for the stream, so dropping a buffer whose
     /// async consumers are still queued is a use-after-free (sdma copy
-    /// error 0x217 under deep queues, 2026-09-18 bench). Pooling by size
+    /// error 0x217 under deep queues, bench). Pooling by size
     /// keeps every buffer alive forever; single-stream execution makes
     /// same-size reuse sequentially ordered (a kernel's reads finish
     /// before the next same-size writer's writes begin).
@@ -394,7 +394,7 @@ impl DeviceBuffer {
 /// Buffers whose async consumers may still sit in the stream queue.
 /// aclrtFree is NOT stream-ordered: freeing immediately lets a later
 /// malloc reuse the address while a kernel/memcpy still touches it
-/// (sdma copy error 0x217 under deep queues, bench 2026-09-18). Drops
+/// (sdma copy error 0x217 under deep queues, bench). Drops
 /// park here; the next successful stream synchronize flushes for real.
 /// Raw device pointer + length, parked until the stream drains. The
 /// wrapper makes the static's Send requirement honest (ACL device
