@@ -2,9 +2,7 @@
 
 use std::sync::Arc;
 
-use apxinf_core::{Backend, Device, Result};
-#[cfg(not(feature = "cuda"))]
-use apxinf_core::Error;
+use apxinf_core::{Backend, Device, Error, Result};
 
 pub(crate) fn create_backend(device: Device) -> Result<Arc<dyn Backend>> {
     match device {
@@ -13,21 +11,11 @@ pub(crate) fn create_backend(device: Device) -> Result<Arc<dyn Backend>> {
         Device::Cuda(id) => cuda::create(id),
         #[cfg(not(feature = "cuda"))]
         Device::Cuda(_) => Err(Error::Other("CUDA support not compiled in".into())),
-        #[cfg(feature = "ascend")]
-        Device::Ascend(id) => ascend::create(id),
-        #[cfg(not(feature = "ascend"))]
-        Device::Ascend(_) => Err(Error::Other("Ascend support not compiled in".into())),
-    }
-}
-
-#[cfg(feature = "ascend")]
-pub(crate) mod ascend {
-    use std::sync::Arc;
-
-    use apxinf_core::{Backend, Result};
-
-    pub(crate) fn create(device_id: usize) -> Result<Arc<dyn Backend>> {
-        Ok(Arc::new(apxinf_ascend::AscendBackend::new(device_id)?))
+        // Ascend inference runs through the GE OM engine (pi05::ascend_ge,
+        // constructed directly), not the portable Backend trait factory.
+        Device::Ascend(_) => Err(Error::Other(
+            "Ascend runs via the GE OM engine, not the portable Backend factory".into(),
+        )),
     }
 }
 

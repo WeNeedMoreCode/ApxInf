@@ -16,14 +16,12 @@ pub mod backend;
 pub mod context;
 pub mod ffi;
 pub mod ge_builder;
-pub mod graph;
 pub mod ops;
 pub mod stream;
 pub mod tensor;
 
 pub use backend::AscendBackend;
 pub use context::{flush_pending_frees, AscendContext, DeviceBuffer};
-pub use graph::AscendGraph;
 pub use stream::AscendStream;
 pub use tensor::AclTensor;
 

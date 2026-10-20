@@ -742,21 +742,6 @@ impl Seg {
         name.to_string()
     }
 
-    /// NZ 格式 Data 输入（绑定 buffer 必须已是 host_nz_reorder 产物）
-    fn data_nz(&mut self, name: &str, dims_nz: &[i64], buf: DeviceBuffer) -> String {
-        self.g
-            .add_data_fmt(name, self.idx, dims_nz, Dtype::Fp16, "FRACTAL_NZ")
-            .unwrap();
-        self.idx += 1;
-        self.names.push(name.to_string());
-        self.shapes.push(dims_nz.to_vec());
-        self.binds.push(buf);
-        self.bind_names.push(name.to_string());
-        self.data_inputs.push(self.binds.len() - 1);
-        self.datas.insert(name.to_string());
-        name.to_string()
-    }
-
     /// dst.port ← src（Data 用默认解析；算子用显式输出端口）
     fn wire(&self, dst: &str, port: &str, src: &str) {
         if self.datas.contains(src) {
@@ -796,10 +781,10 @@ impl Seg {
         self.g.set_input_desc(name, "x", a_dims, Dtype::Fp16).unwrap();
         self.g.set_input_desc(name, "quantized_weight", w_dims, Dtype::Int8).unwrap();
         self.g.set_input_desc(name, "weight_scale", &[n], Dtype::Fp32).unwrap();
-        if let Some(sm_name) = sm {
+        if sm.is_some() {
             self.g.set_input_desc(name, "smooth_scale", &[a_dims[1]], Dtype::Fp16).unwrap();
         }
-        if let Some(zb_name) = zb {
+        if zb.is_some() {
             self.g.set_input_desc(name, "bias", &[n], Dtype::Int32).unwrap();
         }
         self.g.set_output_desc(name, "y", o, Dtype::Fp16).unwrap();
@@ -1510,7 +1495,7 @@ impl Seg {
         // payload 做逐请求选档；names/shapes 此刻已定）
         self.compose_gear_payloads();
         if std::env::var("GEB_LOAD").is_ok() {
-            // 缓存加载模式：跳过编译，parity_and_bench 里替换为磁盘 OM
+            // 缓存加载模式：跳过编译，改用磁盘 OM
             return;
         }
         if std::env::var("GEB_SEG").ok().as_deref() == Some("e2e") {
@@ -1574,169 +1559,6 @@ impl Seg {
 // 通用运行：eager 参考跑完 → GE run → 对拍 → bench → OM 落盘
 // ---------------------------------------------------------------------------
 
-/// 对拍 + bench 通用尾段。outs_elem：每个图输出的元素数。
-pub fn parity_and_bench(
-    ctx: &AscendContext,
-    stream: &AscendStream,
-    seg: &mut Seg,
-    tag: &str,
-    out_elems: &[usize],
-    eager: &dyn Fn(&[DeviceBuffer]) -> Vec<DeviceBuffer>,
-    bench: bool,
-) {
-    // gear 模式：eager 参考与 row_bcast/动态 binds 布局不兼容（bias 行
-    // 重复物化、rope 表 p_max 全量），且多档对拍需逐档参考——数值裁判走
-    // e2e golden 与行为 eval。烤桶 OM 落盘照常（save 只需 build 产物）
-    if gear_mode() {
-        println!("[parity] gear 模式：跳过 eager 对拍（裁判 = e2e golden + 行为 eval）");
-        if let Ok(p) = std::env::var("GEB_SAVE") {
-            seg.g.save(&p).expect("save om (gear)");
-            println!("OM saved: {p}");
-        }
-        return;
-    }
-    // GEB_NORM32：GE 是 fp32 方差语义、eager 参考（aclnnAddRmsNorm）是
-    // f16——对拍必分叉；且标量池前插使 eager 的层索引错位。单段模式
-    // 下跳过对拍（数值裁判走 GEB_OPTEST=n32v + e2e 路径的 golden 对拍）
-    if norm32_enabled() {
-        println!(
-            "[parity] GEB_NORM32 开启：跳过 eager 对拍（f32 vs f16 语义差；golden 对拍走 e2e）"
-        );
-        // 烤桶路径：OM 落盘不能被跳过（tl144n32 全靠这里；save 只需
-        // build 产物，不依赖 run）
-        if let Ok(p) = std::env::var("GEB_SAVE") {
-            seg.g.save(&p).expect("save om (n32)");
-            println!("OM saved: {p}");
-        }
-        return;
-    }
-    let n_in = seg.ins().len();
-    // 缓存加载（替代编译；数据/图构造仍跑——权重 buffer 是运行输入）
-    if let Ok(path) = std::env::var("GEB_LOAD") {
-        println!("loading OM from {path}");
-        seg.g = ge_builder::load(&path).expect("load om");
-    }
-    // eager 参考先跑（binds 只读借用）
-    let mem = |tag: &str| {
-        let total: usize = seg.binds.iter().map(|b| b.len()).sum();
-        if let Ok(o) = std::process::Command::new("npu-smi").arg("info").output() {
-            let txt = String::from_utf8_lossy(&o.stdout);
-            for l in txt.lines().filter(|l| l.contains("Memory-Usage") || l.contains("/ 4")) {
-                let _ = l;
-            }
-            let _ = &txt;
-        }
-        println!("[mem] {tag}: binds total = {:.1} MB", total as f64 / 1e6);
-    };
-    mem("before-eager");
-    let probe_malloc = |tag: &str| match ctx.malloc(16) {
-        Ok(_) => println!("[malloc-probe] {tag}: ok"),
-        Err(e) => println!("[malloc-probe] {tag}: FAIL {e:?}"),
-    };
-    probe_malloc("before-eager");
-    let refs = eager(&seg.binds);
-    if let Err(e) = stream.synchronize() {
-        println!("[sync-err after eager] {e:?}");
-    }
-    probe_malloc("after-eager");
-    mem("after-eager");
-
-    // GE run（加载缓存或已 build 的图；GEB_WCONST 时 ins 只含真图输入）
-    let n_out = seg.g.num_outputs().unwrap();
-    for i in 0..n_out {
-        println!("[out-dims] {i}: size={} dims={:?}", seg.g.output_size(i).unwrap_or(0), seg.g.output_dims(i).unwrap_or_default());
-    }
-    let outs: Vec<DeviceBuffer> = (0..n_out)
-        .map(|i| ctx.malloc(seg.g.output_size(i).unwrap().max(16)).expect("out malloc"))
-        .collect();
-    let out_refs: Vec<&DeviceBuffer> = outs.iter().collect();
-    // gear 模式 bring-up = max 档内容 → 末档执行（静态 = run_seg 0 档）
-    seg.run_seg(seg.gear_payloads.len().saturating_sub(1), &out_refs, stream)
-        .expect("ge run");
-    drop(stream.synchronize());
-
-    // GEB_DBG：打印每个图输出缓冲的 |max| + head（层 0 各级绑成图输出后
-    // 与 eager 的 GEB_TRACE 逐级对照用——|max| 同但 head 异 = 排列错位类）
-    if std::env::var("GEB_DBG").is_ok() {
-        for i in 0..n_out {
-            let n = (seg.g.output_size(i).unwrap_or(0) / 2).min(4_000_000) as usize;
-            if n == 0 {
-                continue;
-            }
-            let h = download_f16(ctx, &outs[i], n);
-            let m = h.iter().fold(0f32, |m, v| m.max(v.to_f32().abs()));
-            let head: Vec<f32> = h[..6.min(h.len())].iter().map(|v| v.to_f32()).collect();
-            println!("[dbg out{i}] n={n} |max|={m:.4} head={head:?}");
-        }
-    }
-
-    // 对拍（主输出——LayerNormV4 的 mean/rstd aux 输出跳过）。断言用
-    // 相对误差：GE 静态 OM 与 eager aclnn 允许不同 tiling 变体（这正是
-    // C 路线的性能来源），单算子/小图逐位一致（已验证），全量多层图
-    // 是稳定的变体差（prefix 18 层累计 ~15% 内）
-    let mut worst = 0f32;
-    let mut worst_rel = 0f32;
-    for (i, elems) in out_elems.iter().take(refs.len()).enumerate() {
-        let ge_h = download_f16(ctx, &outs[i], *elems);
-        let ref_h = download_f16(ctx, &refs[i], *elems);
-        let mut md = 0f32;
-        for (a, b) in ge_h.iter().zip(&ref_h) {
-            let d = (a.to_f32() - b.to_f32()).abs();
-            if d > md {
-                md = d;
-            }
-        }
-        let rm = ref_h.iter().fold(0f32, |m, v| m.max(v.to_f32().abs()));
-        let rel = if rm > 0.0 { md / rm } else { md };
-        println!("parity[{tag} out{i}] max_diff={md:.5} (ref |max|={rm:.3}, rel={:.1}%)", rel * 100.0);
-        worst = worst.max(md);
-        worst_rel = worst_rel.max(rel);
-    }
-    if worst_rel >= 0.20 {
-        // bench 模式下降级为警告（GE 静态 tiling 与 eager 的逐层漂移是
-        // 架构性合法差，全深对拍口径待升级为 fp32 oracle）
-        if bench {
-            println!("{tag} parity drift {:.1}% (>=20%, oracle 对拍待做；bench 继续)", worst_rel * 100.0);
-        } else {
-            panic!("{tag} GE OM diverged: worst_rel={:.1}%", worst_rel * 100.0);
-        }
-    }
-    println!("{tag}_PARITY_OK n_in={n_in} worst={worst:.5} rel={:.1}%", worst_rel * 100.0);
-
-    // OM 落盘
-    if let Ok(p) = std::env::var("GEB_SAVE") {
-        seg.g.save(&p).expect("save om");
-        println!("OM saved: {p}");
-    }
-
-    if bench {
-        // GEB_ROUNDS/GEB_PER：bench 规模参数化——假设检验用小配置
-        // （如 ROUNDS=5 PER=3，十几秒出数），全深度留作最终确认
-        let rounds = envi("GEB_ROUNDS", 30) as usize;
-        let per = envi("GEB_PER", 10).max(1) as usize;
-        // rounds=3 时 min(3) 会把全部轮次吃成 warmup → ts 空仓 panic；
-        // 至少留 1 个样本轮
-        let skip = rounds.saturating_sub(1).min(3);
-        let gi = seg.gear_payloads.len().saturating_sub(1);
-        for _ in 0..3 {
-            seg.run_seg(gi, &out_refs, stream).unwrap();
-        }
-        drop(stream.synchronize());
-        let mut ts = Vec::new();
-        for r in 0..rounds {
-            let t0 = std::time::Instant::now();
-            for _ in 0..per {
-                seg.run_seg(gi, &out_refs, stream).unwrap();
-            }
-            drop(stream.synchronize());
-            if r >= skip {
-                ts.push(t0.elapsed().as_secs_f64() * 1000.0 / per as f64);
-            }
-        }
-        ts.sort_by(|a, b| a.partial_cmp(b).unwrap());
-        println!("{tag} GE OM: {:.4} ms (median/{per}, rounds={rounds})", ts[ts.len() / 2]);
-    }
-}
 
 // ---------------------------------------------------------------------------
 // e2e：三段 OM 接真实推理链（GEB_SEG=e2e，进程内链式、host 中转）
@@ -2693,10 +2515,10 @@ pub fn seg_e2e(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>) {
         println!("[e2e] replay: {path} ×{n} 帧（token 等长断言已过）");
     }
     let t0 = std::time::Instant::now();
-    seg_vision(be, false, Some(real), Some(&mut st));
+    seg_vision(be, Some(real), Some(&mut st));
     let t1 = std::time::Instant::now();
     println!("[e2e] vision 段 {:?}（含 OM 加载）", t1.duration_since(t0));
-    seg_prefix(be, false, Some(real), Some(&mut st));
+    seg_prefix(be, Some(real), Some(&mut st));
     let t2 = std::time::Instant::now();
     println!("[e2e] prefix 段 {:?}（含 OM 加载 + 2.1GB 嵌入查表）", t2.duration_since(t1));
     if std::env::var("GEB_E2E_STOP").ok().as_deref() == Some("prefix") {
@@ -2705,7 +2527,7 @@ pub fn seg_e2e(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>) {
         println!("GE_E2E_PROBE_OK");
         return;
     }
-    seg_flow(be, false, Some(real), Some(&mut st));
+    seg_flow(be, Some(real), Some(&mut st));
     let t3 = std::time::Instant::now();
     println!("[e2e] flow 段 {:?}（含 OM 加载 + 10 步）", t3.duration_since(t2));
     let head: Vec<f32> = st.actions[..8.min(st.actions.len())].iter().map(|v| v.to_f32()).collect();
@@ -2868,7 +2690,7 @@ pub fn serve_loop(be: &AscendBackend, st: &mut E2eStage, dir: &str, tokens: usiz
 // 序列与 eager aclnn 组合（ops.rs）同构
 // ---------------------------------------------------------------------------
 
-pub fn seg_vision(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e: Option<&mut E2eStage>) {
+pub fn seg_vision(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&mut E2eStage>) {
     let ctx = be.ctx();
     let stream = be.stream();
     let depth = envi("GEB_DEPTH_VISION", envi("GEB_DEPTH", 27)) as usize;
@@ -3160,79 +2982,6 @@ pub fn seg_vision(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e
     s.finish(&fin);
     println!("vision OM built: depth={depth} n_in={} n_out=1", s.ins().len());
 
-    // ---- eager 参考（vision_layer_ascend 序列镜像；qkv 独立投影）----
-    let trace = std::env::var("GEB_TRACE").is_ok();
-    let eager = |b: &[DeviceBuffer]| -> Vec<DeviceBuffer> {
-        let mut mx = |tag: &str, buf: &DeviceBuffer| {
-            if trace {
-                // d2h memcpy 非流序——先同步再读，否则竞态脏读（l0 out head
-                // 全 0 实证：大 kernel 后下载抢跑）
-                drop(stream.synchronize());
-                let n = buf.len() / 2;
-                let h = download_f16(ctx, buf, n);
-                let m = h.iter().fold(0f32, |m, v| m.max(v.to_f32().abs()));
-                let head: Vec<f32> = h[..6.min(h.len())].iter().map(|v| v.to_f32()).collect();
-                println!("[trace] {tag}: |max|={m:.3} head={head:?}");
-                if tag == "emb" {
-                    let row: Vec<f32> = h[..1152].iter().map(|v| v.to_f32()).collect();
-                    let mean = row.iter().sum::<f32>() / row.len() as f32;
-                    let var = row.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>() / row.len() as f32;
-                    println!("[trace] emb row0: mean={mean:.5} var={var:.3e} head={:?}", &row[..6]);
-                }
-            }
-        };
-        let emb = aops::matmul_b_t_fp16(ctx, stream, &b[0], [t, V_PATCH_W], &b[1], V_PATCH_W, VW).unwrap();
-        let emb = aops::bias_add_fp16(ctx, stream, &emb, &b[2], t, VW).unwrap();
-        let mut h = aops::add_fp16(ctx, stream, &emb, &b[3], &[t, VW]).unwrap();
-        mx("emb", &h);
-        let zeros = &b[4];
-        for li in 0..depth {
-            // qkv3 层内输入布局：n1w,n1b,qw,kw,vw,qb,kb,vb,outwt,outb,
-            // n2w,n2b,fc1wt,fc1b,fc2wt,fc2b（16 项）；默认 12 项
-            let w = &b[layer_bases[li]..layer_bases[li] + if qkv3 { 16 } else { 12 }];
-            let (ow, ob, f1w, f1b, f2w, f2b) = if qkv3 { (8, 9, 12, 13, 14, 15) } else { (4, 5, 8, 9, 10, 11) };
-            let (wq, wk, wv, bq, bk, bv) = &eager_qkv[li];
-            let (n1w_h, n1b_h, n2w_h, n2b_h) = &eager_norms[li];
-            let normed = host_ln(ctx, stream, &h, n1w_h, n1b_h, t, VW);
-            mx(&format!("l{li} ln1"), &normed);
-            let q = aops::bias_add_fp16(ctx, stream,
-                &aops::matmul_b_t_fp16(ctx, stream, &normed, [t, VW], wq, VW, vqd).unwrap(), bq, t, vqd).unwrap();
-            let k = aops::bias_add_fp16(ctx, stream,
-                &aops::matmul_b_t_fp16(ctx, stream, &normed, [t, VW], wk, VW, vqd).unwrap(), bk, t, vqd).unwrap();
-            let v = aops::bias_add_fp16(ctx, stream,
-                &aops::matmul_b_t_fp16(ctx, stream, &normed, [t, VW], wv, VW, vqd).unwrap(), bv, t, vqd).unwrap();
-            let attn = aops::prompt_flash_attention_bsh_batch_fp16(
-                ctx, stream, &q, &k, &v, VIEWS, VPV, V_HEADS, V_HEADS, V_HD, None).unwrap();
-            mx(&format!("l{li} attn"), &attn);
-            let proj = aops::matmul_b_t_fp16(ctx, stream, &attn, [t, vqd], &w[ow], vqd, VW).unwrap();
-            let proj = aops::bias_add_fp16(ctx, stream, &proj, &w[ob], t, VW).unwrap();
-            let res1 = aops::add_fp16(ctx, stream, &proj, &h, &[t, VW]).unwrap();
-            mx(&format!("l{li} res1"), &res1);
-            let norm2 = host_ln(ctx, stream, &res1, n2w_h, n2b_h, t, VW);
-            mx(&format!("l{li} ln2"), &norm2);
-            let act = aops::matmul_b_t_fp16(ctx, stream, &norm2, [t, VW], &w[f1w], VW, V_INTER).unwrap();
-            let act = aops::bias_add_fp16(ctx, stream, &act, &w[f1b], t, V_INTER).unwrap();
-            mx(&format!("l{li} fc1b"), &act);
-            let act = aops::gelu_fp16(ctx, stream, &act, &[t, V_INTER], false).unwrap();
-            mx(&format!("l{li} act"), &act);
-            let out = aops::matmul_b_t_fp16(ctx, stream, &act, [t, V_INTER], &w[f2w], V_INTER, VW).unwrap();
-            let out = aops::bias_add_fp16(ctx, stream, &out, &w[f2b], t, VW).unwrap();
-            h = aops::add_fp16(ctx, stream, &out, &res1, &[t, VW]).unwrap();
-            mx(&format!("l{li} out"), &h);
-        }
-        let n = b.len();
-        let normed = host_ln(ctx, stream, &h, &pnw_h, &pnb_h, t, VW);
-        let proj = aops::matmul_b_t_fp16(ctx, stream, &normed, [t, VW], &b[n - 2], VW, PW).unwrap();
-        let fin = aops::bias_add_fp16(ctx, stream, &proj, &b[n - 1], t, PW).unwrap();
-        mx("final", &fin);
-        // ⚠ 闭包内中间量 drop 时 kernel 可能未落（aclrtFree 非流序，内存
-        // 回池被后续 GE 输出 malloc 复用 → 反向踩烂在途 eager 数据——
-        // ref |max| 0.014/0.321 随机跳，非确定性 parity 崩的根因）。
-        // 返回前强制同步。
-        drop(stream.synchronize());
-        vec![fin]
-    };
-
     if let Some(st) = e2e {
         // e2e：加载 vision_real.om 跑一次，抓 post-projector 输出 [VT, PW]
         let outs = e2e_run(ctx, stream, &mut s, "vision");
@@ -3277,7 +3026,6 @@ pub fn seg_vision(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e
         }
         return;
     }
-    parity_and_bench(ctx, stream, &mut s, "vision", &[(t * PW) as usize], &eager, bench);
     ge_builder::fini().expect("fini");
     println!("GE_VISION_PROBE_OK");
 }
@@ -3388,7 +3136,7 @@ fn lin_f16_unfold(l: &LinearWeights, out_dim: usize, unfold: bool, g: &[f32]) ->
     w.into_iter().map(f16::from_f32).collect()
 }
 
-pub fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e: Option<&mut E2eStage>) {
+pub fn seg_prefix(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&mut E2eStage>) {
     let ctx = be.ctx();
     let stream = be.stream();
     let depth = envi("GEB_DEPTH_PREFIX", envi("GEB_DEPTH", 18)) as usize;
@@ -3954,55 +3702,6 @@ pub fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e
     s.finish(&out_names);
     println!("prefix OM built: depth={depth} P={p} n_in={} n_out={}", s.ins().len(), kv_outs.len());
 
-    // ---- eager 参考（language_layer_ascend 序列镜像；qkv 独立投影）----
-    let layer_bases2 = layer_bases.clone();
-    let kv_count = kv_outs.len();
-    let eager = |b: &[DeviceBuffer]| -> Vec<DeviceBuffer> {
-        let zeros = &b[1];
-        let mut h: Option<DeviceBuffer> = None;
-        let mut outs = Vec::with_capacity(kv_count);
-        for li in 0..depth {
-            // qkv3 层内输入布局：g1,qw,kw,vw,qb,kb,vb,outwt,outb,g2,
-            // gatewt,upwt,downwt,downb（14 项）；默认 10 项
-            let w = &b[layer_bases2[li]..layer_bases2[li] + if qkv3 { 14 } else { 10 }];
-            let (ow, ob, g2, gw, uw, dw, db) = if qkv3 { (7, 8, 9, 10, 11, 12, 13) } else { (3, 4, 5, 6, 7, 8, 9) };
-            let hb: &DeviceBuffer = h.as_ref().unwrap_or(&b[0]);
-            let (wq, wk, wv, bq, bk, bv) = &eager_qkv[li];
-            let normed = aops::add_rms_norm_fp16(ctx, stream, hb, zeros, &w[0], &[p, PW], RMS_EPS).unwrap().0;
-            let k = aops::bias_add_fp16(ctx, stream,
-                &aops::matmul_b_t_fp16(ctx, stream, &normed, [p, PW], wk, PW, KVD).unwrap(), bk, p, KVD).unwrap();
-            let v = aops::bias_add_fp16(ctx, stream,
-                &aops::matmul_b_t_fp16(ctx, stream, &normed, [p, PW], wv, PW, KVD).unwrap(), bv, p, KVD).unwrap();
-            let kr = aops::rope_rotate_half_flat_fp16(ctx, stream, &k, p * KV_HEADS, HD, &b[5], &b[6], &b[7]).unwrap();
-            if li + 1 == depth {
-                outs.push(kr);
-                outs.push(v);
-                break;
-            }
-            let q = aops::bias_add_fp16(ctx, stream,
-                &aops::matmul_b_t_fp16(ctx, stream, &normed, [p, PW], wq, PW, QD).unwrap(), bq, p, QD).unwrap();
-            let qr = aops::rope_rotate_half_flat_fp16(ctx, stream, &q, p * HEADS, HD, &b[2], &b[3], &b[4]).unwrap();
-            let attn = aops::prompt_flash_attention_bsh_fp16(
-                ctx, stream, &qr, &kr, &v, p, HEADS, KV_HEADS, HD, None).unwrap();
-            outs.push(kr);
-            outs.push(v);
-            let proj = aops::matmul_b_t_fp16(ctx, stream, &attn, [p, QD], &w[ow], QD, PW).unwrap();
-            let biased = aops::bias_add_fp16(ctx, stream, &proj, &w[ob], p, PW).unwrap();
-            let res = aops::add_fp16(ctx, stream, &biased, hb, &[p, PW]).unwrap();
-            let norm2 = aops::add_rms_norm_fp16(ctx, stream, &res, zeros, &w[g2], &[p, PW], RMS_EPS).unwrap().0;
-            let gate = aops::matmul_b_t_fp16(ctx, stream, &norm2, [p, PW], &w[gw], PW, INTER).unwrap();
-            let up = aops::matmul_b_t_fp16(ctx, stream, &norm2, [p, PW], &w[uw], PW, INTER).unwrap();
-            let g = aops::gelu_fp16(ctx, stream, &gate, &[p, INTER], true).unwrap();
-            let act = aops::mul_fp16(ctx, stream, &g, &up, &[p, INTER]).unwrap();
-            let down = aops::matmul_b_t_fp16(ctx, stream, &act, [p, INTER], &w[dw], INTER, PW).unwrap();
-            let downb = aops::bias_add_fp16(ctx, stream, &down, &w[db], p, PW).unwrap();
-            h = Some(aops::add_fp16(ctx, stream, &downb, &res, &[p, PW]).unwrap());
-        }
-        // 中间量 drop 前 kernel 必须落定（同 vision 段注记）
-        drop(stream.synchronize());
-        outs
-    };
-
     if let Some(st) = e2e {
         // e2e：加载 prefix_real.om 跑一次，抓 36×k/v（k0,v0,k1,v1,...）；
         // GEB_DBG_MID 烤的 OM 尾部多 2 输出（层 0 attention 合并/h1）
@@ -4191,9 +3890,6 @@ pub fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e
         );
         return;
     }
-    let elems = [(p * KVD) as usize];
-    let out_elems: Vec<usize> = kv_outs.iter().map(|_| elems[0]).collect();
-    parity_and_bench(ctx, stream, &mut s, "prefix", &out_elems, &eager, bench);
     ge_builder::fini().expect("fini");
     println!("GE_PREFIX_PROBE_OK");
 }
@@ -4203,7 +3899,7 @@ pub fn seg_prefix(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e
 // geglu) → action_out → euler）。styles/prefix-kv/euler 常数全为外部输入。
 // ---------------------------------------------------------------------------
 
-pub fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e: Option<&mut E2eStage>) {
+pub fn seg_flow(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&mut E2eStage>) {
     let ctx = be.ctx();
     let stream = be.stream();
     let depth = envi("GEB_DEPTH", 18) as usize;
@@ -4722,76 +4418,6 @@ pub fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e
     s.finish(&[&out]);
     println!("flow OM built: depth={depth} P={p} n_in={} n_out=1", s.ins().len());
 
-    // ---- eager 参考（action_layer_ascend 序列镜像；qkv 独立投影）----
-    let layer_bases2 = layer_bases.clone();
-    let eager = |b: &[DeviceBuffer]| -> Vec<DeviceBuffer> {
-        let zeros = &b[1];
-        // ada-norm eager：AddRmsNorm(gamma=scale) + bias_add(shift)
-        let ada = |x: &DeviceBuffer, scl: &DeviceBuffer, sh: &DeviceBuffer| -> DeviceBuffer {
-            let n = aops::add_rms_norm_fp16(ctx, stream, x, zeros, scl, &[HOR, AW], RMS_EPS).unwrap().0;
-            aops::bias_add_fp16(ctx, stream, &n, sh, HOR, AW).unwrap()
-        };
-        // ⚠ 段级索引按当前注册序：0 state / 1 zeros / 2..7 flat rope /
-        // 8..11 rank-2 表 / 12 ainwt / 13 ainb / 14.. pk_i,pv_i 交替 /
-        // 16.. 层权重（const_i32 改造前 shape 占 4 槽，旧索引 16/17/18
-        // 已失效——[832,256] 读到 qkvwt 的 size 断言 panic 取证）
-        let ain = aops::matmul_b_t_fp16(ctx, stream, &b[0], [HOR, ADIM], &b[12], ADIM, AW).unwrap();
-        // 残差流双轨（同图构造修复——residual 基 = 未归一化 x）
-        let mut xstream = aops::bias_add_fp16(ctx, stream, &ain, &b[13], HOR, AW).unwrap();
-        let mut normed = ada(&xstream, &b[layer_bases2[0]], &b[layer_bases2[0] + 1]);
-        for li in 0..depth {
-            // qkv3 层内输入布局：ascl,ash,qw,kw,vw,qb,kb,vb,outwt,outb,
-            // mscl,msh,gatewt,upwt,downwt,downb,agate,mgate（18 项）；默认 14 项
-            let w = &b[layer_bases2[li]..layer_bases2[li] + if qkv3 { 18 } else { 14 }];
-            let (g_a, g_m) = if qkv3 { (16, 17) } else { (12, 13) };
-            let (ow, ob, msc, msh, gw, uw, dw, db) = if qkv3 { (8, 9, 10, 11, 12, 13, 14, 15) } else { (4, 5, 6, 7, 8, 9, 10, 11) };
-            let (pk, pv) = (&b[14 + 2 * li], &b[15 + 2 * li]);
-            let (wq, wk, wv, bq, bk, bv) = &eager_qkv[li];
-            let q = aops::bias_add_fp16(ctx, stream,
-                &aops::matmul_b_t_fp16(ctx, stream, &normed, [HOR, AW], wq, AW, QD).unwrap(), bq, HOR, QD).unwrap();
-            let k = aops::bias_add_fp16(ctx, stream,
-                &aops::matmul_b_t_fp16(ctx, stream, &normed, [HOR, AW], wk, AW, KVD).unwrap(), bk, HOR, KVD).unwrap();
-            let v = aops::bias_add_fp16(ctx, stream,
-                &aops::matmul_b_t_fp16(ctx, stream, &normed, [HOR, AW], wv, AW, KVD).unwrap(), bv, HOR, KVD).unwrap();
-            let kr = aops::rope_rotate_half_flat_fp16(ctx, stream, &k, HOR * KV_HEADS, HD, &b[5], &b[6], &b[7]).unwrap();
-            let qr = aops::rope_rotate_half_flat_fp16(ctx, stream, &q, HOR * HEADS, HD, &b[2], &b[3], &b[4]).unwrap();
-            let kall = aops::cat_fp16(ctx, stream, &[pk, &kr], &[vec![p, KVD], vec![HOR, KVD]], 0, &[total, KVD]).unwrap();
-            let vall = aops::cat_fp16(ctx, stream, &[pv, &v], &[vec![p, KVD], vec![HOR, KVD]], 0, &[total, KVD]).unwrap();
-            let attn = aops::prompt_flash_attention_cross_bsh_fp16(
-                ctx, stream, &qr, &kall, &vall, HOR, total, HEADS, KV_HEADS, HD, None).unwrap();
-            let proj = aops::matmul_b_t_fp16(ctx, stream, &attn, [HOR, QD], &w[ow], QD, AW).unwrap();
-            let proj = aops::bias_add_fp16(ctx, stream, &proj, &w[ob], HOR, AW).unwrap();
-            let proj = aops::gate_mul_fp16(ctx, stream, &proj, &w[g_a], HOR, AW).unwrap();
-            let res = aops::add_fp16(ctx, stream, &proj, &xstream, &[HOR, AW]).unwrap();
-            let mnorm = ada(&res, &w[msc], &w[msh]);
-            let gate = aops::matmul_b_t_fp16(ctx, stream, &mnorm, [HOR, AW], &w[gw], AW, AINTER).unwrap();
-            let up = aops::matmul_b_t_fp16(ctx, stream, &mnorm, [HOR, AW], &w[uw], AW, AINTER).unwrap();
-            let g = aops::gelu_fp16(ctx, stream, &gate, &[HOR, AINTER], true).unwrap();
-            let act = aops::mul_fp16(ctx, stream, &g, &up, &[HOR, AINTER]).unwrap();
-            let down = aops::matmul_b_t_fp16(ctx, stream, &act, [HOR, AINTER], &w[dw], AINTER, AW).unwrap();
-            let down = aops::bias_add_fp16(ctx, stream, &down, &w[db], HOR, AW).unwrap();
-            let down = aops::gate_mul_fp16(ctx, stream, &down, &w[g_m], HOR, AW).unwrap();
-            let hidden = aops::add_fp16(ctx, stream, &down, &res, &[HOR, AW]).unwrap();
-            let n = b.len();
-            let (ns, nh) = if li + 1 < depth {
-                (&b[layer_bases2[li + 1]], &b[layer_bases2[li + 1] + 1])
-            } else {
-                (&b[n - 6], &b[n - 5])
-            };
-            normed = ada(&hidden, ns, nh);
-            xstream = hidden;
-        }
-        let n = b.len();
-        let vel = aops::matmul_b_t_fp16(ctx, stream, &normed, [HOR, AW], &b[n - 4], AW, ADIM).unwrap();
-        let vel = aops::bias_add_fp16(ctx, stream, &vel, &b[n - 3], HOR, ADIM).unwrap();
-        let t1 = aops::mul_fp16(ctx, stream, &b[0], &b[n - 2], &[HOR, ADIM]).unwrap();
-        let t2 = aops::mul_fp16(ctx, stream, &vel, &b[n - 1], &[HOR, ADIM]).unwrap();
-        let fin = aops::add_fp16(ctx, stream, &t1, &t2, &[HOR, ADIM]).unwrap();
-        // 中间量 drop 前 kernel 必须落定（同 vision 段注记）
-        drop(stream.synchronize());
-        vec![fin]
-    };
-
     if let Some(st) = e2e {
         // e2e 10 步：每步覆写 styles（qkv3 布局：ascl/ash=base+0/+1，
         // mscl/msh=base+10/+11）+ state（x），pk/pv 不变；euler 已在图内
@@ -5141,8 +4767,6 @@ pub fn seg_flow(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e
             s.g.save(&p).expect("save om (flow int8)");
             println!("OM saved: {p}");
         }
-    } else {
-        parity_and_bench(ctx, stream, &mut s, "flow", &[(HOR * ADIM) as usize], &eager, bench);
     }
     ge_builder::fini().expect("fini");
     println!("GE_FLOW_PROBE_OK");
@@ -5238,9 +4862,9 @@ impl GeServe {
             pmech: None,
             fmech: None,
         };
-        seg_vision(be, false, Some(real), Some(&mut st));
-        seg_prefix(be, false, Some(real), Some(&mut st));
-        seg_flow(be, false, Some(real), Some(&mut st));
+        seg_vision(be, Some(real), Some(&mut st));
+        seg_prefix(be, Some(real), Some(&mut st));
+        seg_flow(be, Some(real), Some(&mut st));
         let fast = serve_fast();
         GeServe {
             vm: st.vmech.take().expect("GeServe vision 机械缺失"),

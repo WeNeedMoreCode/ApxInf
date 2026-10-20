@@ -62,9 +62,9 @@ fn main() {
         }
     });
     match seg.as_str() {
-        "vision" => seg_vision(&be, bench, real.as_ref(), None),
-        "prefix" => seg_prefix(&be, bench, real.as_ref(), None),
-        "flow" => seg_flow(&be, bench, real.as_ref(), None),
+        "vision" => seg_vision(&be, real.as_ref(), None),
+        "prefix" => seg_prefix(&be, real.as_ref(), None),
+        "flow" => seg_flow(&be, real.as_ref(), None),
         "e2e" => seg_e2e(&be, bench, real.as_ref()),
         other => panic!("GEB_SEG: vision|prefix|flow|e2e, got {other}"),
     }
