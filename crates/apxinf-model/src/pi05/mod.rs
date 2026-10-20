@@ -61,7 +61,7 @@ pub use ascend_executor::{
 };
 #[cfg(feature = "ascend")]
 pub use ascend_ge::{
-    optest, preload_e2e_oms, seg_e2e, seg_flow, seg_prefix, seg_vision, serve_loop, GeServe,
+    preload_e2e_oms, seg_e2e, seg_flow, seg_prefix, seg_vision, serve_loop, GeServe,
     GeServeOut,
 };
 #[cfg(feature = "ascend")]

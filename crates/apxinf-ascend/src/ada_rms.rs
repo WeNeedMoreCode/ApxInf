@@ -32,9 +32,10 @@ static LIB: OnceLock<std::result::Result<Library, String>> = OnceLock::new();
 
 fn lib() -> std::result::Result<&'static Library, String> {
     LIB.get_or_init(|| {
-        let path = std::env::var("APXINF_ADA_RMS_LIB").unwrap_or_else(|_| {
-            "/data/apxinf/ascendc/ada_rms_norm/out/lib/libada_rms_norm_host.so".into()
-        });
+        // bare name: resolved via the loader search path (LD_LIBRARY_PATH);
+        // override with APXINF_ADA_RMS_LIB for an explicit path
+        let path = std::env::var("APXINF_ADA_RMS_LIB")
+            .unwrap_or_else(|_| "libada_rms_norm_host.so".into());
         unsafe { Library::new(&path) }.map_err(|e| format!("dlopen {path}: {e}"))
     })
     .as_ref()

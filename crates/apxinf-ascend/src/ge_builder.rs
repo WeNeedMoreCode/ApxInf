@@ -25,9 +25,10 @@ static LIB: OnceLock<std::result::Result<Library, String>> = OnceLock::new();
 
 fn lib() -> std::result::Result<&'static Library, String> {
     LIB.get_or_init(|| {
-        let path = std::env::var("APXINF_GE_BUILDER_LIB").unwrap_or_else(|_| {
-            "/data/apxinf/ascendc/ge_builder/build/libge_builder.so".into()
-        });
+        // bare name: resolved via the loader search path (LD_LIBRARY_PATH);
+        // override with APXINF_GE_BUILDER_LIB for an explicit path
+        let path = std::env::var("APXINF_GE_BUILDER_LIB")
+            .unwrap_or_else(|_| "libge_builder.so".into());
         unsafe { Library::new(&path) }.map_err(|e| format!("dlopen {path}: {e}"))
     })
     .as_ref()

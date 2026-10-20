@@ -941,7 +941,7 @@ mod ge_serve_py {
         /// Open a pipeline from a pre-baked bucket directory.
         ///
         /// * `om_dir` — bucket dir containing `{vision,prefix,flow}_real.om`
-        ///   (gate-era build; e.g. `/data/apxinf/om_cache/tl144`).
+        ///   (baked per bucket; e.g. `<om_cache>/tl144`).
         /// * `tokens` — the bucket's token length L (must match the OMs).
         /// * `ckpt` — LeRobot checkpoint dir (token-embedding + styles host
         ///   consumers; one-time ~60s load).

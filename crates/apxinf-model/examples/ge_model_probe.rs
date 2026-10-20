@@ -3,14 +3,14 @@
 //! GeServe 进程内直调门面与 serve_loop 共用同一帧实现）。env 全集与协议
 //! 见 ascend_ge.rs 头部注释。
 //!
-//! 运行（rust 容器，先 source /data/apxinf/rust_env.sh）：
+//! 运行（需 CANN toolkit 环境下的 rust 工具链）：
 //!   GEB_SEG=vision GEB_DEPTH=2 cargo run --example ge_model_probe --features ascend --release -p apxinf-model
 //!   GEB_SEG=e2e GEB_E2E_SERVE=<spool 目录> GEB_TOKENS=144 GEB_CKPT=<ckpt>
-//!   GEB_OM_DIR=/data/apxinf/om_cache/tl144（起 serve 桶——supervisor.sh 代劳）
+//!   GEB_OM_DIR=<om_cache>/tl144（起 serve 桶——supervisor 脚本代劳）
 
 use apxinf_ascend::ge_builder;
 use apxinf_ascend::AscendBackend;
-use apxinf_model::pi05::{optest, seg_e2e, seg_flow, seg_prefix, seg_vision, Pi05Config, Pi05Weights};
+use apxinf_model::pi05::{seg_e2e, seg_flow, seg_prefix, seg_vision, Pi05Config, Pi05Weights};
 
 fn main() {
     let seg = std::env::var("GEB_SEG").unwrap_or_else(|_| "prefix".into());
@@ -61,10 +61,6 @@ fn main() {
             w
         }
     });
-    if let Ok(t) = std::env::var("GEB_OPTEST") {
-        optest(&be, &t, real.as_ref());
-        return;
-    }
     match seg.as_str() {
         "vision" => seg_vision(&be, bench, real.as_ref(), None),
         "prefix" => seg_prefix(&be, bench, real.as_ref(), None),
