@@ -1740,7 +1740,7 @@ pub fn parity_and_bench(
 
 // ---------------------------------------------------------------------------
 // e2e：三段 OM 接真实推理链（GEB_SEG=e2e，进程内链式、host 中转）
-//   组装口径全对齐 ascend_runtime（M2 eager 全链，CUDA 镜像同源）：
+//   组装口径与 CUDA 镜像同源：
 //   x0 = vision_out ‖ token_embedding[token_ids]（视觉前语言后）
 //   state 不进 prefix——π0.5 走 state 离散化进 prompt（pi05_prompt）
 //   cond = silu(W_out·silu(W_in·te+b_in)+b_out)；style 切分 [0:w]/[w:2w]
@@ -2865,7 +2865,7 @@ pub fn serve_loop(be: &AscendBackend, st: &mut E2eStage, dir: &str, tokens: usiz
 
 // ---------------------------------------------------------------------------
 // vision 段：patch embed → depth×SigLIP 层 → post LN → projector
-// eager = ascend_executor::vision_layer_ascend 序列镜像
+// 序列与 eager aclnn 组合（ops.rs）同构
 // ---------------------------------------------------------------------------
 
 pub fn seg_vision(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>, e2e: Option<&mut E2eStage>) {

@@ -6,13 +6,7 @@
 //! CUDA crates expose only kernels and device primitives.
 
 #[cfg(feature = "ascend")]
-mod ascend_executor;
-#[cfg(feature = "ascend")]
 mod ascend_ge;
-#[cfg(feature = "ascend")]
-mod ascend_runtime;
-#[cfg(feature = "ascend")]
-mod ascend_vla;
 #[cfg(feature = "cuda")]
 mod backend;
 #[cfg(feature = "cuda")]
@@ -55,19 +49,10 @@ pub use bf16_runtime::{
 };
 pub use bf16_weights::{bf16_to_device, Bf16LinearWeights};
 #[cfg(feature = "ascend")]
-pub use ascend_executor::{
-    action_layer_ascend, language_layer_ascend, vision_layer_ascend, vision_patch_embed_ascend,
-    AscendCaches, AscendRopeCache,
-};
-#[cfg(feature = "ascend")]
 pub use ascend_ge::{
     preload_e2e_oms, seg_e2e, seg_flow, seg_prefix, seg_vision, serve_loop, GeServe,
     GeServeOut,
 };
-#[cfg(feature = "ascend")]
-pub use ascend_runtime::{AscendPrefixKvCache, Pi05AscendRuntime};
-#[cfg(feature = "ascend")]
-pub use ascend_vla::Pi05AscendVlaRuntime;
 #[cfg(feature = "cuda")]
 pub use calibration::Pi05CalibrationObserver;
 pub use config::{GemmaVariantConfig, Pi05Config, Pi05PerformanceProfile};
@@ -124,9 +109,4 @@ pub use weights::{
 #[cfg(feature = "cuda")]
 pub(crate) fn register_builtin() {
     crate::registry::register("pi05-cuda", vla_runtime::load_registered);
-}
-
-#[cfg(feature = "ascend")]
-pub(crate) fn register_builtin_ascend() {
-    crate::registry::register("pi05-ascend", ascend_vla::load_registered);
 }

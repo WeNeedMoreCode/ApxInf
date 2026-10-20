@@ -2,7 +2,7 @@
 //!
 //! 模型定义留在 Rust——哪些算子、什么 desc/attrs、怎么连线都由本模块的
 //! 调用方（未来是 executor）表达；C++ 侧只是薄操纵层。dlopen 方式与
-//! ada_rms 相同（aarch64 产物，非昇腾机器可编译本 crate）。
+//! aarch64 产物，非昇腾机器可编译本 crate。
 //!
 //! 会话语义：`init` 必须在进程里 `aclInit`/`SetDevice` 之前跑（早期 POC
 //! 实测 GE 反向初始化会 GRAPH_FAILED）；`GeGraph::begin` 开一个构图槽
