@@ -1569,40 +1569,17 @@ impl Seg {
 //   （executor L714-719：ascl=1+s0 / ash=s1）
 // ---------------------------------------------------------------------------
 
-/// GEB_E2E_REPLAY 离线轨迹帧：真 LIBERO rollout（record_rollout.py 录制，
-/// torch npu-torch 路径）——patches/token_ids/noise/nact 为录制值，三段
-/// 链逐帧产物（vision_out/kv/actions）随回放填充。actions 前 gd 列与
-/// nact（= torch normalized_actions，x_t 终态切片，同 noise）对拍 = 离线
-/// 行为裁判（闭环 env 前的中间验收）
-pub struct ReplayFrame {
-    patches: Vec<f16>,     // [VT, V_PATCH_W]（含 empty 视图 -1 pad 行）
-    token_ids: Vec<u32>,   // PaliGemma tokenizer + state 离散化（真 prompt）
-    noise: Vec<f16>,       // [HOR, ADIM] 录制时注入
-    nact: Vec<f16>,        // [HOR, 7] torch normalized_actions 参考值
-    vision_out: Vec<f16>,  // [VT, PW] 本帧 vision 段产物
-    kv: Vec<Vec<f16>>,     // 本帧 prefix 36 输出
-    actions: Vec<f16>,     // 本帧 flow 终态 [HOR, ADIM]
-}
-
 pub struct E2eStage {
-    /// 输入（golden 或合成 bring-up）
+    /// frame inputs
     patches: Vec<f16>,          // [VT, V_PATCH_W]
-    token_ids: Vec<u32>,        // lang tokens（真 tokenizer 随 golden 落地）
+    token_ids: Vec<u32>,        // lang tokens
     noise: Vec<f16>,            // [HOR, ADIM]
-    golden_actions: Option<Vec<f16>>, // [HOR, ADIM]
-    /// golden 中间量（f32 原值；键存在才比——段边界 bisect）：
-    /// vision_out[x0 之前] / x0[prefix 输入] / kv0[prefix 首层 k] / step0_x1
-    golden_mid: Vec<(String, Vec<f32>)>,
-    /// 阶段产物（host 中转）
+    /// stage outputs (host-relayed between segments)
     vision_out: Vec<f16>,       // [VT, PW] post-projector
-    kv: Vec<Vec<f16>>,          // prefix 36 输出（k0,v0,k1,v1,... 各 [p,KVD]）
-    actions: Vec<f16>,          // flow 终态 [HOR, ADIM]
-    /// 离线轨迹回放帧（GEB_E2E_REPLAY；token 长度须全帧 = GEB_TOKENS——
-    /// 真 prompt 的 pad 行在 torch 侧被 mask，引擎静态全可见不等价，等长
-    /// 真 token 才是精确对拍）
-    replay: Vec<ReplayFrame>,
-    /// GEB_E2E_SERVE 常驻机械（三段 per-frame 执行器；ctx/stream 由
-    /// serve 循环传入，机械只持 owned 状态——多桶 = 每桶一个进程）
+    kv: Vec<Vec<f16>>,          // prefix 36 outputs (k0,v0,k1,v1,... each [p,KVD])
+    actions: Vec<f16>,          // flow terminal state [HOR, ADIM]
+    /// GEB_E2E_SERVE resident mechs (per-frame executors; ctx/stream passed
+    /// in by the serve loop, mechs hold owned state only — one process per bucket)
     vmech: Option<VisionMech>,
     pmech: Option<PrefixMech>,
     fmech: Option<FlowMech>,
@@ -2172,31 +2149,6 @@ impl FlowMech {
 }
 
 impl E2eStage {
-    /// 段边界 bisect 对拍：golden 有该键才比（BISECT 前缀），无则静默跳过。
-    /// 带 argmax 索引——x0 上可直接分辨分岔落在视觉段/语言段行区间。
-    /// got ≥ want 时截断比前缀（range padding 对拍：桶界 OM 出 P 行，
-    /// golden 是真 L 行——真行恰为前缀，数学等价由 mask 保证）
-    fn cmp_mid(&self, tag: &str, got: &[f16]) {
-        let Some(want) = self.golden_mid.iter().find(|(k, _)| k == tag).map(|(_, v)| v) else {
-            return;
-        };
-        assert!(got.len() >= want.len(), "golden {tag} 长度不足（got {} want {}）", got.len(), want.len());
-        let got = &got[..want.len()];
-        let mut md = 0f32;
-        let mut i_at = 0usize;
-        for (i, (&g, &w)) in got.iter().zip(want.iter()).enumerate() {
-            let d = (g.to_f32() - w).abs();
-            if d > md {
-                md = d;
-                i_at = i;
-            }
-        }
-        let rm = want.iter().fold(0f32, |m, v| m.max(v.abs()));
-        println!(
-            "[e2e] BISECT {tag}: max_diff={md:.5} @idx{i_at} (golden |max|={rm:.3}, rel={:.1}%)",
-            if rm > 0.0 { md / rm * 100.0 } else { md }
-        );
-    }
 }
 
 pub fn silu_f32(x: f32) -> f32 {
@@ -2407,113 +2359,22 @@ pub fn seg_e2e(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>) {
     preload_e2e_oms(be.ctx());
     // 注：GE 静态 OM 接受非 16 倍 M（GEB_TOKENS=200 → P=968 实证编译/运行/
     // parity 正常——eager aclnn 的 16 倍 M 崩坑不适用于 GE 路径）
-    let mut st = match std::env::var("GEB_E2E_GOLDEN") {
-        Ok(path) => {
-            println!("[e2e] golden: {path}");
-            let (t, _) = apxinf_loader::safetensors::load_native_path(std::path::Path::new(&path))
-                .expect("golden load");
-            let f32v = |k: &str| -> Vec<f32> {
-                t.get(k).unwrap_or_else(|| panic!("golden 缺键 {k}")).to_f32_vec().unwrap()
-            };
-            let f16v = |k: &str| -> Vec<f16> { f32v(k).into_iter().map(f16::from_f32).collect() };
-            let ids: Vec<u32> = f32v("token_ids").iter().map(|&v| v as u32).collect();
-            // GEB_E2E_PAD_TOKENS（range padding 对拍）：golden 真长 < 桶界
-            if envi("GEB_E2E_PAD_TOKENS", 0) == 0 {
-                assert_eq!(ids.len(), tokens, "golden token 数与 GEB_TOKENS 不符");
-            }
-            // 中间量（可选键，名对齐 golden_gen.py 落盘键）：vision_out / x0 /
-            // kvk_l{i} 全 18 层（prefix k cache）/ step0_x1——段边界 bisect
-            let mut keys: Vec<String> = Vec::new();
-            for k in ["vision_out", "x0", "x0_vis", "step0_x1", "m0", "h1"] {
-                if t.contains_key(k) {
-                    keys.push(k.to_string());
-                }
-            }
-            keys.extend(
-                t.keys()
-                    .filter(|k| k.starts_with("kvk_l") || k.starts_with("kvv_l") || k.starts_with("cond_s"))
-                    .cloned()
-                    .collect::<Vec<_>>(),
-            );
-            let golden_mid: Vec<(String, Vec<f32>)> = keys
-                .iter()
-                .filter_map(|k| {
-                    t.get(k.as_str()).map(|a| (k.clone(), a.to_f32_vec().unwrap()))
-                })
-                .collect();
-            println!(
-                "[e2e] golden 中间量: {:?}",
-                golden_mid.iter().map(|(k, v)| format!("{k}[{}]", v.len())).collect::<Vec<_>>()
-            );
-            E2eStage {
-                patches: f16v("patches"),
-                token_ids: ids,
-                noise: f16v("noise"),
-                golden_actions: t
-                    .get("actions")
-                    .map(|a| a.to_f32_vec().unwrap().into_iter().map(f16::from_f32).collect()),
-                golden_mid,
-                vision_out: Vec::new(),
-                kv: Vec::new(),
-                actions: Vec::new(),
-                replay: Vec::new(),
-                vmech: None,
-                pmech: None,
-                fmech: None,
-            }
-        }
-        Err(_) => {
-            println!("[e2e] 无 GEB_E2E_GOLDEN：合成 patches/noise + 占位 token ids（bring-up 模式，golden 对拍下一步）");
-            let mut seed = 0xE2E2u32;
-            let ids = (0..tokens).map(|i| 1000 + i as u32 * 7).collect();
-            E2eStage {
-                patches: rand_f16((VT * V_PATCH_W) as usize, &mut seed, 300.0),
-                token_ids: ids,
-                noise: rand_f16((HOR * ADIM) as usize, &mut seed, 1.0),
-                golden_actions: None,
-                golden_mid: Vec::new(),
-                vision_out: Vec::new(),
-                kv: Vec::new(),
-                actions: Vec::new(),
-                replay: Vec::new(),
-                vmech: None,
-                pmech: None,
-                fmech: None,
-            }
+    let mut st = {
+        // synthetic bring-up frame (smoke): real frames arrive via serve spool
+        let mut seed = 0xE2E2u32;
+        let ids = (0..tokens).map(|i| 1000 + i as u32 * 7).collect();
+        E2eStage {
+            patches: rand_f16((VT * V_PATCH_W) as usize, &mut seed, 300.0),
+            token_ids: ids,
+            noise: rand_f16((HOR * ADIM) as usize, &mut seed, 1.0),
+            vision_out: Vec::new(),
+            kv: Vec::new(),
+            actions: Vec::new(),
+            vmech: None,
+            pmech: None,
+            fmech: None,
         }
     };
-    // GEB_E2E_REPLAY=<safetensors>：离线轨迹回放（record_rollout.py 录制，
-    // 键 patches_{i}/token_ids_{i}/noise_{i}/nact_{i}）。bring-up 后三段各
-    // 自逐帧换绑重跑（bring-up 的 golden 对拍照旧作金丝雀）
-    if let Ok(path) = std::env::var("GEB_E2E_REPLAY") {
-        let (t, _) = apxinf_loader::safetensors::load_native_path(std::path::Path::new(&path))
-            .expect("replay load");
-        let n = t.keys().filter(|k| k.starts_with("noise_")).count();
-        assert!(n > 0, "replay 文件无 noise_{{i}} 键: {path}");
-        let rf32 = |k: &str| -> Vec<f32> {
-            t.get(k).unwrap_or_else(|| panic!("replay 缺键 {k}")).to_f32_vec().unwrap()
-        };
-        for i in 0..n {
-            let ids: Vec<u32> = rf32(&format!("token_ids_{i}")).iter().map(|&v| v as u32).collect();
-            assert_eq!(
-                ids.len(),
-                tokens,
-                "replay 帧 {i} token 长度 {} ≠ GEB_TOKENS {tokens}——真 prompt token 数随 \
-                 state 离散值位数浮动，静态 OM 须按等长真 token 帧过滤/重烤",
-                ids.len()
-            );
-            st.replay.push(ReplayFrame {
-                patches: rf32(&format!("patches_{i}")).into_iter().map(f16::from_f32).collect(),
-                token_ids: ids,
-                noise: rf32(&format!("noise_{i}")).into_iter().map(f16::from_f32).collect(),
-                nact: rf32(&format!("nact_{i}")).into_iter().map(f16::from_f32).collect(),
-                vision_out: Vec::new(),
-                kv: Vec::new(),
-                actions: Vec::new(),
-            });
-        }
-        println!("[e2e] replay: {path} ×{n} 帧（token 等长断言已过）");
-    }
     let t0 = std::time::Instant::now();
     seg_vision(be, Some(real), Some(&mut st));
     let t1 = std::time::Instant::now();
@@ -2765,9 +2626,6 @@ pub fn seg_vision(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&m
     // norm gamma/beta 的 host 副本（eager 参考 host LN 用）
     let mut eager_norms: Vec<(Vec<f16>, Vec<f16>, Vec<f16>, Vec<f16>)> = Vec::new();
     let mut layer_bases = Vec::with_capacity(depth);
-    // GEB_DBG：层 0 各级额外绑图输出（parity_and_bench 的 [dbg outN] 打印）
-    let dbg = std::env::var("GEB_DBG").is_ok();
-    let mut dbg_outs: Vec<String> = Vec::new();
     for i in 0..depth {
         let base = s.binds.len();
         layer_bases.push(base);
@@ -2894,23 +2752,21 @@ pub fn seg_vision(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&m
         // attention（v3 方案：rank-2 列切 → Reshape rank-3 桥）。
         // manual：[b*h,s,d] 桥 + bmm/softmax/bmm（全静态）；pfa：batch PFA
         let ln1 = s.addln(&format!("{}ln1", p), &cur, &format!("{}n1w", p), &format!("{}n1b", p), "nsh", &[t, VW]);
-        let (q2, k2, v2, _qdbg) = if qkv3 {
+        let (q2, k2, v2) = if qkv3 {
             let qm = s.mm(&format!("{}qm", p), &ln1, &[t, VW], &format!("{}qw", p), &[vqd, VW], &[t, vqd]);
             let km = s.mm(&format!("{}km", p), &ln1, &[t, VW], &format!("{}kw", p), &[vqd, VW], &[t, vqd]);
             let vm = s.mm(&format!("{}vm", p), &ln1, &[t, VW], &format!("{}vw", p), &[vqd, VW], &[t, vqd]);
             let qb = s.bias(&format!("{}qb_", p), &qm, &[t, vqd], &format!("{}qb", p));
             let kb = s.bias(&format!("{}kb_", p), &km, &[t, vqd], &format!("{}kb", p));
             let vb = s.bias(&format!("{}vb_", p), &vm, &[t, vqd], &format!("{}vb", p));
-            let qdbg = qb.clone();
-            (qb, kb, vb, qdbg)
+            (qb, kb, vb)
         } else {
             let qkv = s.mm(&format!("{}qkv", p), &ln1, &[t, VW], &format!("{}qkvwt", p), &[qkvw, VW], &[t, qkvw]);
             let qkvb = s.bias(&format!("{}qkvb", p), &qkv, &[t, qkvw], &format!("{}qkvb", p));
             let q2 = s.slice2(&format!("{}q2", p), &qkvb, &[t, qkvw], 0, vqd);
             let k2 = s.slice2(&format!("{}k2", p), &qkvb, &[t, qkvw], vqd, vqd);
             let v2 = s.slice2(&format!("{}v2", p), &qkvb, &[t, qkvw], vqd * 2, vqd);
-            let qdbg = qkvb.clone();
-            (q2, k2, v2, qdbg)
+            (q2, k2, v2)
         };
         let attn = if attn_manual {
             // 头主序桥（headsplit：Reshape[3,256,16,72]→TransposeD(0,2,1,3)
@@ -2943,14 +2799,6 @@ pub fn seg_vision(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&m
         let fc2 = s.mm(&format!("{}fc2", p), &act, &[t, V_INTER], &format!("{}fc2wt", p), &[VW, V_INTER], &[t, VW]);
         let fc2b = s.bias(&format!("{}fc2b", p), &fc2, &[t, VW], &format!("{}fc2b", p));
         cur = s.add2(&format!("{}out", p), &fc2b, &res1, &[t, VW]);
-        if i == 0 && dbg {
-            // ⚠ attn（bmm/PFA 输出）及其直接下游（proj mm）绑图输出时 desc
-            // 动态（[-1,-1,-1] / [-1,1152]，size ~1e18 → malloc 崩）——
-            // 动态 desc 只传一层；res1 起恢复静态
-            for st in [&ln1, &_qdbg, &res1, &ln2, &fc1b, &act, &fc2b, &cur] {
-                dbg_outs.push(st.clone());
-            }
-        }
     }
 
     // ---- post norm + projector ----
@@ -2975,11 +2823,7 @@ pub fn seg_vision(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&m
     let pln = s.addln("pln", &cur, "pnw", "pnb", "nsh", &[t, VW]);
     let proj = s.mm("proj", &pln, &[t, VW], "projwt", &[PW, VW], &[t, PW]);
     let out = s.bias("out", &proj, &[t, PW], "projb");
-    let mut fin: Vec<&str> = vec![&out];
-    if dbg {
-        fin.extend(dbg_outs.iter().map(|x| x.as_str()));
-    }
-    s.finish(&fin);
+    s.finish(&[&out]);
     println!("vision OM built: depth={depth} n_in={} n_out=1", s.ins().len());
 
     if let Some(st) = e2e {
@@ -2991,32 +2835,8 @@ pub fn seg_vision(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&m
         st.vision_out = outs[0].clone();
         let m = st.vision_out.iter().fold(0f32, |m, v| m.max(v.to_f32().abs()));
         println!("[e2e] vision_out |max|={m:.4}");
-        st.cmp_mid("vision_out", &st.vision_out);
-        // GEB_E2E_REPLAY：逐帧覆写 patches（binds[0] = 段首注册的 patches
-        // 输入）重跑；aux 输出 buffer 一次分配复用、只下载主输出 idx0
-        if !st.replay.is_empty() {
-            let n_out = s.g.num_outputs().unwrap();
-            let routs: Vec<DeviceBuffer> = (0..n_out)
-                .map(|i| ctx.malloc(s.g.output_size(i).unwrap().max(16)).expect("replay out malloc"))
-                .collect();
-            let h2d = |buf: &DeviceBuffer, vals: &[f16]| {
-                let bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect();
-                ctx.copy_h2d(buf, &bytes).expect("replay h2d");
-            };
-            let t0 = std::time::Instant::now();
-            for f in st.replay.iter_mut() {
-                assert_eq!(f.patches.len() * 2, s.binds[0].len(), "replay patches 尺寸不符");
-                h2d(&s.binds[0], &f.patches);
-                let ins = s.ins();
-                let refs: Vec<&DeviceBuffer> = routs.iter().collect();
-                s.g.run(&ins, &refs, stream).expect("ge run");
-                drop(stream.synchronize());
-                f.vision_out = download_f16(ctx, &routs[0], s.g.output_size(0).unwrap() / 2);
-            }
-            println!("[e2e] replay vision ×{} {:?}", st.replay.len(), t0.elapsed());
-        }
         // GEB_E2E_SERVE：机械下沉 E2eStage（per-frame 执行由 seg_e2e 的
-        // serve 循环驱动；routs 一次分配跨请求复用，同 replay 语义）
+        // serve 循环驱动；routs 一次分配跨请求复用）
         if std::env::var("GEB_E2E_SERVE").is_ok() {
             let n_out = s.g.num_outputs().unwrap();
             let routs: Vec<DeviceBuffer> = (0..n_out)
@@ -3232,40 +3052,23 @@ pub fn seg_prefix(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&m
     // 0 x0 / 1 zeros / 2..7 flat rope 六件（eager flat 版用）/
     // 8..11 rank-2 rope 表四件（GE rank-2 组合用）/ 层 10 项
     // e2e x0 = vision_out ‖ token_embedding[token_ids]（embed_prefix 同序：
-    // 视觉前、语言后；state 不进 prefix——π0.5 走离散化进 prompt 文本）。
-    // GEB_E2E_PAD_TOKENS（range padding 对拍）：golden 真长 <
-    // GEB_TOKENS（桶界）——token 补 0 到桶界（pad 行由 padmask 遮蔽），
-    // 真长供 padmask 填充。cmp_mid 截断比前缀 = 真行对拍
-    let pad_true_l = envi("GEB_E2E_PAD_TOKENS", 0);
+    // 视觉前、语言后；state 不进 prefix——π0.5 走离散化进 prompt 文本）
     let x0_h = match (&e2e, real) {
         (Some(st), Some(w)) => {
             assert!(!st.vision_out.is_empty(), "e2e: 须先跑 vision 段");
             assert_eq!(st.vision_out.len(), (VT * PW) as usize);
-            if pad_true_l > 0 {
-                assert_eq!(st.token_ids.len(), pad_true_l as usize, "GEB_E2E_PAD_TOKENS ≠ golden token 数");
-                assert!(pad_true_l < tokens, "GEB_E2E_PAD_TOKENS 须 < GEB_TOKENS（桶界）");
-            } else {
-                assert_eq!(st.token_ids.len(), tokens as usize, "golden token 数与 GEB_TOKENS 不符");
-            }
+            assert_eq!(st.token_ids.len(), tokens as usize, "token ids 与 GEB_TOKENS 不符");
             // 一次性 f32 物化 [vocab,PW]（~2.1GB 峰值，查完即弃）
             let emb = w.vision.token_embedding.to_f32_vec().unwrap();
             let vocab_w = PW as usize;
             // LeRobot embed_language_tokens 语义：查表行 × √width（gemma
-            // embed scale，modeling_pi05 L695；vision 段无此缩放）。
-            // 空视图剔除：vision_out 只取前 (VT-drop_v) 行（视图主序，empty
-            // 在尾），golden 对拍键 x0_vis 同序
+            // embed scale；vision 段无此缩放）。
+            // 空视图剔除：vision_out 只取前 (VT-drop_v) 行（视图主序，empty 在尾）
             let lang_scale = (PW as f32).sqrt();
             let vis_rows = ((VT - drop_v) * PW) as usize;
             let mut x0 = st.vision_out[..vis_rows].to_vec();
-            let ids_eff: Vec<u32> = if pad_true_l > 0 {
-                let mut v = st.token_ids.clone();
-                v.resize(tokens as usize, 0);
-                v
-            } else {
-                st.token_ids.clone()
-            };
-            x0.reserve(ids_eff.len() * vocab_w);
-            for &id in &ids_eff {
+            x0.reserve(st.token_ids.len() * vocab_w);
+            for &id in &st.token_ids {
                 let r = id as usize * vocab_w;
                 assert!(r + vocab_w <= emb.len(), "token id {id} 超 vocab");
                 x0.extend(emb[r..r + vocab_w].iter().map(|&v| f16::from_f32(v * lang_scale)));
@@ -3276,18 +3079,6 @@ pub fn seg_prefix(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&m
         _ => rand_f16((p * PW) as usize, &mut seed, 100.0),
     };
     s.data(ctx, "x0", &[gd(p), PW], &x0_h);
-    // GEB_NORM32 v2：常量走 Const 折叠（n32_consts 懒建），无 Data 注册
-    // ——binds[0]=x0 的硬编码约束自然解除
-    // bisect：x0 = cat(vision_out, 查表×√PW) 组装后即比（idx 域 [0,VT*PW)
-    // = 视觉行 / 其后 = 语言行——分岔落哪个段一眼可辨）。剔除空视图时
-    // golden 参考键为 x0_vis（712 行同序）
-    if let Some(st) = e2e.as_ref() {
-        if drop_v > 0 {
-            st.cmp_mid("x0_vis", &x0_h);
-        } else {
-            st.cmp_mid("x0", &x0_h);
-        }
-    }
     // zeros 显式 gear 化（data_zeros 保持纯静态——vision 段共用）：
     // 内容全零逐行 p 无关，p_max 全量即前缀截断
     {
@@ -3303,17 +3094,6 @@ pub fn seg_prefix(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&m
     } else {
         None
     };
-    // PAD 对拍：padmask 填真 mask（行 [vis+真L, p) = -30000）——serve 同义
-    if attn_mask_n.is_some() && pad_true_l > 0 {
-        let vis = VT - envi("GEB_PREFIX_DROP_EMPTY", 0);
-        let mut mh = vec![f16::from_f32(0.0); p as usize];
-        for r in &mut mh[(vis + pad_true_l) as usize..] {
-            *r = f16::from_f32(-30000.0);
-        }
-        let bytes: Vec<u8> = mh.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect();
-        let bi = s.bind_of("padmask");
-        ctx.copy_h2d(&s.binds[bi], &bytes).expect("padmask h2d");
-    }
     let (qc, qs, qi) = rope_flat_const(p, HEADS, 0);
     let (kc, ks, ki) = rope_flat_const(p, KV_HEADS, 0);
     let qf = (p * HEADS * 2, HD / 2);
@@ -3371,10 +3151,6 @@ pub fn seg_prefix(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&m
     let mut layer_bases = Vec::with_capacity(depth);
     let mut cur = "x0".to_string();
     let mut kv_outs: Vec<String> = Vec::new();
-    // GEB_DBG_MID：层 0 attention 合并输出（o_proj 前）与 h1 作为图输出尾部
-    // 追加——golden m0/h1 对拍，钉 GE 图内第一坏级（attention vs MLP vs 残差）
-    let dbg_mid = std::env::var("GEB_DBG_MID").is_ok();
-    let mut dbg_outs: Vec<String> = Vec::new();
     for i in 0..depth {
         let base = s.binds.len();
         layer_bases.push(base);
@@ -3382,12 +3158,8 @@ pub fn seg_prefix(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&m
         let last = i + 1 == depth;
         // 真权重：语言层 host 解析时已把 Gemma 1+w scale 折进 q/k/v/gate/up
         //（g1/g2 = ones）——probe 图直接消费该约定，无需再乘 norm scale。
-        // GEB_LAYER_OFFSET：权重取层偏移（隔离实验——如 d2 图层 0 用 L1
-        // 权重 + x0 喂 golden h1，直接对拍 kvk_l1 公式，裁决 WCONST 烤入）
-        let lay = real.and_then(|w| {
-            w.language_layers.get(i + envi("GEB_LAYER_OFFSET", 0) as usize)
-        });
-        let lay_i = i + envi("GEB_LAYER_OFFSET", 0) as usize; // smooth 因子键层号同权重层
+        let lay = real.and_then(|w| w.language_layers.get(i));
+        let lay_i = i; // smooth 因子键层号同权重层
         // int8 q/k/v 注册（f32 直取，不过 f16；manual-attn 的 pscale 折 q——
         // 行量化对整体常数不变，仅 scale 同比缩小）
         let (iq8, ik8, iv8) = if int8 {
@@ -3646,10 +3418,6 @@ pub fn seg_prefix(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&m
             s.bias(&format!("{}projb", tag), &proj, &[gd(p), PW], &format!("{}outb", tag))
         };
         let res = s.add2(&format!("{}res", tag), &projb, &cur, &[gd(p), PW]);
-        if dbg_mid && i == 0 {
-            dbg_outs.push(sq.clone());
-            dbg_outs.push(res.clone());
-        }
         let norm2 = s.addrms(&format!("{}n2", tag), &res, "zeros", &format!("{}g2", tag), &[gd(p), PW]);
         let ig8 = if i8sel("gate") {
             let l = lay.expect("GEB_PREFIX_INT8 需真权重");
@@ -3683,105 +3451,19 @@ pub fn seg_prefix(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&m
             s.bias(&format!("{}downb", tag), &down, &[gd(p), PW], &format!("{}downb", tag))
         };
         cur = s.add2(&format!("{}out", tag), &downb, &res, &[gd(p), PW]);
-        if dbg_mid && i == 0 && std::env::var("GEB_DBG_FULL").is_ok() {
-            // 全级导出（GEB_DBG_FULL）：逐级与教科书对拍钉 GE 图坏点。
-            // ⚠ 输出槽可能被内存复用覆写（res 槽实测被 n2 覆写）——逐级
-            // 对拍时用「值匹配教科书哪一级」判读，勿信槽序。
-            // n1/k2：norm1 输出与 rope 前 k——kvk 漂移链（输入→norm→k_proj→
-            // rope）的中间级，18.7% 分岔定位用（norm 后幅度与输入无关 ⇒
-            // 幅度依赖分岔只可能在 n1 之前产生）
-            for n in [norm1.clone(), k2.clone(), proj.clone(), projb.clone(), res.clone(), norm2.clone(),
-                      gate.clone(), up.clone(), gact.clone(), act.clone(),
-                      down.clone(), downb.clone(), cur.clone()] {
-                dbg_outs.push(n);
-            }
-        }
     }
-    kv_outs.extend(dbg_outs);
     let out_names: Vec<&str> = kv_outs.iter().map(|x| x.as_str()).collect();
     s.finish(&out_names);
     println!("prefix OM built: depth={depth} P={p} n_in={} n_out={}", s.ins().len(), kv_outs.len());
 
     if let Some(st) = e2e {
-        // e2e：加载 prefix_real.om 跑一次，抓 36×k/v（k0,v0,k1,v1,...）；
-        // GEB_DBG_MID 烤的 OM 尾部多 2 输出（层 0 attention 合并/h1）
+        // e2e：加载 prefix_real.om 跑一次，抓 36×k/v（k0,v0,k1,v1,...）
         let outs = e2e_run(ctx, stream, &mut s, "prefix");
         let nkv = depth * 2;
         assert!(outs.len() >= nkv, "prefix OM 输出 {} < kv {}", outs.len(), nkv);
-        // GEB_E2E_DUMP_MID=<dir>：prefix 全部输出原始 f16 落盘——含 36 路 kv
-        //（slot{2i}=k_l{i} / slot{2i+1}=v_l{i}，行数 = 可见 Pv）+ 调试槽位
-        //（GEB_DBG_MID 烤的 OM 才有；槽值可能被复用覆写，判读用「值匹配
-        // 教科书哪级」而非槽序）。用法：static 侧 dump → 合并进 golden
-        // → dyn 跑时 cmp_mid 打的即逐层 dyn-vs-static 互差
-        if let Ok(dir) = std::env::var("GEB_E2E_DUMP_MID") {
-            std::fs::create_dir_all(&dir).expect("dump dir");
-            for (i, vals) in outs.iter().enumerate() {
-                let bytes: Vec<u8> =
-                    vals.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect();
-                std::fs::write(format!("{dir}/ge_slot{i}.f16"), &bytes).expect("dump mid");
-            }
-            println!("[e2e] prefix 输出已落盘 {dir}/ge_slot{{0..{}}}.f16（含 36 路 kv）", outs.len());
-        }
-        if outs.len() > nkv {
-            // 剔除空视图时 golden 参考键为 _vis（712 行，与图槽同形）
-            if drop_v > 0 {
-                st.cmp_mid("m0_vis", &outs[nkv]);
-                st.cmp_mid("h1_vis", &outs[nkv + 1]);
-            } else {
-                st.cmp_mid("m0", &outs[nkv]);
-                st.cmp_mid("h1", &outs[nkv + 1]);
-            }
-        }
         st.kv = outs[..nkv].to_vec();
         let m = st.kv.iter().flat_map(|v| v.iter()).fold(0f32, |m, v| m.max(v.to_f32().abs()));
         println!("[e2e] prefix kv ×{} |max|={m:.4}", st.kv.len());
-        // 逐层 k 对拍（golden 键 kvk_l{i+GEB_LAYER_OFFSET}——偏移实验时键随
-        // 权重层同步偏移）
-        let key_off = envi("GEB_LAYER_OFFSET", 0) as usize;
-        for li in 0..depth {
-            st.cmp_mid(&format!("kvk_l{}", li + key_off), &st.kv[2 * li]);
-            st.cmp_mid(&format!("kvv_l{}", li + key_off), &st.kv[2 * li + 1]);
-        }
-        // GEB_E2E_REPLAY：逐帧重组 x0（本帧 vision_out 可见行 + 真 token 查表
-        // ×√PW——bring-up 同式）覆写 binds[0]（段首注册的 x0）重跑，36 路
-        // kv 下载（aux 槽不下载）。嵌入表 2.1GB 一次性物化复用
-        if !st.replay.is_empty() {
-            let w = real.expect("replay prefix 需要 GEB_CKPT（token 嵌入查表）");
-            let n_out = s.g.num_outputs().unwrap();
-            let routs: Vec<DeviceBuffer> = (0..n_out)
-                .map(|i| ctx.malloc(s.g.output_size(i).unwrap().max(16)).expect("replay out malloc"))
-                .collect();
-            let emb = w.vision.token_embedding.to_f32_vec().unwrap();
-            let vocab_w = PW as usize;
-            let lang_scale = (PW as f32).sqrt();
-            let vis_rows = ((VT - drop_v) * PW) as usize;
-            let h2d = |buf: &DeviceBuffer, vals: &[f16]| {
-                let bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect();
-                ctx.copy_h2d(buf, &bytes).expect("replay h2d");
-            };
-            let t0 = std::time::Instant::now();
-            for f in st.replay.iter_mut() {
-                assert_eq!(f.vision_out.len(), (VT * PW) as usize, "须先跑 vision replay");
-                let mut x0 = f.vision_out[..vis_rows].to_vec();
-                x0.reserve(f.token_ids.len() * vocab_w);
-                for &id in &f.token_ids {
-                    let r = id as usize * vocab_w;
-                    assert!(r + vocab_w <= emb.len(), "token id {id} 超 vocab");
-                    x0.extend(emb[r..r + vocab_w].iter().map(|&v| f16::from_f32(v * lang_scale)));
-                }
-                assert_eq!(x0.len() * 2, s.binds[0].len(), "replay x0 尺寸不符");
-                h2d(&s.binds[0], &x0);
-                let refs: Vec<&DeviceBuffer> = routs.iter().collect();
-                // replay 帧恒 = GEB_TOKENS（= gear 模式 max 档）——末档执行
-                s.run_seg(s.gear_payloads.len().saturating_sub(1), &refs, stream)
-                    .expect("ge run");
-                drop(stream.synchronize());
-                f.kv = (0..nkv)
-                    .map(|i| download_f16(ctx, &routs[i], s.g.output_size(i).unwrap() / 2))
-                    .collect();
-            }
-            println!("[e2e] replay prefix ×{} {:?}", st.replay.len(), t0.elapsed());
-        }
         // GEB_E2E_SERVE：机械下沉（嵌入表 ~2.1GB 常驻机械内，跨请求查表复用）
         if std::env::var("GEB_E2E_SERVE").is_ok() {
             let w = real.expect("serve prefix 需要 GEB_CKPT（token 嵌入查表）");
@@ -3958,14 +3640,8 @@ pub fn seg_flow(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&mut
         assert_eq!(st.kv.len(), depth * 2, "e2e: prefix 段 k/v 数与 flow 深度不符（GEB_DEPTH 须全 18）");
     }
     s.data_zeros(ctx, "zeros", HOR, AW);
-    // PAD 对拍：flow token 位置 = vis+真L+i（serve 侧 set_rope_for(真L) 同
-    // 义）——桶界 P 只定 cache 消费维度，rope 相位必须按真 L，否则 flow
-    // 整体相位漂移（首战 24.7% l17 教训：数值验收两坑之一）
-    let rope_p = if envi("GEB_E2E_PAD_TOKENS", 0) > 0 {
-        lp_to_p(envi("GEB_E2E_PAD_TOKENS", 0))
-    } else {
-        p
-    };
+    // 桶界 P 只定 cache 消费维度；serve 侧 set_rope_for(真L) 按真长定相位
+    let rope_p = p;
     let (qc, qs, qi) = rope_flat_const(HOR, HEADS, rope_p);
     let (kc, ks, ki) = rope_flat_const(HOR, KV_HEADS, rope_p);
     let qf = (HOR * HEADS * 2, HD / 2);
@@ -4461,22 +4137,6 @@ pub fn seg_flow(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&mut
         let c2_h = vec![f16::from_f32(-0.1); (HOR * ADIM) as usize];
         h2d_f16(&s.binds[s.bind_of("c1")], &c1_h);
         h2d_f16(&s.binds[s.bind_of("c2")], &c2_h);
-        // PAD 对拍：flow padmask 填真 mask（cache pad 键列 [vis+真L, p) =
-        // -30000，flow HOR 行与真 cache 行恒 0——serve 侧 fill_mask 同义；
-        // 缺此步则 pad cache 键裸露，actions 对拍被语义污染（首战 9% 教训）
-        if envi("GEB_E2E_PAD_TOKENS", 0) > 0 {
-            if let Some(bi) = s.try_bind_of("padmask") {
-                let lt = envi("GEB_E2E_PAD_TOKENS", 0);
-                let vis = lp_to_p(0);
-                let mut mh = vec![f16::from_f32(0.0); (p + HOR) as usize];
-                for r in &mut mh[(vis + lt) as usize..p as usize] {
-                    *r = f16::from_f32(-30000.0);
-                }
-                let bytes: Vec<u8> =
-                    mh.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect();
-                ctx.copy_h2d(&s.binds[bi], &bytes).expect("flow padmask h2d");
-            }
-        }
         // styles 预计算缓存：10 步 time 调度固定（1+step·dt）⇒ styles 跨调用
         // 不变，生产口径一次性算 + 常驻（每步 host 现算 ≈173ms/步 是 glue 大头，
         // bring-up 计时定罪）。cond 对拍/替入诊断（bisect）保留在此
@@ -4491,23 +4151,6 @@ pub fn seg_flow(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&mut
                     cfg.time_max_period,
                 );
                 let cond = e2e_conditioning(rw, &te);
-                // golden cond_s{step}（frame0_v3b）存在时打印 host f32 cond 与
-                // golden 的差（styles 对拍诊断）
-                let gold_cond = {
-                    let key = format!("cond_s{step}");
-                    st.golden_mid
-                        .iter()
-                        .find(|(k, _)| *k == key)
-                        .map(|(_, v)| v.clone())
-                };
-                if let Some(want) = &gold_cond {
-                    assert_eq!(cond.len(), want.len(), "cond 与 golden cond_s{step} 长度不符");
-                    let mut md = 0f32;
-                    for (a, b) in cond.iter().zip(want.iter()) {
-                        md = md.max((a - b).abs());
-                    }
-                    println!("[e2e] step {step} cond host-vs-golden max_diff={md:.6}");
-                }
                 let mut v: Vec<Vec<f16>> = Vec::with_capacity(depth * 6 + 2);
                 for i in 0..depth {
                     let lay = &rw.action_layers[i];
@@ -4553,9 +4196,6 @@ pub fn seg_flow(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&mut
             x = download_f16(ctx, &ob, (HOR * ADIM) as usize);
             let m = x.iter().fold(0f32, |m, v| m.max(v.to_f32().abs()));
             println!("[e2e] step {step} |x|max={m:.4}");
-            if step == 0 {
-                st.cmp_mid("step0_x1", &x);
-            }
         }
         println!("[e2e] flow 10 步 {:?}（styles 已缓存——纯 h2d 换绑 + run + d2h）", t0.elapsed());
         // GEB_E2E_BENCH=N：稳态 per-call bench——每迭代 = 完整 10 步 flow
@@ -4596,118 +4236,6 @@ pub fn seg_flow(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&mut
             );
         }
         st.actions = x;
-        // GEB_E2E_DUMP_MID 同目录落 actions（f16 raw [50,ADIM]——互差的
-        // golden 合并原料：static actions 并进 golden_actions 后，dyn 跑的
-        // GOLDEN PARITY 即 actions 级 dyn-vs-static 互差）
-        if let Ok(dir) = std::env::var("GEB_E2E_DUMP_MID") {
-            let bytes: Vec<u8> = st.actions.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect();
-            std::fs::write(format!("{dir}/ge_actions.f16"), &bytes).expect("dump actions");
-            println!("[e2e] actions 已落盘 {dir}/ge_actions.f16");
-        }
-        if let Some(g) = &st.golden_actions {
-            // golden actions = predict_action_chunk 的 deployable 切片
-            // (50, gd)——取 e2e 输出 [50, ADIM] 每行前 gd 列比（pad_vector
-            // 真值在前）
-            let gd = g.len() / 50;
-            assert!(gd > 0 && gd <= ADIM as usize, "golden actions 形状异常");
-            let mut md = 0f32;
-            for r in 0..50usize {
-                for c in 0..gd {
-                    let a = st.actions[r * ADIM as usize + c].to_f32();
-                    let b = g[r * gd + c].to_f32();
-                    md = md.max((a - b).abs());
-                }
-            }
-            let rm = g.iter().fold(0f32, |m, v| m.max(v.to_f32().abs()));
-            println!(
-                "[e2e] GOLDEN PARITY (first {gd} cols): max_diff={md:.5} (golden |max|={rm:.3}, rel={:.1}%)",
-                if rm > 0.0 { md / rm * 100.0 } else { md }
-            );
-        } else {
-            println!("[e2e] 无 golden actions——只验有限性（golden 对拍/LIBERO 归下一步）");
-        }
-        assert!(st.actions.iter().all(|v| v.to_f32().is_finite()), "actions 含非有限值");
-        // GEB_E2E_REPLAY：逐帧 pk/pv 换绑（36 路 host 中转，同生产链）+ noise
-        // 重启 10 步（styles 预计算缓存跨帧不变）→ actions 前 gd 列 vs torch
-        // normalized_actions（同 noise 对拍 = 离线行为裁判）
-        if !st.replay.is_empty() {
-            let t0 = std::time::Instant::now();
-            let mut rels: Vec<f32> = Vec::with_capacity(st.replay.len());
-            for (fi, f) in st.replay.iter_mut().enumerate() {
-                assert_eq!(f.kv.len(), depth * 2, "须先跑 prefix replay");
-                for i in 0..depth {
-                    h2d_f16(&s.binds[pk_base + 2 * i], &f.kv[2 * i]);
-                    h2d_f16(&s.binds[pk_base + 2 * i + 1], &f.kv[2 * i + 1]);
-                }
-                let mut xx = f.noise.clone();
-                for sc in &style_cache {
-                    for i in 0..depth {
-                        let b = layer_bases[i];
-                        h2d_f16(&s.binds[b], &sc[6 * i]);
-                        h2d_f16(&s.binds[b + 1], &sc[6 * i + 1]);
-                        h2d_f16(&s.binds[b + 10], &sc[6 * i + 2]);
-                        h2d_f16(&s.binds[b + 11], &sc[6 * i + 3]);
-                        h2d_f16(&s.binds[b + 16], &sc[6 * i + 4]);
-                        h2d_f16(&s.binds[b + 17], &sc[6 * i + 5]);
-                    }
-                    h2d_f16(&s.binds[fs_idx], &sc[6 * depth]);
-                    h2d_f16(&s.binds[fs_idx + 1], &sc[6 * depth + 1]);
-                    h2d_f16(&s.binds[0], &xx);
-                    let oref: Vec<&DeviceBuffer> = vec![&ob];
-                    s.run_seg(s.gear_payloads.len().saturating_sub(1), &oref, stream)
-                        .expect("ge run");
-                    drop(stream.synchronize());
-                    xx = download_f16(ctx, &ob, (HOR * ADIM) as usize);
-                }
-                f.actions = xx;
-                let gd = f.nact.len() / 50;
-                assert!(gd > 0 && gd <= ADIM as usize, "replay nact 形状异常（帧 {fi}）");
-                let mut md = 0f32;
-                for r in 0..50usize {
-                    for c in 0..gd {
-                        let a = f.actions[r * ADIM as usize + c].to_f32();
-                        let b = f.nact[r * gd + c].to_f32();
-                        md = md.max((a - b).abs());
-                    }
-                }
-                let rm = f.nact.iter().fold(0f32, |m, v| m.max(v.to_f32().abs()));
-                let xm = f.actions.iter().fold(0f32, |m, v| m.max(v.to_f32().abs()));
-                let rel = if rm > 0.0 { md / rm * 100.0 } else { md };
-                rels.push(rel);
-                println!(
-                    "[e2e] replay 帧 {fi}: |x|max={xm:.3} max_diff={md:.5} rel={rel:.1}% (nact|max|={rm:.3})",
-                );
-            }
-            rels.sort_by(|a, b| a.partial_cmp(b).unwrap());
-            println!(
-                "[e2e] REPLAY 对拍 ×{} 帧 {:?}: rel P50={:.1}% min={:.1}% max={:.1}%（torch normalized_actions，同 noise）",
-                st.replay.len(),
-                t0.elapsed(),
-                rels[rels.len() / 2],
-                rels[0],
-                rels[rels.len() - 1]
-            );
-            // GEB_REPLAY_DUMP=<path>：逐帧 engine actions 落盘（LE 原始二进制：
-            // u32 帧数；每帧 u32 gd + 50*ADIM f32 actions + 50*gd f32 nact）——
-            // 行为刑侦用（bias/scale/corr：系统性与噪声性偏差的判别）
-            if let Ok(p) = std::env::var("GEB_REPLAY_DUMP") {
-                use std::io::Write as _;
-                let mut out = std::fs::File::create(&p).expect("replay dump create");
-                let n = st.replay.len() as u32;
-                out.write_all(&n.to_le_bytes()).unwrap();
-                for fr in st.replay.iter() {
-                    let gd = (fr.nact.len() / 50) as u32;
-                    out.write_all(&gd.to_le_bytes()).unwrap();
-                    for v in fr.actions.iter() {
-                        out.write_all(&v.to_f32().to_le_bytes()).unwrap();
-                    }
-                    for v in fr.nact.iter() {
-                        out.write_all(&v.to_f32().to_le_bytes()).unwrap();
-                    }
-                }
-                println!("[e2e] replay actions dumped: {p}");
-            }
-        }
         // GEB_E2E_SERVE：机械下沉（styles 缓存跨请求不变——10 步调度固定；
         // euler c1/c2 已换绑 LeRobot 语义，buffer 内容恒持）
         if std::env::var("GEB_E2E_SERVE").is_ok() {
@@ -4852,12 +4380,9 @@ impl GeServe {
             patches: rand_f16((VT * V_PATCH_W) as usize, &mut seed, 300.0),
             token_ids: (0..tokens).map(|i| 1000 + i as u32 * 7).collect(),
             noise: rand_f16((HOR * ADIM) as usize, &mut seed, 1.0),
-            golden_actions: None,
-            golden_mid: Vec::new(),
             vision_out: Vec::new(),
             kv: Vec::new(),
             actions: Vec::new(),
-            replay: Vec::new(),
             vmech: None,
             pmech: None,
             fmech: None,
