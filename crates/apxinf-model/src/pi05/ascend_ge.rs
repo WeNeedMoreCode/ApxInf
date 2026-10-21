@@ -1,66 +1,47 @@
-//! GE 三段 OM（vision/prefix/flow）执行器——**crate 库面**（自 ge_model_probe
-//! 探针下沉而来）：三段建图/对拍/bench、E2eStage、三段 per-frame
-//! 机械（VisionMech/PrefixMech/FlowMech，含 GEB_SERVE_FAST 设备直连）、
-//! spool serve_loop、**GeServe 进程内直调门面**（④C；PyO3/serve 同源帧实现）。
-//! 探针驱动（env 分发/GEB_CKPT 加载）在 examples/ge_model_probe.rs。
+//! PI-0.5 three-segment Ascend GE executor (vision / prefix / flow OMs):
+//! segment graph building, per-frame mechanics (VisionMech / PrefixMech /
+//! FlowMech), spool serve loop, and the GeServe in-process facade shared by
+//! PyO3 and serve. Probe entry points (env dispatch, GEB_CKPT loading) live
+//! in examples/ge_model_probe.rs. The flow OM is single-step — a 10-step
+//! flow is 10 executions with rebound inputs.
 //!
-//! 三段 OM 全量验证：vision / prefix / flow 三段各自声明为 GE 静态
-//! OM（ge_builder FFI），与 eager aclnn 组合同输入同序列对拍 + bench。
-//! flow 段是单步 OM（10 步 flow 由调用方执行 10 次换绑定）。
+//! Operator contract (verified against 310P opp protos):
+//!   AddLayerNorm x1/x2/gamma/beta(/bias) -> y/mean/rstd/x, epsilon(Float)
+//!   GeluV2       x -> y, approximate("none"|"tanh")
+//!   GatherV2D    x/indices -> y, axis(Int; 310P supports axis 0 only)
+//!   ConcatD      DYNAMIC_INPUT x1..xN -> y, concat_dim(Int) + N(Int)
+//!   SliceD       x -> y, offsets/size(ListInt)
+//!   BroadcastToD x -> y, shape(ListInt)          [row broadcast]
+//!   Reshape      x + shape(tensor input) -> y    [flat / rank-3 bridge]
+//!   MatMulV2(transpose_x2), PromptFlashAttention (BSH rank-3), AddRmsNorm,
+//!   Squeeze, Add, Mul — verified at single-layer depth.
 //!
-//! 算子契约（310P opp proto 头文件实证）：
-//!   AddLayerNorm  x1/x2/gamma/beta(/bias)→y/mean/rstd/x, epsilon(Float)
-//!   GeluV2        x→y, approximate(String: "none"=exact / "tanh")
-//!   GatherV2D     x/indices→y, axis(Int attr；310P 实现 axis 只支持 0)
-//!   ConcatD       DYNAMIC_INPUT x1..xN → y, concat_dim(Int) + N(Int)
-//!   SliceD        x→y, offsets/size(ListInt)
-//!   BroadcastToD  x→y, shape(ListInt)  [行广播：bias / ada-norm shift]
-//!   Reshape       x + shape(张量输入) → y   [rope flat 桥 / rank-3 桥]
-//!   MatMulV2(transpose_x2)/PromptFlashAttention(BSH rank-3)/AddRmsNorm/
-//!   Squeeze/Add/Mul —— 已验证（单层探针）
+//! Graph conventions:
+//!   - Weights are host-transposed to [n,k] and MatMulV2 runs with
+//!     transpose_x2=true; weights/biases/constants enter as Data inputs.
+//!   - qkv column split: full-width bias broadcast -> rank-3 Reshape ->
+//!     SliceD x3 (PFA requires rank-3 descs).
+//!   - rope is composed in-graph (flat adjacent-row swap via GatherV2D);
+//!     tables, swap indices and shape tensors are segment-level constant
+//!     inputs shared across layers.
+//!   - ada-norm: AddRmsNorm(gamma=scale_row) + BroadcastToD(shift_row)+Add.
+//!   - Data sources use `link`; operator sources need `link_out` with an
+//!     explicit port — default resolution silently fails on multi-output
+//!     operators.
 //!
-//! 图内设计要点：
-//!   - 权重 host 预转置 [n,k] 物理 + MatMulV2 transpose_x2=true（NzCache
-//!     同款布局，C1-② 零代价验证）；权重/bias/常量全部是 Data 输入
-//!   - qkv 列拼接切分：bias 一次广播加整宽 → Reshape rank-3 → SliceD×3
-//!     （PFA desc 必须 rank-3；比逐段广播省 kernel）
-//!   - rope 组合图内（eager flat 版同构）：Reshape flat [t*h*2, d/2] →
-//!     GatherV2D(相邻行 swap) → mul+mul+add → Reshape back rank-3。
-//!     cos/sin flat 表、swap 索引、shape 张量均为段级常量输入（层间共享）
-//!   - ada-norm：AddRmsNorm(gamma=scale_row) + BroadcastToD(shift_row)+Add
-//!     （eager 的 host 预解析行等价物；行作为每步外部输入）
-//!   - 链接纪律：Data src 用 link（单输出默认解析可靠），算子 src 一律
-//!     link_out 显式端口（陷阱 #8：多输出算子默认解析静默失败）
-//!
-//! 运行（需 CANN toolkit 环境下的 rust 工具链）：
-//!   GEB_SEG=vision GEB_DEPTH=2 cargo run --example ge_model_probe --features ascend --release -p apxinf-model
-//!   GEB_SEG=prefix GEB_BENCH=1 cargo run ...   （全深对拍 + bench）
-//!   GEB_SAVE=<path>/prefix.om ...（OM 落盘）
-//!   GEB_LOAD=...（缓存加载替代编译）
-//! 环境变量：GEB_SEG（默认 prefix）/ GEB_DEPTH（层深覆盖，冒烟用）/
-//!   GEB_TOKENS（prefix token 数，默认 64 → P=832，16 倍数纪律）/
-//!   GEB_BENCH / GEB_SAVE / GEB_LOAD / GEB_ATTN=manual（手工 attention）/
-//!   GEB_QKV3=1（q/k/v 独立投影，消 SliceD 视图运行时物化）
-//!   GEB_CKPT=<dir>（真 checkpoint：权重经 Pi05Weights::from_safetensors
-//!   host 解析（含 Gemma 1+w scale 折叠）→ bf16→f16 → wt() Const 路径烤入
-//!   OM（per-checkpoint，ADR-002）；缺省合成权重。x0/state/pk/pv/ada 条件
-//!   向量等运行时输入保持合成（两路同值对拍不受影响）。
-//!   ⚠ GEB_LOAD 真 OM（*_real.om）必须配 GEB_CKPT——权重烤在 OM 里，但
-//!   eager 参考仍从 binds 取权重，缺 GEB_CKPT 时对拍错权重无意义
-//!   GEB_SEG=e2e：三段链式 e2e（vision→prefix→flow 10 步换绑）——x0 真
-//!   嵌入组装（vision_out ‖ token_embedding 查表，embed_prefix 同序）、
-//!   styles 真值（time_mlp(sinusoidal(t))→style→ascl=1+s0/ash=s1）、pk/pv =
-//!   prefix OM 36 输出直连（host 中转）。GEB_E2E_GOLDEN=<safetensors> 对拍
-//!   torch golden（键 patches[768,588]/token_ids[N]/noise[50,32]/actions
-//!   [50,32]，值 f32 存储；缺省合成 bring-up 模式）。OM 从 GEB_OM_DIR（默认
-//!   ./om_cache）读 {seg}_real.om；须配 GEB_CKPT + 四件套 env。
+//! Environment knobs: GEB_SEG (probe segment, default prefix), GEB_DEPTH
+//! (smoke-depth override), GEB_TOKENS (default 64 -> P=832, multiple of 16),
+//! GEB_BENCH / GEB_SAVE / GEB_LOAD, GEB_ATTN=manual, GEB_QKV3=1 (independent
+//! q/k/v projections; avoids SliceD view materialization), GEB_CKPT=<dir>
+//! (real checkpoint baked into the OM, per checkpoint; without it synthetic
+//! weights), GEB_OM_DIR (default ./om_cache).
 use half::f16;
 
 use apxinf_ascend::ge_builder::{self, Dtype, GeGraph};
 use apxinf_ascend::{ops as aops, AscendBackend, AscendContext, AscendStream, DeviceBuffer};
 use crate::pi05::{sinusoidal_time_embedding, LinearWeights, Pi05Config, Pi05Weights};
 
-// π0.5 3 视图档维度（Pi05Config::default）
+// PI-0.5 3-view profile dims (Pi05Config::default).
 pub const VT: i64 = 768; // vision tokens = 3 views × 256 patches
 pub const VPV: i64 = 256;
 pub const VIEWS: i64 = 3;
@@ -90,16 +71,20 @@ pub fn envi(k: &str, d: i64) -> i64 {
 }
 
 // ---------------------------------------------------------------------------
-// 动态分档（ge.dynamicDims；实证配方）：
-//   GEB_DYN_LLIST="137,138,...,157,200" = L 档表。构图期所有含 p 的 desc
-//   维与 Reshape shape Const 内容一律写 -1（Const 全档共享，内容必须 gear
-//   不变；-1 由分支推理按档解析——HF 参考链 0.6% 三档验证）；rope
-//   表/swap 索引等 L 长度张量注册为 Data[-1]（内容逐行 p 无关，p_max 全
-//   量上流即前缀截断语义）；L 相关 Const（qswap_c）转 Data。运行期按请求
-//   选档：aclmdlSetInputDynamicDims 一次调用带全部动态输入的维（S2 定式）。
+// Dynamic gears (ge.dynamicDims). GEB_DYN_LLIST="137,...,200" lists the L
+// gears. Rules learned the hard way:
+//   - every p-dependent desc dim and every Reshape shape Const carries -1
+//     (Consts are shared across gears, so their content must not depend on
+//     the gear; -1 is resolved per gear at run time)
+//   - L-length tensors (rope tables, swap indices) become Data[-1] inputs
+//     sized to p_max — row content is gear-independent and reading the
+//     first p rows is prefix truncation
+//   - per-request gear selection = one aclmdlSetInputDynamicDims call that
+//     carries the dims of ALL dynamic inputs at once.
 // ---------------------------------------------------------------------------
 
-/// GEB_DYN_LLIST 解析（正整数逗号表）；None = 静态单 L 模式（行为不变）。
+/// Parses GEB_DYN_LLIST (comma-separated positive ints); None = static
+/// single-L mode.
 pub fn dyn_llist() -> Option<Vec<i64>> {
     std::env::var("GEB_DYN_LLIST")
         .ok()
@@ -114,17 +99,19 @@ pub fn dyn_llist() -> Option<Vec<i64>> {
 
 static GEAR_MODE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
 
-/// 进程级 gear 模式开关（env 读一次；构图/执行两侧共用）。
-/// GEB_PREFIX_POOL 例外：池模式下压成 false——prefix 组装须与静态桶 OM 的
-/// 接口一致（gear 折叠 rows==1 bias 少注册 90 个 Data，n_in 170!=260 实证）；
-/// flow 接口两模式同形（rope 恒 Data）不受影响，但
-/// set_rope_for 的早退门按 flows 池判（见彼处）。
+/// Process-wide gear switch (env read once; shared by build and run sides).
+/// Forced false under GEB_PREFIX_POOL: pool-mode prefix assembly must match
+/// the static-bucket OM interface (gear folding drops 90 rows==1 bias Data
+/// inputs — n_in 170 != 260, verified). Flow descs are identical in both
+/// modes (rope stays Data), but set_rope_for's early-exit gate checks the
+/// flows pool instead — see there.
 pub fn gear_mode() -> bool {
     *GEAR_MODE.get_or_init(|| dyn_llist().is_some() && std::env::var("GEB_PREFIX_POOL").is_err())
 }
 
-/// desc 维度的动态位替换：gear 模式一律 -1（MultiBatchClone 逐档特化；
-// 静态模式原值返回——辅助函数内统一走这里可无分支适配两模式）。
+/// Dynamic-dim slot: -1 in gear mode (MultiBatchClone specializes per
+/// gear), the literal value in static mode. Route every p-dependent dim
+/// through here so helpers serve both modes without branching.
 pub fn gdyn(v: i64) -> i64 {
     if gear_mode() {
         -1
@@ -133,42 +120,29 @@ pub fn gdyn(v: i64) -> i64 {
     }
 }
 
-/// L → p（prefix 可见长度；drop 与段内公式同源）。
+/// L -> p (visible prefix length; drop term shared with segment code).
 pub fn lp_to_p(l: i64) -> i64 {
     VT + l - envi("GEB_PREFIX_DROP_EMPTY", 0)
 }
 
-/// Range padding 网格映射（GEB_POOL_GRID=stride）：请求真 L →
-/// 桶界 P（向上取整到 stride 倍数，clamp [MIN, MAX]）。无 env = 恒等（精确
-/// 桶现行为）。桶界与真长的差行由 GEB_ATTN_MASK 的 softmax 加性 mask 遮蔽
-/// ——表外 L 根除（任意 L ≤ MAX 均有归属），单任务 eval 从 ~4 桶缩到 1 桶。
+/// Range-padding grid map (GEB_POOL_GRID = stride): true L -> bucket
+/// boundary P (round up to a stride multiple, clamp [MIN, MAX]); no env =
+/// identity. Rows between L and P are hidden by the additive softmax mask
+/// of GEB_ATTN_MASK, so every L <= MAX has a bucket.
 pub fn pool_grid_p(l: i64) -> i64 {
     let stride = envi("GEB_POOL_GRID", 0);
     if stride <= 1 {
         return l;
     }
     let hi = envi("GEB_POOL_GRID_MAX", 200);
-    assert!(l <= hi, "range-padding: L={l} 超桶表上限 {hi}");
+    assert!(l <= hi, "range-padding: L={l} exceeds bucket table max {hi}");
     let p = ((l + stride - 1) / stride) * stride;
     p.clamp(envi("GEB_POOL_GRID_MIN", 136), hi)
 }
 
-/// erf 近似（Abramowitz-Stegun 7.1.26，|ε|<1.5e-7——exact gelu 对照够用）
-pub fn erf(x: f32) -> f32 {
-    let s = x.signum();
-    let x = x.abs();
-    let t = 1.0 / (1.0 + 0.327_591_1 * x);
-    let y = 1.0 - (((((1.061_405_43 * t - 1.453_152_027) * t) + 1.421_413_741) * t
-        - 0.284_496_736)
-        * t
-        + 0.254_829_592)
-        * t
-        * (-x * x).exp();
-    s * y
-}
-
-/// splitmix64 单步（LCG 高 16 位 mod 200 有短周期结构——vision 探针
-/// LayerNorm 行方差塌缩 → rstd 放大 385× 的教训）
+/// splitmix64 step. Do not swap in a plain LCG: high-bits mod-200 LCGs
+/// have short-period structure that collapses LayerNorm row variance
+/// (rstd inflated x385 here once).
 pub fn mix64(z: &mut u64) -> u64 {
     *z = z.wrapping_add(0x9E37_79B9_7F4A_7C15);
     let mut x = *z;
@@ -188,7 +162,7 @@ pub fn rand_f16(n: usize, seed: &mut u32, div: f32) -> Vec<f16> {
     v
 }
 
-/// norm gamma/beta：center ± 0.05（贴近真实量级，避免幅度塌缩）
+/// norm gamma/beta: center +/- 0.05 (realistic magnitude).
 pub fn norm_f16(n: usize, seed: &mut u32, center: f32) -> Vec<f16> {
     let mut z: u64 = (*seed as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
     let mut v = Vec::with_capacity(n);
@@ -201,17 +175,18 @@ pub fn norm_f16(n: usize, seed: &mut u32, center: f32) -> Vec<f16> {
     v
 }
 
-/// 真 checkpoint Tensor（bf16/f32）→ host f16（310P 无 bf16，精度策略 fp16）
+/// Checkpoint tensor (bf16/f32) -> host f16 (310P has no bf16; fp16 is the
+/// precision policy).
 pub fn t_f16(t: &apxinf_core::Tensor) -> Vec<f16> {
     t.to_f32_vec().unwrap().into_iter().map(f16::from_f32).collect()
 }
 
-/// LinearWeights.weight [in,out] → host f16（wt()/wbuf_t 的 host 布局同构）
+/// LinearWeights.weight [in,out] -> host f16 (same host layout as wt()).
 pub fn lw_f16(l: &LinearWeights) -> Vec<f16> {
     t_f16(&l.weight)
 }
 
-/// LinearWeights.bias → f16；None（Gemma 投影无 bias）→ zeros
+/// LinearWeights.bias -> f16; None (Gemma projections have no bias) -> zeros.
 pub fn lb_f16(l: &LinearWeights, n: usize) -> Vec<f16> {
     match &l.bias {
         Some(b) => t_f16(b),
@@ -241,7 +216,7 @@ pub fn upload_i32(ctx: &AscendContext, vals: &[i32]) -> DeviceBuffer {
     buf
 }
 
-/// fp16 device buffer -> host Vec<f16>（d2h 字节流按 LE u16 重组）
+/// fp16 device buffer -> host Vec<f16> (LE u16 reassembly of the d2h stream).
 pub fn download_f16(ctx: &AscendContext, buf: &DeviceBuffer, n: usize) -> Vec<f16> {
     let mut back = vec![0u8; n * 2];
     ctx.copy_d2h(buf, &mut back).expect("d2h");
@@ -250,51 +225,47 @@ pub fn download_f16(ctx: &AscendContext, buf: &DeviceBuffer, n: usize) -> Vec<f1
         .collect()
 }
 
-/// host [rows, cols] f16 权重 → 转置 upload 为 [cols, rows] 物理
-/// （MatMulV2 transpose_x2=true 与 eager matmul_b_t 共用布局）
-pub fn wbuf_t(ctx: &AscendContext, host: &[f16], rows: i64, cols: i64) -> DeviceBuffer {
-    let bytes = unsafe { std::slice::from_raw_parts(host.as_ptr() as *const u8, host.len() * 2) };
-    let t = aops::host_transpose(bytes, rows, cols);
-    upload_bytes(ctx, &t)
-}
-
 // ---------------------------------------------------------------------------
-// 生产化：prefix int8（GEB_PREFIX_INT8）——7 投影 mm → QuantMatmulDequant
+// Production int8: prefix/flow projection mms -> QuantMatmulDequant.
 // ---------------------------------------------------------------------------
 
-/// GEB_PREFIX_INT8：prefix 7 投影换 QuantMatmulDequant（int8 ND [n,k] +
-/// per-row scale + smooth，算子契约经单算对拍实证）。
-/// f16 回退 = 不设此 env。需真权重 + GEB_QKV3 + GEB_INT8_SMOOTH 因子文件。
+/// GEB_PREFIX_INT8: prefix 7 projections use QuantMatmulDequant (int8 ND
+/// [n,k] + per-row scale + smooth; operator contract verified by single-op
+/// parity). Unset = f16 fallback. Requires real weights + GEB_QKV3 +
+/// GEB_INT8_SMOOTH factor file.
 pub fn prefix_int8() -> bool {
     std::env::var("GEB_PREFIX_INT8").map(|v| !v.is_empty()).unwrap_or(false)
 }
 
-/// GEB_FLOW_INT8：flow 段 7 投影换 QuantMatmulDequant（GEB_FLOW_SMOOTH
-/// 因子文件，键 flow/L{nn}/{proj}）。与 prefix 的关键差异：action 层
-/// loader 无 Gemma (1+g) fold（weights.rs 只 take 不 fold）——图内激活
-/// 天然 torch 域，s_eff = s_npz 直取、无 g 表（prefix 的两域回图不适用）。
-/// 动机：flow 步 M=50 无法摊销权重读，每步全量流式 f16 权重 ~622MB
-/// （带宽下限 ~9.9ms/步 vs 实测 7.9）——int8 权重字节减半是正杠杆。
+/// GEB_FLOW_INT8: flow 7 projections use QuantMatmulDequant (factor file
+/// GEB_FLOW_SMOOTH, keys flow/L{nn}/{proj}). Unlike prefix, the action
+/// loader does not fold Gemma (1+g) — weights.rs takes values verbatim —
+/// so in-graph activations are already in the torch domain: s_eff is
+/// s_npz directly and no g table applies. Motivation: M=50 flow steps
+/// cannot amortize weight reads (~622MB f16 streamed per step), so
+/// halving weight bytes is a direct win.
 pub fn flow_int8() -> bool {
     std::env::var("GEB_FLOW_INT8").map(|v| !v.is_empty()).unwrap_or(false)
 }
 
-/// 引擎域 smooth 因子（GEB_INT8_SMOOTH safetensors，键 prefix/L{nn}/{proj}）。
-/// 由 smooth_calib_v1.npz（torch 域）经 convert_smooth_engine.py v2 转换
-/// （g 回图方案）：int8 层 AddRmsNorm gamma 用 (1+g) 真值（loader fold 的
-/// 原值替代源），激活侧回 torch 域——纯引擎域 s_eff 会因 L00 近零 fold
-/// 爆到 ±e7（f16 行不可表示，实测）。
+/// Engine-domain smooth factors (GEB_INT8_SMOOTH safetensors, keys
+/// prefix/L{nn}/{proj}), converted from torch-domain calibration by
+/// convert_smooth_engine.py v2: int8 layers keep the true (1+g) gamma in
+/// AddRmsNorm and push activations back to the torch domain. A pure
+/// engine-domain s_eff would blow up to +/-e7 where the (1+g) fold is
+/// near zero (not f16-representable — measured).
 pub struct Int8Smooth {
-    /// 权重侧吸收因子 f32[k]（= s_npz/(1+g)，仅 f32 权重量化用）
+    /// Weight-side absorb factor f32[k] (= s_npz/(1+g); for f32 weight quant).
     pub s_eff: Vec<f32>,
-    /// 算子原生 smooth_scale 输入值 f32[k]（= s_npz，torch 域，f16 安全）
+    /// Native smooth_scale input f32[k] (= s_npz, torch domain, f16-safe).
     pub smooth: Vec<f32>,
-    /// 1/s_npz（GEB_INT8_NATIVE=0 回退路径的行广播值）
+    /// 1/s_npz (row broadcast on the GEB_INT8_NATIVE=0 fallback path).
     pub inv: Vec<f32>,
 }
 
-/// smooth 因子文件加载：矩阵因子（s_eff/smooth/inv 三键一组）+ 组 norm
-/// 真值（prefix/L{nn}/g1、g2 = 1+norm_scale，int8 层回 torch 域用）
+/// Loads the smooth factor file: matrix factors (s_eff/smooth/inv per
+/// base) plus group-norm truths (prefix/L{nn}/g1, g2 = 1+norm_scale, used
+/// to return int8 layers to the torch domain).
 pub fn load_int8_smooth(
     path: &str,
 ) -> (
@@ -302,17 +273,17 @@ pub fn load_int8_smooth(
     std::collections::HashMap<String, [Vec<f32>; 2]>,
 ) {
     let (t, _) = apxinf_loader::safetensors::load_native_path(std::path::Path::new(path))
-        .unwrap_or_else(|e| panic!("GEB_INT8_SMOOTH 加载失败 {path}: {e}"));
+        .unwrap_or_else(|e| panic!("GEB_INT8_SMOOTH load failed {path}: {e}"));
     let mut out = std::collections::HashMap::new();
     let bases: Vec<String> = t
         .keys()
         .filter_map(|k| k.strip_suffix("/s_eff").map(|b| b.to_string()))
         .collect();
-    assert!(!bases.is_empty(), "{path} 无 */s_eff 键（须为转换后的因子文件）");
+    assert!(!bases.is_empty(), "{path} has no */s_eff keys (needs a converted factor file)");
     for base in bases {
         let get = |suf: &str| -> Vec<f32> {
             t.get(&format!("{base}{suf}"))
-                .unwrap_or_else(|| panic!("int8 smooth 缺 {base}{suf}"))
+                .unwrap_or_else(|| panic!("int8 smooth missing {base}{suf}"))
                 .to_f32_vec()
                 .unwrap()
         };
@@ -333,16 +304,17 @@ pub fn load_int8_smooth(
     (out, norms)
 }
 
-/// W8 行量化（smooth 吸收后）：host w32 [k,n]（in-major，loader f32 权重）
-/// → int8 [n,k] 物理 + per-row scale [n]。与 int8_bake_weights.py 同数学
-/// （f32 域乘、max().max(1e-12)/127、ties-even round、±127 clip）——
-/// GEB_INT8_DUMP 落盘对拍 npz 金标准，期望 bit 级一致（fold 结合律 ulp 除外）。
-/// 转置分块：朴素逐元素在 [2048,16384] 全 cache miss（~130s/18 层量级）。
+/// W8 row quantization (after smooth absorb): host w32 [k,n] in-major ->
+/// int8 [n,k] physical + per-row scale [n]. Math must stay identical to
+/// int8_bake_weights.py (f32-domain multiply, max().max(1e-12)/127,
+/// ties-even round, clamp +/-127) — GEB_INT8_DUMP output is compared
+/// bit-exactly against the npz golden. Tiled transpose: a naive
+/// element-wise pass is all cache misses at [2048,16384] (~130s/18 layers).
 pub fn quant_w8(w32: &[f32], k: usize, s_eff: &[f32]) -> (Vec<i8>, Vec<f32>) {
     let n = w32.len() / k;
-    assert_eq!(w32.len(), n * k, "int8 权重非 k 整行");
-    assert_eq!(s_eff.len(), k, "smooth 因子长度 ≠ k");
-    let mut ws = vec![0f32; n * k]; // [n,k] 物理（转置 + s_eff 吸收一遍完成）
+    assert_eq!(w32.len(), n * k, "int8 weights: not whole k rows");
+    assert_eq!(s_eff.len(), k, "smooth factor length != k");
+    let mut ws = vec![0f32; n * k]; // [n,k] physical (transpose + absorb in one pass)
     for nn0 in (0..n).step_by(64) {
         let ne = (nn0 + 64).min(n);
         for kk0 in (0..k).step_by(64) {
@@ -370,44 +342,10 @@ pub fn quant_w8(w32: &[f32], k: usize, s_eff: &[f32]) -> (Vec<i8>, Vec<f32>) {
     (wq, scale)
 }
 
-/// host LayerNorm 参考（f32 计算）：aclnnAddLayerNorm 在 [768,1152] 有
-/// kernel 级放大（实测），eager 参考路径的 LN 用 host 计算。
-/// ⚠ 入参 stream 先同步——同步 d2h（aclrtMemcpy）不等待 compute 流上的
-/// 生产 kernel，不同步则读到跑赢/滞后的数据（eager 全 device kernel 时
-/// 确定性错排 98.2%；PFA 模式被 host 回调串行化掩盖）。
-pub fn host_ln(
-    ctx: &AscendContext, stream: &AscendStream, x: &DeviceBuffer, g: &[f16], b: &[f16], rows: i64, cols: i64,
-) -> DeviceBuffer {
-    drop(stream.synchronize());
-    let xh = download_f16(ctx, x, (rows * cols) as usize);
-    let mut out = vec![f16::from_f32(0.0); (rows * cols) as usize];
-    for r in 0..rows as usize {
-        let base = r * cols as usize;
-        let mut mean = 0f32;
-        for i in 0..cols as usize {
-            mean += xh[base + i].to_f32();
-        }
-        mean /= cols as f32;
-        let mut var = 0f32;
-        for i in 0..cols as usize {
-            let d = xh[base + i].to_f32() - mean;
-            var += d * d;
-        }
-        var /= cols as f32;
-        let rstd = 1.0 / (var + LN_EPS as f32).sqrt();
-        for i in 0..cols as usize {
-            out[base + i] = f16::from_f32(
-                (xh[base + i].to_f32() - mean) * rstd * g[i].to_f32() + b[i].to_f32(),
-            );
-        }
-    }
-    upload(ctx, &out)
-}
-
-/// cos/sin flat 表 + swap 索引（eager flat rope 常量同款语义）。
-/// x [t, heads*d] → flat [t*heads*2, d/2]（偶行 = 前半通道），位置 =
-/// pos_offset + t。cosF 半维重复自然成；sinF 折叠 rotate-half 符号
-/// （half_flag=0 取 -s、1 取 +s）。swap = 相邻行交换索引 r^1。
+/// Flat rope constants: cos/sin tables plus swap indices for the flat
+/// layout x [t, heads*d] -> [t*heads*2, d/2] (even rows = first half
+/// channels; position = pos_offset + t). sin rows fold the rotate-half
+/// sign (hf=0 -> -s, hf=1 -> +s); swap = adjacent-row exchange r^1.
 pub fn rope_flat_const(tokens: i64, heads: i64, pos_offset: i64) -> (Vec<f16>, Vec<f16>, Vec<i32>) {
     let half = (HD / 2) as usize;
     let rows = (tokens * heads * 2) as usize;
@@ -430,18 +368,20 @@ pub fn rope_flat_const(tokens: i64, heads: i64, pos_offset: i64) -> (Vec<f16>, V
     (cos, sin, swap)
 }
 
-/// rope 角度（golden 数值同源）：inv_freq = θ^(-2i/HD) 先量化 f16——torch
-/// 模型 .to(f16) 连 rotary inv_freq buffer 一起转，HF rotary 用 f16 频率回
-/// f32 算角。全精度频率在高位置（~968）处与 golden 相位差 O(0.1 rad)——
-/// prefix kv l0 即偏 12.6%、逐层放大至 l17 85%（f16-inv 复刻实测 0.08%）
+/// Rope angle, golden-matched: inv_freq = theta^(-2i/HD) is quantized to
+/// f16 FIRST — torch's .to(f16) converts the rotary inv_freq buffer too,
+/// and HF rotary computes angles from the f16 frequencies. Full-precision
+/// frequencies drift O(0.1 rad) at high positions (~968): prefix kv is
+/// 12.6% off at l0, amplifying to 85% by l17. Replicating the f16 step
+/// measured 0.08%.
 pub fn rope_angle(pos: i64, i: usize) -> f64 {
     let inv = f16::from_f32((ROPE_THETA as f32).powf(-(2.0 * i as f32) / HD as f32));
     pos as f64 * inv.to_f32() as f64
 }
 
-/// cos/sin rank-2 表 [t*heads, HD]（eager build_rope_tables 同款：cos 半维
-/// 重复、sin 符号折叠），配合通道半互换 swap（SliceD×2+ConcatD）的
-/// rank-2 rope 组合。
+/// Rank-2 rope tables [t*heads, HD]: cos half-dim duplicated, sin sign
+/// folded — pairs with the channel-half-swap (SliceD x2 + ConcatD) rope
+/// composition.
 pub fn rope_rank2_const(tokens: i64, heads: i64, pos_offset: i64) -> (Vec<f16>, Vec<f16>) {
     let d = HD as usize;
     let half = d / 2;
@@ -465,8 +405,10 @@ pub fn rope_rank2_const(tokens: i64, heads: i64, pos_offset: i64) -> (Vec<f16>, 
 }
 
 // ---------------------------------------------------------------------------
-// 段构造器：数据（权重/常量）与图一体，输入注册序 = 运行绑定序。
-// wire() 区分 Data（link 默认）与算子（link_out 显式端口，陷阱 #8）
+// Segment builder: data (weights/constants) and graph in one place;
+// input registration order == runtime binding order. wire() distinguishes
+// Data sources (link) from operator sources (link_out with an explicit
+// port — default port resolution fails silently on multi-output ops).
 // ---------------------------------------------------------------------------
 
 pub struct Seg {
@@ -475,35 +417,39 @@ pub struct Seg {
     names: Vec<String>,
     shapes: Vec<Vec<i64>>,
     pub binds: Vec<DeviceBuffer>,
-    /// binds 平行名表（bind_of 用）。⚠ names/shapes 只覆盖 Data 输入——
-    /// WCONST 权重（wt Const 分支）与 i8 占位槽只 push binds 不进 names，
-    /// 两表历史上不对齐（bind_of 恰只查头部 Data 输入而幸存）；bind_names
-    /// 与 binds 严格平行，按名定位不再依赖注册顺序（历史事故修复）
+    /// Name table parallel to binds. names/shapes only cover Data inputs —
+    /// WCONST weights (wt Const branch) and i8 placeholder slots push into
+    /// binds but not names, so those two tables do NOT align; bind_names
+    /// does, and name-based lookup no longer depends on registration order.
     pub bind_names: Vec<String>,
-    /// 图输入在 binds 里的下标（GEB_WCONST 时权重是 Const 不占图输入，
-    /// binds 仍全量持上传副本供 eager/层基址——索引两模式恒同）
+    /// Indices of graph inputs inside binds (under GEB_WCONST weights are
+    /// Consts and not graph inputs; binds still holds every upload so the
+    /// indices are identical in both modes).
     data_inputs: Vec<usize>,
-    /// GEB_NORM32 常量池（按宽度懒建：sc/kc/ones 的 Const 名——rms32 v2）
+    /// GEB_NORM32 constant pool, lazily built per width (sc/kc/ones Const
+    /// names).
     n32_c: std::collections::HashMap<i64, (String, String, String)>,
-    /// GEB_WCONST：mm 权重 Const 入图（编译期折叠 ND→NZ 转换，零运行
-    /// 时税；wgt 单算实证 0.3945→0.2945 ms/mm、OM 烤入权重 8.4MB）。
-    /// 代价：OM 变 per-权重集（checkpoint 版本进缓存 key）
+    /// GEB_WCONST: mm weights baked as Consts (ND->NZ folded at compile
+    /// time, zero runtime tax; measured 0.3945 -> 0.2945 ms/mm, +8.4MB in
+    /// the OM). Cost: the OM becomes per-weight-set (checkpoint version
+    /// joins the cache key).
     wconst: bool,
     datas: std::collections::HashSet<String>,
     outports: std::collections::HashMap<String, &'static str>,
-    /// LayerNormV4 实例名（finish 时 mean/rstd 绑 aux 图输出）
+    /// LayerNormV4 instance names (finish() binds mean/rstd as aux graph
+    /// outputs).
     ln_aux: Vec<String>,
-    /// gear 模式（GEB_DYN_LLIST）：每档的 p 值（VT+L-drop_v，段侧喂入）。
-    /// finish 时合成 ge.dynamicDims 档表 + 每档 S2 payload（全部动态输入
-    /// 维拼接，输入注册序）——mech 直接取用做 run_gear 入参
+    /// Gear mode (GEB_DYN_LLIST): p value per gear (VT+L-drop_v, fed by
+    /// the segment). finish() derives the ge.dynamicDims gear table and
+    /// one S2 payload per gear (all dynamic-input dims concatenated in
+    /// registration order) for run_gear.
     pub gear_ps: Vec<i64>,
     gear_mul: std::collections::HashMap<String, i64>,
-    /// 定值动态输入（每档恒值——legacy Const 墙的绕道，见 set_gear_fix）
-    gear_fix: std::collections::HashMap<String, i64>,
-    /// 每档 S2 payload（gear 模式非空；静态模式空 = run 等价）
+    /// S2 payload per gear (non-empty in gear mode; empty = plain run).
     pub gear_payloads: Vec<Vec<i64>>,
-    /// 每档纯 -1 位值（ge.dynamicDims 选项串专用——atc 语义只要 -1 位的
-    /// 值；payload 的静态尾维混进选项会让编译 rc=-7，实测）
+    /// Pure -1-slot values per gear, for the ge.dynamicDims option string
+    /// only — atc wants just the -1 positions there; mixing in static
+    /// trailing dims from the payload fails compilation with rc=-7.
     gear_optvals: Vec<Vec<i64>>,
 }
 
@@ -524,13 +470,13 @@ impl Seg {
             ln_aux: Vec::new(),
             gear_ps: Vec::new(),
             gear_mul: std::collections::HashMap::new(),
-            gear_fix: std::collections::HashMap::new(),
             gear_payloads: Vec::new(),
             gear_optvals: Vec::new(),
         }
     }
 
-    /// 图输入装配（GEB_WCONST 时排除 Const 化权重；其余模式 = binds 全量）
+    /// Graph-input assembly (under GEB_WCONST, Const-baked weights are
+    /// excluded; otherwise all binds).
     fn ins(&self) -> Vec<&DeviceBuffer> {
         if self.wconst {
             self.data_inputs.iter().map(|&i| &self.binds[i]).collect()
@@ -544,7 +490,8 @@ impl Seg {
         op.to_string()
     }
 
-    /// gear 模式装配（段侧喂档表的 p 值；动态输入 dim0 = mul×p，缺省 mul=1）
+    /// Gear setup: p value per gear, fed by the segment (dynamic-input
+    /// dim0 = mul*p, default mul=1).
     pub fn set_gear_ps(&mut self, ps: Vec<i64>) {
         self.gear_ps = ps;
     }
@@ -553,16 +500,10 @@ impl Seg {
         self.gear_mul.insert(name.to_string(), mul);
     }
 
-    /// 定值动态输入：进档表但每档恒值（内容静态却不能 Const 的输入——
-    /// legacy 算子 Const 输入墙 rc=-7，如 QMD 的 smooth 因子/gamma；全
-    /// 动态输入集是 SetInputDynamicDims 档位匹配的前提，实测定罪）
-    pub fn set_gear_fix(&mut self, name: &str, v: i64) {
-        self.gear_fix.insert(name.to_string(), v);
-    }
-
-    /// bind 下标按名查（bind_names 与 binds 严格平行——含 WCONST 权重与
-    /// i8 占位槽；names/shapes 仅 Data 输入面，两者历史上不对齐）
-    /// try 版：缺名返回 None（GEB_ATTN_MASK 可选输入 padmask 的 mech 接线）
+    /// Name -> binds index (bind_names is strictly parallel to binds,
+    /// including WCONST weights and i8 placeholders; names/shapes cover
+    /// only Data inputs and do not align). try_ variant returns None for
+    /// absent names (used for the optional GEB_ATTN_MASK padmask input).
     pub fn try_bind_of(&self, name: &str) -> Option<usize> {
         self.bind_names.iter().position(|n| n == name)
     }
@@ -571,12 +512,14 @@ impl Seg {
         self.bind_names
             .iter()
             .position(|n| n == name)
-            .unwrap_or_else(|| panic!("bind_of: 图输入 {name} 不存在"))
+            .unwrap_or_else(|| panic!("bind_of: graph input {name} not found"))
     }
 
-    /// 每档 S2 payload：全部含 -1 维输入的**完整 dims**（动态位 = mul×p，
-    /// 静态尾维原样；S2 定式——SetInputDynamicDims 一次调用带全部
-    /// 动态输入的全维）。ge.dynamicDims 选项串仍是纯 -1 位值（atc 语义）
+    /// S2 payload per gear: the FULL dims of every input carrying a -1
+    /// slot (dynamic slots = mul*p, static trailing dims verbatim; one
+    /// SetInputDynamicDims call carries all of them). The
+    /// ge.dynamicDims option string stays pure -1-slot values (atc
+    /// semantics).
     fn compose_gear_payloads(&mut self) {
         self.gear_payloads.clear();
         if self.gear_ps.is_empty() {
@@ -595,16 +538,11 @@ impl Seg {
                 let ndyn = shp.iter().filter(|&&d| d == -1).count();
                 assert!(
                     ndyn <= 1,
-                    "gear 输入 {n} 含 {ndyn} 个 -1 维（只支持 dim0 单维）"
+                    "gear input {n} has {ndyn} -1 dims (only dim0 supported)"
                 );
                 if ndyn == 1 {
-                    assert_eq!(shp[0], -1, "gear 输入 {n} 的 -1 须在 dim0");
-                    // 定值动态输入优先（每档恒值）；否则 mul×p
-                    let v = self
-                        .gear_fix
-                        .get(n)
-                        .copied()
-                        .unwrap_or_else(|| mul * pg);
+                    assert_eq!(shp[0], -1, "gear input {n}: -1 must be dim0");
+                    let v = mul * pg;
                     pl.push(v);
                     pl.extend_from_slice(&shp[1..]);
                     ov.push(v);
@@ -614,14 +552,15 @@ impl Seg {
             self.gear_optvals.push(ov);
         }
         println!(
-            "[gear] {} 档；payload 维数 {}（首档前 8 {:?}）",
+            "[gear] {} gears; payload dims {} (first 8 of gear 0: {:?})",
             self.gear_ps.len(),
             self.gear_payloads[0].len(),
             &self.gear_payloads[0][..8.min(self.gear_payloads[0].len())]
         );
     }
 
-    /// 档位执行便捷口：payload 取 self（静态模式走原 run，无分支切换）
+    /// Gear-run convenience: payload from self (static mode falls through
+    /// to plain run).
     pub fn run_seg(
         &self,
         gi: usize,
@@ -649,9 +588,10 @@ impl Seg {
         name.to_string()
     }
 
-    /// mm 权重注册（host [rows,cols] → [cols,rows] 转置）：GEB_WCONST 时
-    /// Const 入图（binds 仍持上传副本供 eager，但不占图输入位/idx）；
-    /// 否则 Data（现状——每执行付设备侧 ND→NZ TransData ~63GB/s）。
+    /// mm weight registration (host [rows,cols] -> transposed [cols,rows]):
+    /// under GEB_WCONST baked as a Const (binds still holds the uploaded
+    /// copy; no graph-input slot or idx consumed); otherwise a Data input
+    /// (pays a device-side ND->NZ TransData at ~63GB/s every execution).
     fn wt(&mut self, ctx: &AscendContext, name: &str, dims: &[i64], host: &[f16], rows: i64, cols: i64) -> String {
         let bytes = unsafe { std::slice::from_raw_parts(host.as_ptr() as *const u8, host.len() * 2) };
         let t = aops::host_transpose(bytes, rows, cols);
@@ -676,7 +616,8 @@ impl Seg {
         self.data_buf(name, dims, buf)
     }
 
-    /// fp32 Data 输入（GEB_NORM32 语义对齐用；binds 字节无关 dtype）
+    /// fp32 Data input (GEB_NORM32 semantics; binds are dtype-agnostic
+    /// bytes).
     fn data_f32(&mut self, ctx: &AscendContext, name: &str, dims: &[i64], host: &[f32]) -> String {
         let bytes: Vec<u8> = host.iter().flat_map(|v| v.to_le_bytes()).collect();
         let buf = upload_bytes(ctx, &bytes);
@@ -709,7 +650,7 @@ impl Seg {
         name.to_string()
     }
 
-    /// int8 Data 输入（int8 探针：QuantMatmulDequant 的量化权重/scale）
+    /// int8 Data input (QuantMatmulDequant weights/scales).
     fn data_i8(&mut self, ctx: &AscendContext, name: &str, dims: &[i64], host: &[i8]) -> String {
         let bytes: Vec<u8> = host.iter().map(|&v| v as u8).collect();
         let buf = upload_bytes(ctx, &bytes);
@@ -724,17 +665,19 @@ impl Seg {
         name.to_string()
     }
 
-    /// Const shape 张量（非图输入，编译期常量折叠）。⚠ shape 类输入用
-    /// data_i32（Data）会让消费算子（Reshape/LayerNormV4）输出 desc 变
-    /// unknown → DynamicShapePartitioner 拆子图 → unknown 部分走 host
-    /// 调度（每边界 ~20ms 停顿；vision OM 3220 个 unknown 标记实证）
+    /// Const shape tensor (not a graph input; folded at compile time).
+    /// Shape inputs MUST be Consts: as Data inputs they turn consumer
+    /// outputs (Reshape/LayerNormV4) into unknown descs, and the
+    /// DynamicShapePartitioner then splits the graph and schedules the
+    /// unknown parts on the host (~20ms stall per boundary; 3220 unknown
+    /// marks measured in a vision OM).
     fn const_i32(&mut self, name: &str, vals: &[i32]) -> String {
         self.g.add_const_i32(name, vals).unwrap();
         self.datas.insert(name.to_string());
         name.to_string()
     }
 
-    /// Const fp16 张量（权重入图用——NZ 转换编译期折叠假设的验证入口）
+    /// Const fp16 tensor (weights baked into the graph).
     fn const_f16(&mut self, name: &str, dims: &[i64], host: &[f16]) -> String {
         let bytes: Vec<u8> = host.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect();
         self.g.add_const_raw(name, dims, Dtype::Fp16, &bytes).unwrap();
@@ -742,7 +685,8 @@ impl Seg {
         name.to_string()
     }
 
-    /// dst.port ← src（Data 用默认解析；算子用显式输出端口）
+    /// dst.port <- src (Data: default resolution; operators: explicit
+    /// output port).
     fn wire(&self, dst: &str, port: &str, src: &str) {
         if self.datas.contains(src) {
             self.g.link(dst, port, src).unwrap();
@@ -752,9 +696,9 @@ impl Seg {
         }
     }
 
-    // ---- 算子辅助（返回算子名）----
+    // ---- Operator helpers (return the op name) ----
 
-    /// MatMulV2：a [m,k] × w'（物理 [n,k] 转置）→ [m,n]
+    /// MatMulV2: a [m,k] x w' (physical [n,k], transposed) -> [m,n].
     fn mm(&mut self, name: &str, a: &str, a_dims: &[i64], w: &str, w_dims: &[i64], o: &[i64]) -> String {
         self.g.add_op(name, "MatMulV2").unwrap();
         self.g.set_input_desc(name, "x1", a_dims, Dtype::Fp16).unwrap();
@@ -767,12 +711,14 @@ impl Seg {
         self.reg_out(name, "y")
     }
 
-    /// QuantMatmulDequant：a [m,k] × int8 wq [n,k]（transpose_weight=true，
-    /// linear 风格）→ y [m,n]；weight_scale f32 [n]；smooth_scale f16 [k]
-    /// / bias int32 [n] 可选（None = 无该输入）。契约经单算对拍实证
-    /// （310P legacy 单算；attr 必须显式设——裸 op 默认值不生效，rc=-7）。
-    /// bias 折入 = 砍层内 TileD+Add 对（Gemma bias=0 → int32 零恒等；
-    /// ⚠ 非零 bias 须按 weight_scale 预量化，v1 只支持零）
+    /// QuantMatmulDequant: a [m,k] x int8 wq [n,k] (transpose_weight=true,
+    /// linear style) -> y [m,n]; weight_scale f32 [n]; optional
+    /// smooth_scale f16 [k] and bias int32 [n] (None = input absent).
+    /// Contract verified by single-op parity on 310P legacy. Attributes
+    /// must be set explicitly — bare op defaults do not apply (rc=-7).
+    /// Folding bias in removes a per-layer TileD+Add pair (Gemma bias=0 ->
+    /// int32 zero identity; non-zero bias would need pre-quantization by
+    /// weight_scale — unsupported, v1 is zero-only).
     fn qmd(
         &mut self, name: &str, a: &str, a_dims: &[i64], wq: &str, w_dims: &[i64],
         ws: &str, sm: Option<&str>, zb: Option<&str>, n: i64, o: &[i64],
@@ -802,15 +748,16 @@ impl Seg {
         self.reg_out(name, "y")
     }
 
-    /// 行广播 bias：TileD(row [1,cols], multiples=[rows,1]) + Add。
-    /// （BroadcastToD 在 310P kernel 编译崩——TBE task_distribute；TileD
-    /// attr 版编译验证过。算子名后缀 _bc/_ba 与 bias 行 Data 名错开。）
-    /// 行广播输入注册（bias 行）：静态 = [1,cols] 原行（消费端 TileD 广播）；
-    /// gear = [gdyn,cols] 行重复 rows 份——TileD multiples 含 p 时全档共享
-    /// 不可用（attr 不随档变），改内容即广播（逐行相同，前缀截断语义）。
-    /// int8 折叠路径不消费 bias：gear 模式下干脆不注册（静态 Data 混入
-    /// 动态集 = SetDims 145012——未消费的静态输入也占图输入位）；静态模式
-    /// 传 rows=1 注册原行省内存
+    /// Row-broadcast bias registration: static mode registers the [1,cols]
+    /// row (consumer TileD broadcasts); gear mode registers the row
+    /// repeated rows times as [gdyn,cols] — TileD multiples cannot carry a
+    /// gear-dependent p (attrs are shared across gears), so the content
+    /// itself becomes the broadcast (rows identical = prefix truncation).
+    /// The int8 folding path does not consume the bias: in gear mode it is
+    /// simply not registered (an unconsumed static Data input still takes a
+    /// graph-input slot and mixing static content into the dynamic set
+    /// trips SetDims 145012); static mode passes rows=1 to register the
+    /// bare row and save memory.
     fn row_bcast(
         &mut self,
         ctx: &AscendContext,
@@ -819,7 +766,7 @@ impl Seg {
         cols: i64,
         row: &[f16],
     ) -> String {
-        // gear 模式：行重复注册为同形 [-1,cols]（rows==1 且未消费则折叠不注册）
+        // Gear mode: row repeated into [-1,cols]; rows==1 and unconsumed -> not registered.
         if gear_mode() {
             if rows > 1 {
                 let mut rep = Vec::with_capacity((rows * cols) as usize);
@@ -828,7 +775,8 @@ impl Seg {
                 }
                 self.data(ctx, name, &[gdyn(rows), cols], &rep)
             } else {
-                // 折叠未消费：不注册（名字占位，永不连线）
+                // Folded and unconsumed: not registered (placeholder name,
+                // never wired).
                 format!("{name}_folded")
             }
         } else {
@@ -839,7 +787,7 @@ impl Seg {
     fn bias(&mut self, name: &str, x: &str, x_dims: &[i64], row: &str) -> String {
         let ba = format!("{name}_ba");
         if gear_mode() {
-            // 行已重复注册为同形 [-1,cols]——直接 Add（无 TileD）
+            // Row already repeated into [-1,cols] — plain Add, no TileD.
             self.g.add_op(&ba, "Add").unwrap();
             self.g.set_input_desc(&ba, "x1", x_dims, Dtype::Fp16).unwrap();
             self.g.set_input_desc(&ba, "x2", x_dims, Dtype::Fp16).unwrap();
@@ -864,9 +812,9 @@ impl Seg {
         self.reg_out(&ba, "y")
     }
 
-    /// 行广播门控乘：TileD(gate [1,cols], multiples=[rows,1]) × Mul——torch
-    /// _gated_residual 的 gate 通路（residual + branch·gate）。与 bias 同
-    /// dim0 整行复制方向（#39 干净路径；连续平铺方向 kernel 腐蚀）
+    /// Row-broadcast gated multiply: TileD(gate [1,cols]) x Mul — the
+    /// gate path of torch _gated_residual (residual + branch*gate).
+    /// Broadcasts along dim0 whole-row like bias().
     fn gatew(&mut self, name: &str, x: &str, x_dims: &[i64], row: &str) -> String {
         let gc = format!("{name}_gc");
         let gm = format!("{name}_gm");
@@ -918,9 +866,10 @@ impl Seg {
 
     /// AddRmsNorm(x1=x, x2=zeros, gamma) → y
     fn addrms(&mut self, name: &str, x: &str, zeros: &str, gamma: &str, dims: &[i64]) -> String {
-        // GEB_NORM32：组合手搓 fp32 方差（zeros 输入不需要——rms(x+0)=rms(x)）
+        // GEB_NORM32: hand-composed fp32 variance (no zeros input needed —
+        // rms(x+0)=rms(x)).
         if norm32_enabled() {
-            // rms32 v2 直出 f16（无 Cast 尾巴）
+            // rms32 v2 emits f16 directly (no Cast tail).
             return self.rms32(&format!("{name}_r"), x, gamma, dims);
         }
         self.g.add_op(name, "AddRmsNorm").unwrap();
@@ -935,27 +884,12 @@ impl Seg {
         self.reg_out(name, "y")
     }
 
-    /// fp32 变体（GEB_NORM32）：torch GemmaRMSNorm 语义对齐——方差在
-    /// fp32 域算（norm16 对照实验定罪：去 fp32 上浮 = 行为 0/10 开关）。
-    /// 入参全 fp32，出 y fp32（调用方 Cast 回 f16 或直用）
-    fn addrms_f32(&mut self, name: &str, x: &str, zeros: &str, gamma: &str, dims: &[i64]) -> String {
-        self.g.add_op(name, "AddRmsNorm").unwrap();
-        self.g.set_input_desc(name, "x1", dims, Dtype::Fp32).unwrap();
-        self.g.set_input_desc(name, "x2", dims, Dtype::Fp32).unwrap();
-        self.g.set_input_desc(name, "gamma", &[dims[1]], Dtype::Fp32).unwrap();
-        self.g.set_output_desc(name, "y", dims, Dtype::Fp32).unwrap();
-        self.g.set_attr_float(name, "epsilon", RMS_EPS).unwrap();
-        self.wire(name, "x1", x);
-        self.g.link(name, "x2", zeros).unwrap();
-        self.g.link(name, "gamma", gamma).unwrap();
-        self.reg_out(name, "y")
-    }
-
-    /// ada-norm：y = rms(x)·scale + shift = AddRmsNorm(x, zeros, gamma=scale)
-    /// + TileD(shift_row) + Add（BroadcastToD 310P 编译崩，换 TileD）
+    /// ada-norm: y = rms(x)*scale + shift = AddRmsNorm(x, zeros,
+    /// gamma=scale) + TileD(shift_row) + Add (TileD instead of
+    /// BroadcastToD, which fails to compile on 310P).
     fn ada(&mut self, name: &str, x: &str, zeros: &str, scale: &str, shift: &str, dims: &[i64]) -> String {
-        // GEB_NORM32：torch ada 版语义 = rms32(x,scale) + shift（v2 全
-        // f16 域——scale 已折 1+s0 进 host，shift 广播同非 NORM32 形态）
+        // GEB_NORM32: torch ada semantics = rms32(x, scale) + shift
+        // (all-f16 domain; 1+s0 is folded into the host scale).
         if norm32_enabled() {
             let n = self.rms32(&format!("{name}_r"), x, scale, dims);
             let sbc = format!("{name}_sbc");
@@ -985,8 +919,9 @@ impl Seg {
         self.add2(name, &n, &sbc, dims)
     }
 
-    /// NORM32 常量池（按宽度懒建 Const：sc=s 预缩放 / kc=s·√w /
-    /// ones [1,w]——Const 编译期折叠不占模型输入；多 norm 复用同名节点）
+    /// NORM32 constant pool, lazily built per width (sc = s prescale,
+    /// kc = s*sqrt(w), ones [1,w]) — Consts fold at compile time and cost
+    /// no model input; norms of the same width share one node.
     fn n32_consts(&mut self, w: i64) -> (String, String, String) {
         if let Some(c) = self.n32_c.get(&w) {
             return c.clone();
@@ -1005,32 +940,22 @@ impl Seg {
         c
     }
 
-    /// Cast 节点（to_f32=true: f16→f32；false: f32→f16）。dst_type 是
-    /// DataType 类型 attr——int 值猜测版编译 rc=-7（proto 枚举序不确定），
-    /// 走 geb_set_attr_dtype（C++ ParseDtype 同管道）
-    fn cast_node(&mut self, name: &str, x: &str, dims: &[i64], to_f32: bool) -> String {
-        let (idt, odt) = if to_f32 { (Dtype::Fp16, Dtype::Fp32) } else { (Dtype::Fp32, Dtype::Fp16) };
-        self.g.add_op(name, "Cast").unwrap();
-        self.g.set_input_desc(name, "x", dims, idt).unwrap();
-        self.g.set_output_desc(name, "y", dims, odt).unwrap();
-        self.g.set_attr_dtype(name, "dst_type", if to_f32 { "fp32" } else { "fp16" }).unwrap();
-        self.wire(name, "x", x);
-        self.reg_out(name, "y")
-    }
-
-    /// NORM32 核心 v2（f16 域 + MatMul 立方体 fp32 累加，tap 矩阵定案）：
-    /// 310P tbe 的 ReduceSumD/ReduceSum f32 desc 均为假支持——FE 混精度
-    /// 回退跑 f16 累加，行和 >65504 饱和（实测 92% 偏差）；Cast f32 是
-    /// 真语义（逐位一致）。方差精度改走 mm 的 cube fp32 累加（实测
-    /// 0.05% = f16 量化级）：
-    ///   xs=x·s（防 outlier 平方溢出）→ sq=xs² → ssum=mm(sq,onesᵀ)
-    ///   → inv=rsqrt(ssum)·k（k=s·√w）→ 1-D Tile 广播 → x·invb·γ
-    /// 全程 f16 kernel；torch GemmaRMSNorm 对齐的关键是方差不饱和/
-    /// 不漂移（fp32 累加），f16 mul 舍入 ~0.05%/op 为残余差
+    /// NORM32 core v2 (f16 domain, fp32 accumulation via MatMul cube):
+    /// 310P tbe ReduceSumD/ReduceSum with f32 descs are fake support — the
+    /// FE falls back to f16 accumulation and row sums saturate above
+    /// 65504 (92% deviation measured); Cast to f32 is real semantics.
+    /// Variance precision therefore rides the mm cube's fp32 accumulation
+    /// (0.05% measured = f16 quantization level):
+    ///   xs = x*s (guards outlier square overflow) -> sq = xs^2 ->
+    ///   ssum = mm(sq, ones^T) -> inv = rsqrt(ssum)*k (k = s*sqrt(w)) ->
+    ///   1-D tile broadcast -> x*invb*gamma.
+    /// All kernels f16; GemmaRMSNorm alignment hinges on a non-saturating,
+    /// non-drifting variance (fp32 accumulate); f16 mul rounding ~0.05%/op
+    /// is the residual.
     fn rms32(&mut self, name: &str, x: &str, gamma: &str, dims: &[i64]) -> String {
         let (rows, w) = (dims[0], dims[1]);
         let (sc, kc, ones) = self.n32_consts(w);
-        // xs = x·s
+        // xs = x*s
         let xs = format!("{name}_xs");
         self.g.add_op(&xs, "Mul").unwrap();
         self.g.set_input_desc(&xs, "x1", dims, Dtype::Fp16).unwrap();
@@ -1039,11 +964,11 @@ impl Seg {
         self.wire(&xs, "x1", x);
         self.g.link(&xs, "x2", &sc).unwrap();
         let xs = self.reg_out(&xs, "y");
-        // sq = xs²
+        // sq = xs^2
         let sq = self.mul2_f16(&format!("{name}_sq"), &xs, &xs, dims);
-        // ssum = mm(sq, onesᵀ) [rows,1] —— cube 内 fp32 累加
+        // ssum = mm(sq, ones^T) [rows,1] — fp32 accumulation inside the cube.
         let ssum = self.mm(&format!("{name}_mm"), &sq, dims, &ones, &[1, w], &[rows, 1]);
-        // inv = rsqrt(ssum) · k（k = s·√w，把预缩放折回）
+        // inv = rsqrt(ssum) * k (k = s*sqrt(w) folds the prescale back in).
         let rs = format!("{name}_rs");
         self.g.add_op(&rs, "Rsqrt").unwrap();
         self.g.set_input_desc(&rs, "x", &[rows, 1], Dtype::Fp16).unwrap();
@@ -1058,11 +983,11 @@ impl Seg {
         self.wire(&ik, "x1", &rs);
         self.g.link(&ik, "x2", &kc).unwrap();
         let ik = self.reg_out(&ik, "y");
-        // 广播（行式形态）：[rows,1] → Reshape [1,rows] → TileD
-        // multiples=[w,1]（dim0 整行复制——生产 bias/γ 链同款 kernel）
-        // → [w,rows] → TransposeD(1,0) → [rows,w]。⚠ 连续平铺方向
-        // （rank-1 [rows] 或 [1,rows]+[1,w] flat tile）的 TileD kernel
-        // 在 310P f16 散点腐蚀 ~8%（逐位同错定罪）；行式形态 = 0.08% 干净
+        // Broadcast, row-wise shape: [rows,1] -> Reshape [1,rows] ->
+        // TileD multiples=[w,1] -> [w,rows] -> TransposeD(1,0) -> [rows,w].
+        // The contiguous-tile variants (rank-1 [rows], or [1,rows] tiled
+        // by [1,w]) corrupt scattered f16 elements by ~8% on 310P; this
+        // row-wise shape measures a clean 0.08%.
         let bshp = format!("{name}_bshp");
         self.const_i32(&bshp, &[1, rows as i32]);
         let br1 = self.reshape(&format!("{name}_br1"), &ik, &[rows, 1], &bshp, &[1, rows]);
@@ -1080,9 +1005,9 @@ impl Seg {
         self.g.set_attr_int_list(&tp, "perm", &[1, 0]).unwrap();
         self.wire(&tp, "x", &btiled);
         let invt = self.reg_out(&tp, "y");
-        // nx = x · invb
+        // nx = x * invb
         let nx = self.mul2_f16(&format!("{name}_nx"), x, &invt, dims);
-        // gamma [w] → Reshape [1,w]（rank 桥）→ Tile [rows,w]
+        // gamma [w] -> Reshape [1,w] (rank bridge) -> Tile [rows,w]
         let gshp = format!("{name}_gshp");
         self.const_i32(&gshp, &[1, w as i32]);
         let gfr = self.reshape(&format!("{name}_gfr"), gamma, &[w], &gshp, &[1, w]);
@@ -1091,12 +1016,12 @@ impl Seg {
         self.g.set_input_desc(&gt, "x", &[1, w], Dtype::Fp16).unwrap();
         self.g.set_output_desc(&gt, "y", dims, Dtype::Fp16).unwrap();
         self.g.set_attr_int_list(&gt, "multiples", &[rows, 1]).unwrap();
-        self.wire(&gt, "x", &gfr); // gfr 是算子输出——link 只配 Data 名（陷阱 #8）
+        self.wire(&gt, "x", &gfr); // gfr is an op output — plain link takes Data names only
         let gft = self.reg_out(&gt, "y");
         self.mul2_f16(name, &nx, &gft, dims)
     }
 
-    /// f16 Mul（同形）——NORM32 v2 全 f16 域用
+    /// Same-shape f16 Mul (NORM32 v2, all-f16 domain).
     fn mul2_f16(&mut self, name: &str, a: &str, b: &str, dims: &[i64]) -> String {
         self.g.add_op(name, "Mul").unwrap();
         self.g.set_input_desc(name, "x1", dims, Dtype::Fp16).unwrap();
@@ -1107,56 +1032,13 @@ impl Seg {
         self.reg_out(name, "y")
     }
 
-    /// [rows,1] ÷ [1] 标量（RealDiv 广播——标量分母 TBE 接受）
-    fn rdiv1(&mut self, name: &str, x: &str, num: &str, rows: i64) -> String {
-        self.g.add_op(name, "RealDiv").unwrap();
-        self.g.set_input_desc(name, "x1", &[rows, 1], Dtype::Fp32).unwrap();
-        self.g.set_input_desc(name, "x2", &[1], Dtype::Fp32).unwrap();
-        self.g.set_output_desc(name, "y", &[rows, 1], Dtype::Fp32).unwrap();
-        self.wire(name, "x1", x);
-        self.g.link(name, "x2", num).unwrap();
-        self.reg_out(name, "y")
-    }
-
-    /// [rows,1] + [1] 标量 eps
-    fn add_b1(&mut self, name: &str, x: &str, y: &str, rows: i64) -> String {
-        self.g.add_op(name, "Add").unwrap();
-        self.g.set_input_desc(name, "x1", &[rows, 1], Dtype::Fp32).unwrap();
-        self.g.set_input_desc(name, "x2", &[1], Dtype::Fp32).unwrap();
-        self.g.set_output_desc(name, "y", &[rows, 1], Dtype::Fp32).unwrap();
-        self.wire(name, "x1", x);
-        self.g.link(name, "x2", y).unwrap();
-        self.reg_out(name, "y")
-    }
-
-    /// f32 Mul（同形）——dims 校验由调用方保证
-    fn mul2_f32(&mut self, name: &str, a: &str, b: &str, dims: &[i64]) -> String {
-        self.g.add_op(name, "Mul").unwrap();
-        self.g.set_input_desc(name, "x1", dims, Dtype::Fp32).unwrap();
-        self.g.set_input_desc(name, "x2", dims, Dtype::Fp32).unwrap();
-        self.g.set_output_desc(name, "y", dims, Dtype::Fp32).unwrap();
-        self.wire(name, "x1", a);
-        self.wire(name, "x2", b);
-        self.reg_out(name, "y")
-    }
-
-    /// f32 Add（同形）
-    fn add2_f32(&mut self, name: &str, a: &str, b: &str, dims: &[i64]) -> String {
-        self.g.add_op(name, "Add").unwrap();
-        self.g.set_input_desc(name, "x1", dims, Dtype::Fp32).unwrap();
-        self.g.set_input_desc(name, "x2", dims, Dtype::Fp32).unwrap();
-        self.g.set_output_desc(name, "y", dims, Dtype::Fp32).unwrap();
-        self.wire(name, "x1", a);
-        self.wire(name, "x2", b);
-        self.reg_out(name, "y")
-    }
-
-    /// LayerNormV4（vision SigLIP norm）。⚠ aclnnAddLayerNorm/GE AddLayerNorm
-    /// 在 [768,1152] 大 shape 输出 ~100× 放大（行方差正常、kernel 级行为，
-    /// trace 取证）——换 LayerNormV4（normalized_shape 张量输入）。
-    /// ⚠ mean/rstd 是 REQUIRED 输出且死端会让 y 爆（探针取证，与
-    /// AddRmsNorm 死端无害相反）——每个 LN 实例记入 ln_aux，finish 时
-    /// 绑成 aux 图输出（parity 只对拍主输出）。
+    /// LayerNormV4 (vision SigLIP norm). aclnnAddLayerNorm/GE AddLayerNorm
+    /// amplify output ~100x at [768,1152] (row variance normal — kernel
+    /// behavior), hence LayerNormV4 with its normalized_shape tensor
+    /// input. mean/rstd are REQUIRED outputs and leaving them dead blows
+    /// up y (unlike AddRmsNorm, whose dead ends are harmless) — every LN
+    /// instance is recorded in ln_aux and bound as aux graph outputs at
+    /// finish().
     fn addln(&mut self, name: &str, x: &str, gamma: &str, beta: &str, nsh: &str, dims: &[i64]) -> String {
         self.g.add_op(name, "LayerNormV4").unwrap();
         self.g.set_input_desc(name, "x", dims, Dtype::Fp16).unwrap();
@@ -1173,7 +1055,7 @@ impl Seg {
         self.reg_out(name, "y")
     }
 
-    /// PromptFlashAttention（BSH rank-3；q/kv seq 可不同 = cross）
+    /// PromptFlashAttention (BSH rank-3; q/kv seq may differ = cross).
     #[allow(clippy::too_many_arguments)]
     fn pfa(
         &mut self, name: &str, q: &str, k: &str, v: &str,
@@ -1198,7 +1080,7 @@ impl Seg {
         self.reg_out(name, "attention_out")
     }
 
-    /// Squeeze(axis=[0])：[1,m,*] → [m,*]
+    /// Squeeze(axis=[0]): [1,m,*] -> [m,*].
     fn squeeze(&mut self, name: &str, x: &str, in3: &[i64; 3], out2: &[i64; 2]) -> String {
         self.g.add_op(name, "Squeeze").unwrap();
         self.g.set_input_desc(name, "x", in3, Dtype::Fp16).unwrap();
@@ -1208,7 +1090,7 @@ impl Seg {
         self.reg_out(name, "y")
     }
 
-    /// Reshape(x, shape 常量张量输入)
+    /// Reshape(x, shape as a constant tensor input).
     fn reshape(&mut self, name: &str, x: &str, in_dims: &[i64], shape_in: &str, out: &[i64]) -> String {
         self.g.add_op(name, "Reshape").unwrap();
         self.g.set_input_desc(name, "x", in_dims, Dtype::Fp16).unwrap();
@@ -1219,19 +1101,7 @@ impl Seg {
         self.reg_out(name, "y")
     }
 
-    /// SliceD rank-3 [b,s,w] 最后一维通道切分
-    fn slice3(&mut self, name: &str, x: &str, dims: &[i64; 3], col_off: i64, col_len: i64) -> String {
-        let out = [dims[0], dims[1], col_len];
-        self.g.add_op(name, "SliceD").unwrap();
-        self.g.set_input_desc(name, "x", dims, Dtype::Fp16).unwrap();
-        self.g.set_output_desc(name, "y", &out, Dtype::Fp16).unwrap();
-        self.g.set_attr_int_list(name, "offsets", &[0, 0, col_off]).unwrap();
-        self.g.set_attr_int_list(name, "size", &out).unwrap();
-        self.wire(name, "x", x);
-        self.reg_out(name, "y")
-    }
-
-    /// SliceD rank-2 通道切分
+    /// SliceD rank-2 channel split.
     fn slice2(&mut self, name: &str, x: &str, dims: &[i64; 2], col_off: i64, col_len: i64) -> String {
         let out = [dims[0], col_len];
         self.g.add_op(name, "SliceD").unwrap();
@@ -1243,7 +1113,7 @@ impl Seg {
         self.reg_out(name, "y")
     }
 
-    /// GatherV2D 行 gather（axis=0 attr；swap / 行复制通用）
+    /// GatherV2D row gather (axis=0 attr; used for swaps and row copies).
     fn gather_rows(&mut self, name: &str, x: &str, dims: &[i64; 2], idx: &str) -> String {
         self.g.add_op(name, "GatherV2D").unwrap();
         self.g.set_input_desc(name, "x", dims, Dtype::Fp16).unwrap();
@@ -1257,39 +1127,11 @@ impl Seg {
         self.reg_out(name, "y")
     }
 
-    /// ConcatD：rank-3 [1,s,d] 沿 seq 维（concat_dim=1）拼接。
-    /// ⚠ DYNAMIC_INPUT 端口必须先 dyn_inputs("x", 2) 注册（工厂不预建，
-    /// num=0；ge_builder 经 libgraph_base 符号直链注册）；端口名
-    /// x0/x1（base+序号，从 0 起——非 TF 惯例的 x1/x2）
-    fn concat_seq3(&mut self, name: &str, a: &str, b: &str, a_bsh: &[i64; 3], b_bsh: &[i64; 3]) -> String {
-        let out = [1, a_bsh[1] + b_bsh[1], a_bsh[2]];
-        self.g.add_op(name, "ConcatD").unwrap();
-        self.g.dyn_inputs(name, "x", 2).unwrap();
-        self.g.set_input_desc(name, "x0", a_bsh, Dtype::Fp16).unwrap();
-        self.g.set_input_desc(name, "x1", b_bsh, Dtype::Fp16).unwrap();
-        self.g.set_output_desc(name, "y", &out, Dtype::Fp16).unwrap();
-        self.g.set_attr_int(name, "concat_dim", 1).unwrap();
-        self.g.set_attr_int(name, "N", 2).unwrap();
-        self.wire(name, "x0", a);
-        self.wire(name, "x1", b);
-        self.reg_out(name, "y")
-    }
-
-    /// rank-2 → rank-3 Unsqueeze(axes=[0])（PFA 直连桥）
-    fn unsqueeze(&mut self, name: &str, x: &str, dims: &[i64; 2]) -> String {
-        let out = [1, dims[0], dims[1]];
-        self.g.add_op(name, "Unsqueeze").unwrap();
-        self.g.set_input_desc(name, "x", dims, Dtype::Fp16).unwrap();
-        self.g.set_output_desc(name, "y", &out, Dtype::Fp16).unwrap();
-        self.g.set_attr_int_list(name, "axes", &[0]).unwrap();
-        self.wire(name, "x", x);
-        self.reg_out(name, "y")
-    }
-
-    /// rope 组合（rank-2 版，r1 验证）：x [t, heads*d] → 半通道
-    /// SliceD×2 → ConcatD(axis=1) 互换 → mul+mul+add（rank-2 表）→
-    /// Reshape → [1,t,heads*d]（v3n 验证 Reshape 喂 PFA 数值逐位一致；
-    /// Unsqueeze 喂 PFA 有累积变体差，弃用）。返回 (rank-2, rank-3)。
+    /// Rank-2 rope composition: x [t, heads*d] -> half-channel SliceD x2
+    /// -> ConcatD(axis=1) swap -> mul+mul+add (rank-2 tables) -> Reshape
+    /// [1,t,heads*d]. Feeding PFA through Reshape is bit-identical;
+    /// Unsqueeze showed cumulative drift, so it is not used. Returns
+    /// (rank-2, rank-3).
     fn rope2(&mut self, tag: &str, x: &str, dims: &[i64; 2], cos2: &str, sin2: &str,
              shp3: &str) -> (String, String) {
         let (t, wd) = (dims[0], dims[1]);
@@ -1314,11 +1156,11 @@ impl Seg {
         (kr, kr3)
     }
 
-    /// flat 版 rope（无列切）：[t, wd] → Reshape[t*2, half] →
-    /// GatherV2D(相邻行 swap，idx 为 Const) → mul+mul+add → Reshape back。
-    /// 表 = 段级 flat cos/sin 输入（eager flat 版同款布局）。替代
-    /// rope2 的 slice2×2+ConcatD——列切视图触发运行时 MemcopyAsync 物化
-    /// （同 qkv 切分病；GatherV2D 310P 仅 axis=0，故换 flat 视图做行交换）
+    /// Flat rope (no column split): [t, wd] -> Reshape [t*2, half] ->
+    /// GatherV2D adjacent-row swap (Const idx) -> mul+mul+add -> Reshape
+    /// back. Replaces rope2's SliceD x2 + ConcatD: column-split views
+    /// trigger a runtime MemcopyAsync materialization, and GatherV2D on
+    /// 310P is axis=0 only, hence the flat view for a row swap.
     fn rope2_flat(
         &mut self, tag: &str, x: &str, dims: &[i64; 2], fdims: &[i64; 2],
         cos_f: &str, sin_f: &str, idx_c: &str, shp_flat: &str, shp_back: &str,
@@ -1335,10 +1177,11 @@ impl Seg {
         (kr, kr3)
     }
 
-    /// 手工 attention（MHA 版，ma 验证 0.26%）：q/k/v3 [bh,s,d] →
-    /// bmm(q,kᵀ) → SoftmaxV2(axes=-1) → bmm(·,v)。scale 由调用方折进
-    /// q 侧权重+bias（PFA 的 host 回调 InnerPFA 每次执行 ~20ms 停顿的
-    /// 替代；AttentionScore 310P 无 kernel——asc 三变体编译崩）。
+    /// Manual attention (MHA): q/k/v3 [bh,s,d] -> bmm(q,k^T) ->
+    /// SoftmaxV2(axes=-1) -> bmm(.,v). Scale is folded into the q-side
+    /// weights+bias by the caller. This replaces PFA, whose InnerPFA host
+    /// callback stalls ~20ms per execution (AttentionScore has no 310P
+    /// kernel).
     fn attn_manual(&mut self, name: &str, q3: &str, k3: &str, v3: &str, bh: i64, s: i64, d: i64) -> String {
         let (sc, sm, bm) = (format!("{name}_sc"), format!("{name}_sm"), format!("{name}_bm"));
         self.g.add_op(&sc, "BatchMatMulV2").unwrap();
@@ -1368,11 +1211,11 @@ impl Seg {
         self.reg_out(&bm, "y")
     }
 
-    /// GQA 版（ma2 验证 0.24%）：k3/v3 [1,skv,d] TileD 广播到 bh 头。
-    /// q3 [bh,sq,d]。返回 [bh,sq,d]。
-    /// mask（GEB_ATTN_MASK，range padding）：Some = softmax 前
-    /// 加性 mask 广播 Add（x2 [1,1,skv]——pad 键列大负数，真列 0）。数学上
-    /// 精确（x+0 恒等 + exp(-30000+max) 下溢恰 0），真行输出与精确 L 版等价
+    /// GQA variant: k3/v3 [1,skv,d] tiled to bh heads; q3 [bh,sq,d];
+    /// returns [bh,sq,d]. With mask (GEB_ATTN_MASK, range padding) the
+    /// additive mask is broadcast-added before softmax (x2 [1,1,skv]:
+    /// large negative on pad key columns, 0 on real ones) — exact for
+    /// real rows (x+0 identity; exp(-30000+max) underflows to 0).
     fn attn_manual_gqa(
         &mut self, name: &str, q3: &str, k3: &str, v3: &str,
         bh: i64, sq: i64, skv: i64, d: i64, mask: Option<&str>,
@@ -1428,10 +1271,10 @@ impl Seg {
         self.reg_out(&bm, "y")
     }
 
-    /// token 主序 [views*s, h*d] → 头主序 [views*h, s, d]（bmm 布局）。
-    /// ⚠ 直接 Reshape 是错排（[768,1152]→[48,256,72] 把头/序混排——
-    /// manual 对拍 98.2% 实证）：正确变换 = Reshape[views,s,h,d] →
-    /// TransposeD(0,2,1,3) → Reshape[views*h,s,d]。
+    /// Token-major [views*s, h*d] -> head-major [views*h, s, d] (bmm
+    /// layout). A direct Reshape is a mispermute (98.2% parity error
+    /// measured); the correct chain is Reshape [views,s,h,d] ->
+    /// TransposeD(0,2,1,3) -> Reshape [views*h,s,d].
     fn headsplit(
         &mut self, name: &str, x: &str, t: i64, views: i64, s: i64, h: i64, d: i64,
         shp_vs4: &str, shp_bh3: &str,
@@ -1460,7 +1303,7 @@ impl Seg {
         self.reg_out(&r3, "y")
     }
 
-    /// headsplit 的逆：[views*h, s, d] → [views*s, h*d]
+    /// Inverse of headsplit: [views*h, s, d] -> [views*s, h*d].
     fn headmerge(
         &mut self, name: &str, x: &str, views: i64, s: i64, h: i64, d: i64,
         shp_vh4: &str, shp_flat2: &str,
@@ -1491,15 +1334,17 @@ impl Seg {
     }
 
     fn finish(&mut self, out_names: &[&str]) {
-        // gear payload 合成先于一切早退（serve/e2e 模式跳过编译但 mech 仍需
-        // payload 做逐请求选档；names/shapes 此刻已定）
+        // Gear payload composition precedes every early return (serve/e2e
+        // skip compilation but mechs still need payloads to pick a gear per
+        // request; names/shapes are final at this point).
         self.compose_gear_payloads();
         if std::env::var("GEB_LOAD").is_ok() {
-            // 缓存加载模式：跳过编译，改用磁盘 OM
+            // Cached-load mode: skip compilation, use the on-disk OM.
             return;
         }
         if std::env::var("GEB_SEG").ok().as_deref() == Some("e2e") {
-            // e2e 模式：同样跳过编译（e2e_run 里按 {seg}_real.om 加载）
+            // e2e mode: skip compilation too ({seg}_real.om loaded in
+            // e2e_run).
             return;
         }
         let names: Vec<&str> = self.names.iter().map(|s| s.as_str()).collect();
@@ -1510,12 +1355,12 @@ impl Seg {
             .map(|(n, d)| (n.as_str(), d.as_slice()))
             .collect();
         self.g.graph_inputs(&names).unwrap();
-        // GEB_NO_AUX=1：跳过 LN 辅输出绑定（mean/rstd 死端会让 y 爆——
-        // trap #17，数值坏但 bench 计时有效；用于隔离 111 图输出假设）
+        // GEB_NO_AUX=1: skip the LN aux-output binding (dead mean/rstd
+        // blow up y — numerics break but bench timing stays valid).
         if self.ln_aux.is_empty() || std::env::var("GEB_NO_AUX").is_ok() {
             self.g.graph_outputs(out_names).unwrap();
         } else {
-            // 主输出 idx0 + 每个 LayerNormV4 的 mean(idx1)/rstd(idx2)
+            // Main outputs idx0 + mean(idx1)/rstd(idx2) per LayerNormV4.
             let mut all: Vec<&str> = out_names.to_vec();
             let mut idxs: Vec<i32> = vec![0; out_names.len()];
             for ln in &self.ln_aux {
@@ -1527,8 +1372,9 @@ impl Seg {
             self.g.graph_outputs_idx(&all, &idxs).unwrap();
         }
         self.g.set_nd_input_shape(&shape_refs).unwrap();
-        // gear 模式：ge.dynamicDims 档表 = 纯 -1 位值（输入注册序；payload
-        // 的静态尾维混入选项会 rc=-7——选项/payload 双结构分离）
+        // Gear mode: ge.dynamicDims gear table = pure -1-slot values in
+        // registration order (mixing static trailing dims from the payload
+        // into the option fails with rc=-7 — hence the two structures).
         if !self.gear_optvals.is_empty() {
             let opt = self
                 .gear_optvals
@@ -1544,8 +1390,9 @@ impl Seg {
             println!("[gear] dynamicDims: {opt}");
             self.g.set_option("ge.dynamicDims", &opt).unwrap();
         }
-        // GEB_OPT_<key>=<value>：build option 直通口（A/B 实验，如
-        // GEB_OPT_ge.streamMaxParallelNum=AIcoreEngine:1,VectorEngine:1）
+        // GEB_OPT_<key>=<value>: build-option passthrough (A/B
+        // experiments, e.g.
+        // GEB_OPT_ge.streamMaxParallelNum=AIcoreEngine:1,VectorEngine:1).
         for (k, v) in std::env::vars().filter(|(k, _)| k.starts_with("GEB_OPT_")) {
             let key = &k["GEB_OPT_".len()..];
             self.g.set_option(key, &v).unwrap();
@@ -1556,17 +1403,14 @@ impl Seg {
 }
 
 // ---------------------------------------------------------------------------
-// 通用运行：eager 参考跑完 → GE run → 对拍 → bench → OM 落盘
-// ---------------------------------------------------------------------------
-
-
-// ---------------------------------------------------------------------------
-// e2e：三段 OM 接真实推理链（GEB_SEG=e2e，进程内链式、host 中转）
-//   组装口径与 CUDA 镜像同源：
-//   x0 = vision_out ‖ token_embedding[token_ids]（视觉前语言后）
-//   state 不进 prefix——π0.5 走 state 离散化进 prompt（pi05_prompt）
-//   cond = silu(W_out·silu(W_in·te+b_in)+b_out)；style 切分 [0:w]/[w:2w]
-//   （executor L714-719：ascl=1+s0 / ash=s1）
+// e2e: the three segment OMs wired into the real inference chain
+// (GEB_SEG=e2e, in-process chaining, host relay between segments).
+// Assembly mirrors the CUDA executor:
+//   x0 = vision_out || token_embedding[token_ids] (vision rows first)
+//   state does not enter prefix — PI-0.5 discretizes state into the
+//   prompt (pi05_prompt)
+//   cond = silu(W_out*silu(W_in*te+b_in)+b_out); style split [0:w]/[w:2w]
+//   (ascl = 1+s0, ash = s1)
 // ---------------------------------------------------------------------------
 
 pub struct E2eStage {
@@ -1586,29 +1430,29 @@ pub struct E2eStage {
 }
 
 // ---------------------------------------------------------------------------
-// GEB_E2E_SERVE 常驻机械：三段 per-frame 执行器（闭环 eval 用）。
-// 单进程单桶（GEB_TOKENS=L + GEB_OM_DIR=tl{L}），Python 侧按帧挑桶/每桶
-// 起一个 serve 进程（supervisor 在 apxinf_rust 容器内 spawn——引擎二进制
-// 绑定 9.0.1 GE）。ctx/stream 不入机械，机械只持 owned 状态：Seg
-// （OM + binds）/输出 buffer/嵌入表/styles 缓存。
+// Resident per-frame segment mechs (closed-loop eval). One process per
+// bucket (GEB_TOKENS=L + GEB_OM_DIR=tl{L}); the Python side picks a
+// bucket per frame and the supervisor spawns one serve process per
+// bucket inside the apxinf_rust container (the engine binary binds the
+// 9.0.1 GE). ctx/stream live outside; mechs hold only owned state: Seg
+// (OM + binds), output buffers, embedding table, styles cache.
 // ---------------------------------------------------------------------------
 
 pub struct VisionMech {
     s: Seg,
-    routs: Vec<DeviceBuffer>, // 108 路 LN aux 槽一次分配复用（只下载主输出）
+    routs: Vec<DeviceBuffer>, // 108 LN aux slots, allocated once (only the main output is downloaded)
 }
 
 impl VisionMech {
-    /// 一帧 vision：覆写 binds[0]（patches）重跑，只下载主输出 idx0
-    /// （replay 同式）
+    /// One vision frame: overwrite binds[0] (patches), rerun, download
+    /// only main output idx0.
     fn one_frame(&mut self, ctx: &AscendContext, stream: &AscendStream, patches: &[f16]) -> Vec<f16> {
-        assert_eq!(patches.len() * 2, self.s.binds[0].len(), "serve patches 尺寸不符");
-        // 流水化热路径：零拷贝字节视图（LE 主机上
-        // to_le_bytes ≡ raw bytes，wbuf_t 同款 reinterpret）+ 三段全挂流
-        // （h2d → run → d2h 同 stream FIFO，host 只等最后一次 sync）。
-        // 字节流路径与逐元素转换版完全一致 ⇒ 数值 bit 恒等；分解定罪
-        // 的 d2h 3.4ms + dlconv 5.1ms（1.57M 元素 chunks_exact）就此消除。
-        // 计时：enq 三段 + wait。
+        assert_eq!(patches.len() * 2, self.s.binds[0].len(), "serve patches size mismatch");
+        // Hot path: zero-copy byte views (on LE hosts to_le_bytes == raw
+        // bytes) and all three stages on one stream (h2d -> run -> d2h in
+        // stream FIFO order; the host waits once at the final sync). Bit
+        // -identical to the per-element conversion path; removes the d2h
+        // 3.4ms + dlconv 5.1ms once measured here.
         let tim = serve_timing();
         let t0 = std::time::Instant::now();
         let bytes: &[u8] =
@@ -1624,7 +1468,7 @@ impl VisionMech {
             unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, n0 * 2) };
         ctx.copy_d2h_async(obytes, &self.routs[0], stream).expect("serve d2h vision_out");
         let t2 = std::time::Instant::now();
-        drop(stream.synchronize());
+        let _ = stream.synchronize();
         if tim {
             let now = std::time::Instant::now();
             let ms = |us: u128| us as f64 / 1e3;
@@ -1643,33 +1487,38 @@ impl VisionMech {
 pub struct PrefixMech {
     s: Seg,
     routs: Vec<DeviceBuffer>,
-    emb: Vec<f32>,     // [vocab, PW] host 查表（~2.1GB 常驻复用）
-    lang_scale: f32,   // √PW（gemma embed scale）
-    vis_rows: usize,   // (VT-drop_v)*PW——空视图剔除后的可见行
+    emb: Vec<f32>,     // [vocab, PW] host lookup table (~2.1GB resident)
+    lang_scale: f32,   // sqrt(PW) (gemma embed scale)
+    vis_rows: usize,   // (VT-drop_v)*PW — visible rows after empty-view drop
     nkv: usize,        // depth*2
     vocab_w: usize,
-    /// token 查表缓存：prompt 跨 replan 恒定（同任务 L 桶内 token_ids
-    /// 不变），查表+scale 的 f16 行缓存一次复用——asm 2.5ms 的主体。
-    /// 数值恒等：同 ids 同算式（f32 mul 确定性）产同字节
+    /// Token lookup cache: the prompt is constant across replans (same
+    /// token_ids within a task's L bucket), so the lookup+scale f16 rows
+    /// are computed once. Bit-stable: same ids, same deterministic f32
+    /// arithmetic.
     tok_cache_ids: Vec<u32>,
     tok_cache_rows: Vec<f16>,
-    /// gear 模式：L → 档下标（静态模式空 = 固定 L 单桶）
+    /// Gear mode: L -> gear index (empty in static mode = fixed L).
     gear_of_l: std::collections::HashMap<i64, usize>,
-    /// GEB_PREFIX_POOL：per-L 静态 prefix OM 池（换柄执行，routs 全 L 共用
-    /// ——max 物化、无跨请求状态）。根因修复，见 compose 处注记
+    /// GEB_PREFIX_POOL: per-L static prefix OM pool (handle swap on
+    /// execute; routs shared across Ls — max-sized materialization, no
+    /// cross-request state).
     pool_root: Option<String>,
     pool_graphs: std::collections::HashMap<i64, ge_builder::GeGraph>,
     pool_lru: Vec<i64>,
     pool_cap: usize,
-    /// routs 各槽字节数（= max 档 OM 输出尺寸——池 OM d2h 整缓冲后截断用）
+    /// Per-slot routs byte size (= max-gear OM output size; pool OMs d2h
+    /// the whole buffer then truncate).
     rout_bytes: Vec<usize>,
-    /// GEB_ATTN_MASK（range padding）：padmask 输入 bind 下标（无 mask OM
-    /// = None；池模式网格映射下必须 Some，否则 pad 行无遮蔽）
+    /// GEB_ATTN_MASK (range padding): padmask input bind index (None for
+    /// maskless OMs; must be Some under pool-mode grid mapping or pad
+    /// rows go unmasked).
     mask_bind: Option<usize>,
 }
 
 impl PrefixMech {
-    /// L → 档下标（静态模式恒 0——run_seg 走原 run 分支）
+    /// L -> gear index (always 0 in static mode — run_seg takes the plain
+    /// run branch).
     fn gear_idx(&self, l: i64) -> usize {
         if self.s.gear_payloads.is_empty() {
             return 0;
@@ -1677,23 +1526,24 @@ impl PrefixMech {
         *self
             .gear_of_l
             .get(&l)
-            .unwrap_or_else(|| panic!("prefix 档表缺 L={l}（GEB_DYN_LLIST 未含）"))
+            .unwrap_or_else(|| panic!("prefix gear table missing L={l} (not in GEB_DYN_LLIST)"))
     }
 }
 
 impl PrefixMech {
-    /// 池模式：按 L 换静态 OM 句柄（lazy 装载 tl{l}_i8；LRU 上限防全档
-    /// 驻留炸显存——单只 1.88GB）。routs/binds 不换（max 物化全 L 共用）
+    /// Pool mode: swap the static OM handle for L (lazy load tl{l}_i8;
+    /// LRU cap keeps every gear resident — one OM is 1.88GB). routs/binds
+    /// stay put (max-sized, shared across Ls).
     fn swap_prefix(&mut self, l: i64) {
         if !self.pool_graphs.contains_key(&l) {
             let p = format!("{}/tl{l}_i8/prefix_real.om",
                             self.pool_root.as_deref().unwrap_or_default());
-            println!("[prefix-pool] lazy load L={l}（{p}）");
+            println!("[prefix-pool] lazy load L={l} ({p})");
             let g = ge_builder::load(&p)
-                .unwrap_or_else(|e| panic!("prefix pool 缺 L={l}（{e:?}）——先烤 {p}"));
+                .unwrap_or_else(|e| panic!("prefix pool missing L={l} ({e:?}) — bake {p} first"));
             let n_out = g.num_outputs().unwrap();
             assert!(n_out <= self.rout_bytes.len(),
-                    "池 OM 输出数 {n_out} > max 槽位 {}", self.rout_bytes.len());
+                    "pool OM outputs {n_out} > max slots {}", self.rout_bytes.len());
             self.pool_graphs.insert(l, g);
             self.pool_lru.push(l);
             while self.pool_lru.len() > self.pool_cap {
@@ -1701,7 +1551,7 @@ impl PrefixMech {
                 if let Some(g) = self.pool_graphs.remove(&victim) {
                     let _ = g.unload();
                 }
-                println!("[prefix-pool] LRU 驱逐 L={victim}（cap={}）", self.pool_cap);
+                println!("[prefix-pool] LRU evict L={victim} (cap={})", self.pool_cap);
             }
         } else {
             let i = self.pool_lru.iter().position(|&x| x == l).unwrap();
@@ -1711,10 +1561,11 @@ impl PrefixMech {
         self.s.g = *self.pool_graphs.get(&l).unwrap();
     }
 
-    /// 一帧 prefix（设备态）：重组 x0（本帧 vision_out 可见行 + 真 token
-    /// 查表 ×lang_scale）覆写 binds[0] 重跑 + sync；36 路 kv 留在
-    /// self.routs（设备）——GEB_SERVE_FAST 下由 FlowMech 异步 d2d 直连
-    /// 消费，零 host 中转
+    /// One prefix frame (device state): reassemble x0 (this frame's
+    /// visible vision_out rows + real token lookups * lang_scale),
+    /// overwrite binds[0], rerun + sync; the 36 kv outputs stay in
+    /// self.routs on device — consumed by FlowMech's async d2d under
+    /// GEB_SERVE_FAST, zero host relay.
     fn one_frame_dev(
         &mut self,
         ctx: &AscendContext,
@@ -1722,9 +1573,10 @@ impl PrefixMech {
         vision_out: &[f16],
         token_ids: &[u32],
     ) {
-        assert_eq!(vision_out.len(), (VT * PW) as usize, "serve vision_out 尺寸不符");
-        // range padding（GEB_POOL_GRID，池模式限定）：真 L → 桶界 P，token
-        // 补 0（embedding[0]）——pad 行由 padmask 遮蔽；非池模式恒等不受扰
+        assert_eq!(vision_out.len(), (VT * PW) as usize, "serve vision_out size mismatch");
+        // Range padding (GEB_POOL_GRID, pool mode only): true L -> bucket
+        // boundary P, tokens padded with 0 (embedding[0]) — pad rows are
+        // masked by padmask; non-pool mode is the identity and unaffected.
         let l_true = token_ids.len() as i64;
         let p_bkt = if self.pool_root.is_some() {
             pool_grid_p(l_true)
@@ -1733,7 +1585,7 @@ impl PrefixMech {
         };
         assert!(
             p_bkt == l_true || self.mask_bind.is_some(),
-            "range-padding: pad 到 P={p_bkt} 但 OM 无 padmask（GEB_ATTN_MASK=1 烤）"
+            "range-padding: padded to P={p_bkt} but the OM has no padmask (bake with GEB_ATTN_MASK=1)"
         );
         let pad_owned;
         let token_ids: &[u32] = if p_bkt > l_true {
@@ -1744,20 +1596,21 @@ impl PrefixMech {
         } else {
             token_ids
         };
-        // 计时：asm(x0 组装+查表)/h2d_enq(零拷贝视图上流)/run/wait
+        // Timed: asm (x0 assembly + lookup) / h2d_enq / run / wait.
         let tim = serve_timing();
         let t0 = std::time::Instant::now();
         let gi = self.gear_idx(p_bkt);
         if self.pool_root.is_some() {
             self.swap_prefix(p_bkt);
         }
-        // token 查表缓存：ids 变化才重算（prompt 跨 replan 恒定——同任务
-        // 桶内 token_ids 不变）。数值恒等：同算式（f32 mul）产同 f16 字节
+        // Token lookup cache: recompute only when ids change (the prompt
+        // is constant across replans). Same f32 arithmetic on the same
+        // ids yields identical f16 bytes.
         if self.tok_cache_ids != token_ids {
             let mut rows: Vec<f16> = Vec::with_capacity(token_ids.len() * self.vocab_w);
             for &id in token_ids {
                 let r = id as usize * self.vocab_w;
-                assert!(r + self.vocab_w <= self.emb.len(), "token id {id} 超 vocab");
+                assert!(r + self.vocab_w <= self.emb.len(), "token id {id} beyond vocab");
                 rows.extend(
                     self.emb[r..r + self.vocab_w]
                         .iter()
@@ -1766,8 +1619,9 @@ impl PrefixMech {
             }
             self.tok_cache_ids = token_ids.to_vec();
             self.tok_cache_rows = rows;
-            // padmask 随 token 变化填（L 不变零动作）：行 [vis+L, vis+P)
-            // = -30000，真行/视觉行 0——整只重建，无跨桶污染
+            // padmask refresh rides the token change (no-op when L is
+            // unchanged): rows [vis+L, vis+P) = -30000, real/vision rows
+            // 0 — rebuilt whole, no cross-bucket contamination.
             if let Some(bi) = self.mask_bind {
                 let vis = (self.vis_rows / self.vocab_w) as i64;
                 let mut mh = vec![f16::from_f32(0.0); (vis + p_bkt) as usize];
@@ -1783,15 +1637,18 @@ impl PrefixMech {
         let mut x0 = vision_out[..self.vis_rows].to_vec();
         x0.extend_from_slice(&self.tok_cache_rows);
         let t1 = std::time::Instant::now();
-        // gear 模式 binds[0] = p_max 物化（x0 实际 p 行 ≤ max——sized h2d）
-        assert!(x0.len() * 2 <= self.s.binds[0].len(), "serve x0 尺寸超 max 档");
-        // 零拷贝字节视图（x0 活到函数尾，async h2d 借用安全）
+        // Gear mode: binds[0] is materialized to p_max (x0's actual p
+        // rows <= max — sized h2d).
+        assert!(x0.len() * 2 <= self.s.binds[0].len(), "serve x0 exceeds max gear size");
+        // Zero-copy byte view (x0 outlives the function; async h2d borrow
+        // is safe).
         let bytes: &[u8] =
             unsafe { std::slice::from_raw_parts(x0.as_ptr() as *const u8, x0.len() * 2) };
         if self.s.gear_payloads.is_empty() && self.pool_root.is_none() {
             ctx.copy_h2d_async(&self.s.binds[0], bytes, stream).expect("serve h2d x0");
         } else {
-            // gear / prefix-pool：binds[0] 按 max 物化，本帧实际 p 行 → sized
+            // gear / prefix-pool: binds[0] is max-sized; this frame's p
+            // rows go through the sized copy.
             ctx.copy_h2d_async_sized(&self.s.binds[0], bytes, stream)
                 .expect("serve h2d x0 (sized)");
         }
@@ -1799,7 +1656,7 @@ impl PrefixMech {
         let refs: Vec<&DeviceBuffer> = self.routs.iter().collect();
         self.s.run_seg(gi, &refs, stream).expect("ge run");
         let t3 = std::time::Instant::now();
-        drop(stream.synchronize());
+        let _ = stream.synchronize();
         if tim {
             let now = std::time::Instant::now();
             let ms = |us: u128| us as f64 / 1e3;
@@ -1814,8 +1671,8 @@ impl PrefixMech {
         }
     }
 
-    /// 一帧 prefix（legacy host 中转）：one_frame_dev 后 36 路 kv 下载
-    /// （aux 槽不下载）
+    /// One prefix frame (legacy host relay): one_frame_dev then download
+    /// the 36 kv outputs (aux slots not downloaded).
     fn one_frame(
         &mut self,
         ctx: &AscendContext,
@@ -1827,8 +1684,9 @@ impl PrefixMech {
         (0..self.nkv).map(|i| self.download_kv(ctx, i)).collect()
     }
 
-    /// kv 下载（按当前执行 OM 的实际行数；routs/binds 按 max 物化——
-    /// d2h 整缓冲契约下先全量再截断）
+    /// kv download sized to the currently executing OM's real row count
+    /// (routs/binds are max-sized; the whole-buffer d2h contract means
+    /// download-then-truncate).
     fn download_kv(&self, ctx: &AscendContext, i: usize) -> Vec<f16> {
         if !self.s.gear_payloads.is_empty() {
             let dims = self.s.g.cur_output_dims(i).unwrap_or_else(|e| panic!("cur dims: {e:?}"));
@@ -1851,35 +1709,45 @@ impl PrefixMech {
 pub struct FlowMech {
     s: Seg,
     ob: DeviceBuffer,
-    style_cache: Vec<Vec<Vec<f16>>>, // 10 步 × (6*depth+2) 段（含 gate；跨请求不变）
+    style_cache: Vec<Vec<Vec<f16>>>, // 10 steps x (6*depth+2) segments (incl. gate; request-invariant)
     layer_bases: Vec<usize>,
     fs_idx: usize,
     pk_base: usize,
     depth: usize,
-    /// GEB_SERVE_FAST 设备驻留态：styles 10 步各占独立视图（跨帧恒定 ⇒
-    /// 一次上传后帧内零拷贝——legacy 110 槽位被 10 步复用须逐步重传）；
-    /// style_map = style bind 下标 → 段序；ins_order = 图输入装配序
-    /// （wconst 时 = data_inputs，同 Seg::ins 语义）
+    /// Backing allocation for style_views — the views are raw slices, so
+    /// this field exists purely to keep the master buffer alive for the
+    /// mech's lifetime (never read).
+    #[allow(dead_code)]
     style_master: Option<DeviceBuffer>,
+    /// GEB_SERVE_FAST device-resident styles: each of the 10 steps gets
+    /// its own view (frame-invariant, so one upload serves every frame —
+    /// unlike the legacy 110 slots reused across steps, re-uploaded per
+    /// step).
     style_views: Vec<Vec<DeviceBuffer>>,
+    /// style bind index -> segment order within a step.
     style_map: std::collections::HashMap<usize, usize>,
+    /// Graph-input assembly order (= data_inputs under wconst, same
+    /// semantics as Seg::ins).
     ins_order: Vec<usize>,
-    /// gear 模式：L → 档下标 + rope 表 bind 下标（表 HOR 定形、内容随
-    /// pos_offset=p 变——L 变更时换装；last_l 恒定则零动作）
+    /// Gear mode: L -> gear index, plus rope table bind indices (tables
+    /// are HOR-shaped; their content shifts with pos_offset=p, so they are
+    /// re-uploaded on L change — no-op while L holds).
     gear_of_l: std::collections::HashMap<i64, usize>,
     rope_binds: Vec<usize>,
     last_l: i64,
-    /// HYBRID：per-L 静态 flow OM 池（非空 = 按请求换句柄执行，flow 不
-    /// 走 gear——styles 静态 Data 之故，见 seg_flow 注记）
+    /// HYBRID: per-L static flow OM pool (non-empty = swap handles per
+    /// request; flow does not use gears — its styles are static Data, see
+    /// seg_flow).
     flows: std::collections::HashMap<i64, GeGraph>,
-    /// GEB_ATTN_MASK（range padding）：padmask bind 下标 + 上次填充的 L
-    ///（不变零动作；整只重建无跨桶污染）
+    /// GEB_ATTN_MASK (range padding): padmask bind index + last filled L
+    /// (no-op on match; rebuilt whole, no cross-bucket contamination).
     mask_bind: Option<usize>,
     mask_last: i64,
 }
 
-/// styles 设备驻留构装：10 步 × (6*depth+2) 段拼一块 master（一次 h2d），
-/// 每步每段一个 view；style_map 与 legacy h2d 循环同一 bind 映射
+/// Builds device-resident styles: the 10 steps' (6*depth+2) segments are
+/// packed into one master (single h2d), one view per step-segment;
+/// style_map matches the legacy per-slot h2d loop's bind mapping.
 pub fn style_residency(
     ctx: &AscendContext,
     style_cache: &[Vec<Vec<f16>>],
@@ -1925,7 +1793,7 @@ pub fn style_residency(
 }
 
 impl FlowMech {
-    /// L → 档下标（静态模式恒 0）
+    /// L -> gear index (always 0 in static mode).
     fn gear_idx(&self, l: i64) -> usize {
         if self.s.gear_payloads.is_empty() {
             return 0;
@@ -1933,23 +1801,27 @@ impl FlowMech {
         *self
             .gear_of_l
             .get(&l)
-            .unwrap_or_else(|| panic!("flow 档表缺 L={l}（GEB_DYN_LLIST 未含）"))
+            .unwrap_or_else(|| panic!("flow gear table missing L={l} (not in GEB_DYN_LLIST)"))
     }
 
-    /// HYBRID：按 L 换 flow 静态 OM 句柄（池空 = 单 OM 原样）
+    /// HYBRID: swap the static flow OM handle for L (empty pool = keep
+    /// the single OM).
     fn swap_flow(&mut self, l: i64) {
         if !self.flows.is_empty() {
             self.s.g = *self
                 .flows
                 .get(&l)
-                .unwrap_or_else(|| panic!("flow OM 池缺 L={l}"));
+                .unwrap_or_else(|| panic!("flow OM pool missing L={l}"));
         }
     }
 
-    /// L 变更换装 rope 表（flat 四件 + rank-2 四件；内容 pos_offset=p——
-    /// 表 HOR 定形与 p 无关，内容随 p 平移。L 不变零动作）。早退门按 flows
-    /// 池判：池非空 = HYBRID 逐 L 换静态 flow OM，rope 须随 L 换装（哪怕
-    /// payloads 空——GEB_PREFIX_POOL 下 gear_mode 全局为 false 的情形）
+    /// Re-upload the rope tables on L change (flat quartet + rank-2
+    /// quartet; content shifts with pos_offset=p — the tables are
+    /// HOR-shaped regardless of p). No-op when L holds. The early-exit
+    /// gate checks the flows pool: a non-empty pool means HYBRID swaps a
+    /// static flow OM per L, so rope must follow L even when payloads are
+    /// empty (the GEB_PREFIX_POOL case, where gear_mode is globally
+    /// false).
     fn set_rope_for(&mut self, ctx: &AscendContext, l: i64) {
         if (self.s.gear_payloads.is_empty() && self.flows.is_empty()) || self.last_l == l {
             return;
@@ -1967,10 +1839,12 @@ impl FlowMech {
         self.last_l = l;
     }
 
-    /// range padding：flow padmask 填充——键布局 = cache 行在前（真
-    /// [0,vis+L) / pad [vis+L, vis+P)）+ 本桶 flow HOR 行恒真。L 不变零
-    /// 动作。池模式限定（flows 非空）。⚠ 全长度填充（copy_h2d 等长断言）：
-    /// bind 按 max 桶物化（762 行），本桶外行未被消费取 −30000 无害
+    /// Range padding: fill the flow padmask — key layout = cache rows
+    /// first (real [0,vis+L), pad [vis+L, vis+P)) plus this bucket's HOR
+    /// flow rows always real. No-op when L holds. Pool mode only (flows
+    /// non-empty). The whole length is filled (copy_h2d asserts equal
+    /// length): the bind is max-bucket sized (762 rows) and unconsumed
+    /// rows beyond this bucket are harmless at -30000.
     fn fill_mask(&mut self, ctx: &AscendContext, l_true: i64, p_bkt: i64) {
         let Some(bi) = self.mask_bind else { return };
         if self.flows.is_empty() || self.mask_last == l_true {
@@ -1990,8 +1864,9 @@ impl FlowMech {
         self.mask_last = l_true;
     }
 
-    /// 一帧 flow：36 路 pk/pv 换绑 + noise 重启 10 步（styles 缓存直取；
-    /// euler c1/c2 已在 bring-up 换绑 LeRobot 语义且 buffer 内容恒持）
+    /// One flow frame: rebind the 36 pk/pv, restart from noise, 10 steps
+    /// (styles from cache; euler c1/c2 carry LeRobot semantics with the
+    /// buffer contents held).
     fn one_frame(
         &mut self,
         ctx: &AscendContext,
@@ -2002,12 +1877,14 @@ impl FlowMech {
     ) -> Vec<f16> {
         let h2d = |buf: &DeviceBuffer, vals: &[f16]| {
             let bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_bits().to_le_bytes()).collect();
-            // sized：HYBRID 下 pk/pv 内容 = 实际 p 行 < max 物化 bind
+            // sized: under HYBRID the pk/pv content is p real rows < the
+            // max-sized bind.
             ctx.copy_h2d_async_sized(buf, &bytes, stream).expect("serve h2d");
         };
-        assert_eq!(kv.len(), self.depth * 2, "serve kv 路数不符");
-        // range padding：flow OM 按桶界 P 换柄，rope 内容按真 L 换装
-        //（flow token 位置 = vis+L+i 与 P 无关，表 HOR 定形）；mask 同步填
+        assert_eq!(kv.len(), self.depth * 2, "serve kv count mismatch");
+        // Range padding: swap the flow OM handle by bucket boundary P,
+        // upload rope content by true L (flow token positions = vis+L+i,
+        // independent of P; tables are HOR-shaped); refresh the mask.
         let l_true = token_ids.len() as i64;
         let p_bkt = if self.flows.is_empty() {
             l_true
@@ -2035,20 +1912,22 @@ impl FlowMech {
             }
             h2d(&self.s.binds[self.fs_idx], &sc[6 * self.depth]);
             h2d(&self.s.binds[self.fs_idx + 1], &sc[6 * self.depth + 1]);
-            h2d(&self.s.binds[0], &x); // state = 当前 x
+            h2d(&self.s.binds[0], &x); // state = current x
             let oref: Vec<&DeviceBuffer> = vec![&self.ob];
             self.s.run_seg(gi, &oref, stream).expect("ge run");
-            drop(stream.synchronize());
+            let _ = stream.synchronize();
             x = download_f16(ctx, &self.ob, (HOR * ADIM) as usize);
         }
         x
     }
 
-    /// 一帧 flow（GEB_SERVE_FAST）：36 路 pk/pv 异步 d2d（prefix routs
-    /// 设备直连）→ noise h2d → 10 步同流链（styles 视图零拷贝、x d2d
-    /// 驻留、无 per-step sync）→ 末步一次 sync + actions d2h。与
-    /// one_frame 逐位同源：同一字节流（d2d/视图都是精确字节）+ 同流
-    /// 顺序执行——sync 只挪等待点不改计算序
+    /// One flow frame (GEB_SERVE_FAST): the 36 pk/pv go over async d2d
+    /// (straight from prefix routs) -> noise h2d -> 10 steps chained on
+    /// one stream (zero-copy style views, x resident via d2d, no
+    /// per-step sync) -> one sync at the end + actions d2h. Bit-identical
+    /// to one_frame: same byte streams (d2d and views are exact bytes)
+    /// executed in the same stream order — moving syncs only moves wait
+    /// points, not the computation order.
     fn one_frame_fast(
         &mut self,
         ctx: &AscendContext,
@@ -2057,10 +1936,10 @@ impl FlowMech {
         token_ids: &[u32],
         noise: &[f16],
     ) -> Vec<f16> {
-        assert_eq!(kv_dev.len(), self.depth * 2, "serve kv 路数不符");
-        assert!(!self.style_views.is_empty(), "fast 路径须先构装 styles 驻留");
-        // range padding：flow OM 按桶界 P 换柄，rope 内容按真 L 换装
-        //（flow token 位置 = vis+L+i 与 P 无关，表 HOR 定形）；mask 同步填
+        assert_eq!(kv_dev.len(), self.depth * 2, "serve kv count mismatch");
+        assert!(!self.style_views.is_empty(), "fast path requires resident styles");
+        // Range padding: swap the flow OM handle by bucket boundary P,
+        // upload rope content by true L; refresh the mask.
         let l_true = token_ids.len() as i64;
         let p_bkt = if self.flows.is_empty() {
             l_true
@@ -2071,24 +1950,26 @@ impl FlowMech {
         self.swap_flow(p_bkt);
         self.set_rope_for(ctx, l_true);
         self.fill_mask(ctx, l_true, p_bkt);
-        // 分步计时：kv(d2d×36)/h2d_enq(零拷贝视图上流)/steps(逐步 enqueue)+sync/dl
+        // Timed: kv (36x d2d) / h2d_enq / steps (per-step enqueue) +
+        // sync / dl.
         let tim = serve_timing();
         let t0 = std::time::Instant::now();
         for i in 0..self.depth * 2 {
-            // gear 模式两侧均 max 档 buffer（d2d 全量拷贝，尾部无效行被
-            // 分支 desc 裁掉；静态模式等长断言保留）
+            // Gear mode: both sides are max-gear buffers (d2d copies in
+            // full; the branch desc trims trailing invalid rows). The
+            // equal-length assert stays for static mode.
             if self.s.gear_payloads.is_empty() {
                 assert_eq!(
                     kv_dev[i].len(),
                     self.s.binds[self.pk_base + i].len(),
-                    "fast kv 尺寸不符（路 {i}）"
+                    "fast kv size mismatch (lane {i})"
                 );
             }
             ctx.copy_d2d_async(&self.s.binds[self.pk_base + i], kv_dev[i], stream)
                 .expect("serve d2d kv");
         }
         let t1 = std::time::Instant::now();
-        // 零拷贝字节视图（noise 借用活到函数尾）
+        // Zero-copy byte view (the noise borrow outlives the function).
         let bytes: &[u8] =
             unsafe { std::slice::from_raw_parts(noise.as_ptr() as *const u8, noise.len() * 2) };
         ctx.copy_h2d_async(&self.s.binds[0], bytes, stream).expect("serve h2d noise");
@@ -2106,8 +1987,9 @@ impl FlowMech {
                 .collect();
             let oref: Vec<&DeviceBuffer> = vec![&self.ob];
             let te = std::time::Instant::now();
-            // gear 模式：ins 自组（run_seg 的 ins() 不含 style 视图替换）——
-            // 直接 run_gear，payload 按 gi
+            // Gear mode: ins assembled here (run_seg's ins() knows
+            // nothing of style-view substitution) — run_gear directly
+            // with payload gi.
             if self.s.gear_payloads.is_empty() {
                 self.s.g.run(&ins, &oref, stream).expect("ge run");
             } else {
@@ -2120,12 +2002,13 @@ impl FlowMech {
                 enq.push(te.elapsed().as_secs_f64() * 1e3);
             }
             if step + 1 < nsteps {
-                // x 驻留：本步输出 → 下步 state（同流有序，免 d2h+h2d+sync）
+                // x stays resident: this step's output feeds the next
+                // step's state (same-stream ordering; no d2h+h2d+sync).
                 ctx.copy_d2d_async(&self.s.binds[0], &self.ob, stream).expect("serve d2d x");
             }
         }
         let t4 = std::time::Instant::now();
-        drop(stream.synchronize());
+        let _ = stream.synchronize();
         let t5 = std::time::Instant::now();
         let out = download_f16(ctx, &self.ob, (HOR * ADIM) as usize);
         if tim {
@@ -2155,34 +2038,33 @@ pub fn silu_f32(x: f32) -> f32 {
     x / (1.0 + (-x).exp())
 }
 
-/// GEB_NORM32：torch GemmaRMSNorm 语义对齐开关——方差 fp32 域。
-/// norm16 对照定罪 fp32 上浮 = 行为开关；AddRmsNorm 的
-/// fp32 desc 是假支持（GE 自动 Cast 归一回 f16 kernel，arm32 单算
-/// f32/f16 输出逐位同）——只能组合手搓。
+/// GEB_NORM32: torch GemmaRMSNorm alignment — variance in fp32. Dropping
+/// the fp32 upcast flipped behavior in the norm16 control; AddRmsNorm's
+/// fp32 desc is fake support (GE casts back to an f16 kernel), so the
+/// composition is hand-built.
 pub fn norm32_enabled() -> bool {
     std::env::var("GEB_NORM32").is_ok()
 }
 
-/// GEB_SERVE_FAST：serve 段间设备直连开关（性能轮实测净收益）——
-/// prefix 36 路 kv 异步 d2d 直连（零 host 中转）、flow x 设备驻留
-/// （逐步 d2h→h2d 换同流 d2d）、10 步去 per-step sync、styles 设备
-/// 驻留（每步独立视图一次上传）。数值 bit 级恒等：同一字节流 + 同流
-/// 顺序执行，sync 增删不改计算序。空串不算开（supervisor env 透传
-/// 里未设时不误触）
+/// GEB_SERVE_FAST: device-direct segment handoff in serve — prefix's 36
+/// kv outputs go over async d2d (zero host relay), flow x stays resident
+/// (per-step d2h->h2d becomes a same-stream d2d), per-step syncs are
+/// dropped, styles become device-resident (one upload, per-step views).
+/// Bit-identical numerics: same byte streams in the same stream order.
+/// An empty value does not count as on (avoids accidental trips in
+/// supervisor env passthrough).
 pub fn serve_fast() -> bool {
     std::env::var("GEB_SERVE_FAST").map(|v| !v.is_empty()).unwrap_or(false)
 }
 
-/// GEB_SERVE_TIMING：serve 热路径段内分步计时（conv/h2d/run/sync/dl）——
-/// 段间 glue 开销归因用。只加 Instant 戳不改数据流，数值恒等。
+/// GEB_SERVE_TIMING: per-stage timing inside the serve hot path
+/// (conv/h2d/run/sync/dl) for glue-overhead attribution. Instant stamps
+/// only; data flow untouched.
 pub fn serve_timing() -> bool {
     std::env::var("GEB_SERVE_TIMING").is_ok()
 }
 
-/// NORM32 常量池已内聚到 Seg（n32_c/n32_consts）——v1 的 Data 标量池
-/// （one/eps/w2048/w1024）随 ReduceSumD 假 f32 定罪一并淘汰
-
-/// host 线性层（f32 全精度；维度 1×32×3072 量级，开销可忽略）
+/// Host linear layer (full f32; dims like 1x32x3072, negligible cost).
 pub fn host_lin_f32(w: &LinearWeights, x: &[f32], in_d: usize) -> Vec<f32> {
     let wt = w.weight.to_f32_vec().unwrap();
     let out_d = wt.len() / in_d;
@@ -2199,7 +2081,8 @@ pub fn host_lin_f32(w: &LinearWeights, x: &[f32], in_d: usize) -> Vec<f32> {
     y
 }
 
-/// te [AW] → conditioning [ADIM]（time_mlp 两层，每层 matmul→bias→silu）
+/// te [AW] -> conditioning [ADIM] (two time_mlp layers, each
+/// matmul -> bias -> silu).
 pub fn e2e_conditioning(real: &Pi05Weights, te: &[f32]) -> Vec<f32> {
     let h = host_lin_f32(&real.time_mlp_in, te, te.len());
     let h: Vec<f32> = h.iter().map(|&v| silu_f32(v)).collect();
@@ -2207,10 +2090,11 @@ pub fn e2e_conditioning(real: &Pi05Weights, te: &[f32]) -> Vec<f32> {
     c.iter().map(|&v| silu_f32(v)).collect()
 }
 
-/// style 投影 [ADIM,3W] → (scale=1+s0, shift=s1, gate=s2)。第三段 gate 是
-/// openpi `_gated_residual` 的分支门控（residual + branch·gate，无激活直出
-/// f16 cast）——定罪：引擎此前整体未消费该段，flow 输出 v 近随
-/// 机、闭环 0/10 的主因
+/// Style projection [ADIM,3W] -> (scale=1+s0, shift=s1, gate=s2). The
+/// third segment is openpi _gated_residual's branch gate (residual +
+/// branch*gate, no activation, direct f16 cast) — the engine used to
+/// drop it entirely, leaving flow output near-random (the main cause of
+/// a 0/10 closed loop).
 pub fn e2e_style_pair(w: &LinearWeights, cond: &[f32], width: usize) -> (Vec<f16>, Vec<f16>, Vec<f16>) {
     let raw = host_lin_f32(w, cond, cond.len());
     let scl = raw[..width].iter().map(|&v| f16::from_f32(1.0 + v)).collect();
@@ -2219,19 +2103,20 @@ pub fn e2e_style_pair(w: &LinearWeights, cond: &[f32], width: usize) -> (Vec<f16
     (scl, sh, gt)
 }
 
-/// e2e 收尾共通：GEB_OM_DIR（默认 ./om_cache）加载 {seg}_real.om
-/// 跑一次，全部图输出下载回 host。Seg 构造须与 OM 构建同 env（四件套）
-
-/// 三段 OM 预载缓存（冷启动 lazy）：GeServe::open 前并行装载（ge_builder
-/// 侧带锁），e2e_run 命中即取——把串行 52s 的 OM 装载压成 ~max(单段)
+/// Three-segment OM preload cache (cold-start lazy): loaded in parallel
+/// before GeServe::open (locked on the ge_builder side), consumed by
+/// e2e_run on hit — collapses the serial 52s OM load to ~max(one
+/// segment).
 static OM_PRELOAD: std::sync::Mutex<
     Option<std::collections::HashMap<String, ge_builder::GeGraph>>,
 > = std::sync::Mutex::new(None);
 
-/// 并行预载 GEB_OM_DIR 的 {vision,prefix,flow}_real.om（幂等；serve 冷启
-/// 动路径调一次）。装载线程须绑主 context（aclmdlLoadFromMem 随调用线程
-/// 的 current context 走——裸线程 rc=-3 实证）。失败不 panic——e2e_run
-/// 回退串行装载并报真错误
+/// Preloads {vision,prefix,flow}_real.om from GEB_OM_DIR in parallel
+/// (idempotent; called once on the serve cold-start path). Loader
+/// threads must bind the main context — aclmdlLoadFromMem follows the
+/// calling thread's current context (a bare thread hits rc=-3). Failures
+/// do not panic: e2e_run falls back to serial loading with the real
+/// error.
 pub fn preload_e2e_oms(ctx: &AscendContext) {
     {
         let guard = OM_PRELOAD.lock().unwrap();
@@ -2249,15 +2134,16 @@ pub fn preload_e2e_oms(ctx: &AscendContext) {
             let seg = seg.to_string();
             let ctx2: &AscendContext = unsafe { std::mem::transmute(ctx) };
             std::thread::spawn(move || {
-                // 线程绑 context（&AscendContext 非 Send——transmute 借引用，
-                // join 前 ctx 存活，单次冷启动路径受控）
+                // Bind the context (&AscendContext is not Send — the
+                // transmute borrows by reference; ctx outlives the join,
+                // and this is a controlled one-shot cold-start path).
                 if let Err(e) = ctx2.set_current() {
-                    eprintln!("[preload] {seg} context 绑定失败: {e:?}");
+                    eprintln!("[preload] {seg} context bind failed: {e:?}");
                     return (seg, None);
                 }
                 let g = ge_builder::load(&path);
                 if let Err(e) = &g {
-                    eprintln!("[preload] {seg} OM 装载失败 {path}: {e:?}");
+                    eprintln!("[preload] {seg} OM load failed {path}: {e:?}");
                 }
                 (seg, g.ok())
             })
@@ -2271,7 +2157,7 @@ pub fn preload_e2e_oms(ctx: &AscendContext) {
             }
         }
     }
-    println!("[preload] {} 段 OM 并行装载完成 {:?}", map.len(), t0.elapsed());
+    println!("[preload] {} segment OMs loaded in parallel {:?}", map.len(), t0.elapsed());
     *OM_PRELOAD.lock().unwrap() = Some(map);
 }
 
@@ -2285,7 +2171,7 @@ pub fn e2e_run(ctx: &AscendContext, stream: &AscendStream, s: &mut Seg, seg: &st
         .and_then(|m| m.remove(seg));
     s.g = match preloaded {
         Some(g) => {
-            println!("[e2e] {seg} OM 预载命中");
+            println!("[e2e] {seg} OM preload hit");
             g
         }
         None => {
@@ -2293,11 +2179,12 @@ pub fn e2e_run(ctx: &AscendContext, stream: &AscendStream, s: &mut Seg, seg: &st
             ge_builder::load(&path).expect("load om")
         }
     };
-    // gear 模式：bring-up 内容按 max 档物化 → 用末档跑（静态 = run_seg 0 档）
+    // Gear mode: bring-up content is max-gear materialized — run the
+    // last gear (static = run_seg gear 0).
     let gi = s.gear_payloads.len().saturating_sub(1);
     if !s.gear_payloads.is_empty() {
         let n = s.g.gear_count().unwrap_or(0);
-        println!("[gear] {seg} OM 档数 {n}（bring-up 用末档执行）");
+        println!("[gear] {seg} OM has {n} gears (bring-up runs the last)");
     }
     let n_out = s.g.num_outputs().unwrap();
     let outs: Vec<DeviceBuffer> = (0..n_out)
@@ -2305,9 +2192,11 @@ pub fn e2e_run(ctx: &AscendContext, stream: &AscendStream, s: &mut Seg, seg: &st
         .collect();
     let refs: Vec<&DeviceBuffer> = outs.iter().collect();
     s.run_seg(gi, &refs, stream).expect("ge run");
-    drop(stream.synchronize());
-    // gear 模式 buffer 按 max 档物化（712 行）而本档只写前 666——d2h 须整
-    // 缓冲（copy_d2h 长度断言），下载后 host 侧截到 cur_output_dims 行数
+    let _ = stream.synchronize();
+    // Gear mode: buffers are max-gear sized (712 rows) while this gear
+    // writes only the first 666 — d2h must span the whole buffer
+    // (copy_d2h length assert), then the host truncates to
+    // cur_output_dims rows.
     let dl: Vec<Vec<f16>> = (0..n_out)
         .map(|i| {
             let mut v = download_f16(ctx, &outs[i], s.g.output_size(i).unwrap() / 2);
@@ -2318,15 +2207,16 @@ pub fn e2e_run(ctx: &AscendContext, stream: &AscendStream, s: &mut Seg, seg: &st
             v
         })
         .collect();
-    // GEB_E2E_BENCH=N：稳态 rerun bench（输入 binds 不变重跑；含全输出 d2h
-    // ——prefix 的 36 路 kv 下载 = today 生产 host 中转 glue，如实计入）
+    // GEB_E2E_BENCH=N: steady-state rerun bench (same input binds; the
+    // full-output d2h is included — prefix's 36 kv downloads are the
+    // production host-relay glue and are charged as such).
     let nb = envi("GEB_E2E_BENCH", 0) as usize;
     if nb > 0 {
         let mut ts = Vec::with_capacity(nb);
         for _ in 0..nb {
             let t = std::time::Instant::now();
             s.run_seg(gi, &refs, stream).expect("ge run");
-            drop(stream.synchronize());
+            let _ = stream.synchronize();
             let _: Vec<_> = (0..n_out)
                 .map(|i| download_f16(ctx, &outs[i], s.g.output_size(i).unwrap() / 2))
                 .collect();
@@ -2334,7 +2224,7 @@ pub fn e2e_run(ctx: &AscendContext, stream: &AscendStream, s: &mut Seg, seg: &st
         }
         ts.sort_by(|a, b| a.partial_cmp(b).unwrap());
         println!(
-            "[e2e] {seg} 稳态 bench ×{nb}: P50={:.2}ms min={:.2} max={:.2}（run + sync + {n_out} 路 d2h）",
+            "[e2e] {seg} steady bench x{nb}: P50={:.2}ms min={:.2} max={:.2} (run + sync + {n_out} d2h)",
             ts[nb / 2],
             ts[0],
             ts[nb - 1]
@@ -2345,20 +2235,23 @@ pub fn e2e_run(ctx: &AscendContext, stream: &AscendStream, s: &mut Seg, seg: &st
 
 pub fn seg_e2e(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>) {
     let _ = bench;
-    // e2e 读 *_real.om（四件套构建），Seg 重建必须同配置（输入序一致）
+    // e2e reads *_real.om; the Seg rebuild must use the same env (input
+    // order must match).
     let need = |k: &str| std::env::var(k).is_ok();
     assert!(
         std::env::var("GEB_ATTN").is_ok()
             && need("GEB_QKV3") && need("GEB_ROPEFLAT") && need("GEB_WCONST"),
-        "GEB_SEG=e2e 须配 GEB_ATTN(=manual|pfa) GEB_QKV3=1 GEB_ROPEFLAT=1 GEB_WCONST=1 \
-         （须与 GEB_OM_DIR 下 *_real.om 的构建配置一致——pfa 仅隔离实验用）"
+        "GEB_SEG=e2e requires GEB_ATTN(=manual|pfa) GEB_QKV3=1 GEB_ROPEFLAT=1 GEB_WCONST=1 \
+         (must match how *_real.om under GEB_OM_DIR was built)"
     );
-    let real = real.expect("GEB_SEG=e2e 需要 GEB_CKPT（token_embedding/time_mlp/style 投影 host 消费）");
+    let real = real.expect("GEB_SEG=e2e requires GEB_CKPT (token_embedding/time_mlp/style projections are consumed on the host)");
     let tokens = envi("GEB_TOKENS", 64) as usize;
-    // 冷启动 lazy：三段 OM 并行预载（e2e_run 命中即取）
+    // Cold-start lazy: preload the three OMs in parallel (e2e_run picks
+    // them up).
     preload_e2e_oms(be.ctx());
-    // 注：GE 静态 OM 接受非 16 倍 M（GEB_TOKENS=200 → P=968 实证编译/运行/
-    // parity 正常——eager aclnn 的 16 倍 M 崩坑不适用于 GE 路径）
+    // Note: GE static OMs accept non-multiple-of-16 M (GEB_TOKENS=200 ->
+    // P=968 compiled and ran fine; the eager aclnn 16x-M crash does not
+    // apply to the GE path).
     let mut st = {
         // synthetic bring-up frame (smoke): real frames arrive via serve spool
         let mut seed = 0xE2E2u32;
@@ -2378,23 +2271,25 @@ pub fn seg_e2e(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>) {
     let t0 = std::time::Instant::now();
     seg_vision(be, Some(real), Some(&mut st));
     let t1 = std::time::Instant::now();
-    println!("[e2e] vision 段 {:?}（含 OM 加载）", t1.duration_since(t0));
+    println!("[e2e] vision segment {:?} (incl. OM load)", t1.duration_since(t0));
     seg_prefix(be, Some(real), Some(&mut st));
     let t2 = std::time::Instant::now();
-    println!("[e2e] prefix 段 {:?}（含 OM 加载 + 2.1GB 嵌入查表）", t2.duration_since(t1));
+    println!("[e2e] prefix segment {:?} (incl. OM load + 2.1GB embedding lookup)", t2.duration_since(t1));
     if std::env::var("GEB_E2E_STOP").ok().as_deref() == Some("prefix") {
-        // bisect 用：只跑 vision+prefix（如 GEB_DEPTH=2 小图验输出槽复用）
+        // bisect hook: run only vision+prefix (e.g. a GEB_DEPTH=2 small
+        // graph to verify output-slot reuse)
         ge_builder::fini().expect("fini");
         println!("GE_E2E_PROBE_OK");
         return;
     }
     seg_flow(be, Some(real), Some(&mut st));
     let t3 = std::time::Instant::now();
-    println!("[e2e] flow 段 {:?}（含 OM 加载 + 10 步）", t3.duration_since(t2));
+    println!("[e2e] flow segment {:?} (incl. OM load + 10 steps)", t3.duration_since(t2));
     let head: Vec<f32> = st.actions[..8.min(st.actions.len())].iter().map(|v| v.to_f32()).collect();
     println!("[e2e] actions head={head:?}");
-    // GEB_E2E_SERVE=<dir>：闭环 eval 常驻服务（三段机械已由各段 e2e 分支
-    // 下沉 E2eStage；多桶 = Python 侧每桶一个 serve 进程）
+    // GEB_E2E_SERVE=<dir>: resident closed-loop eval service (mechs
+    // already sunk into E2eStage by each segment's e2e branch; multiple
+    // buckets = one serve process per bucket on the Python side).
     if let Ok(dir) = std::env::var("GEB_E2E_SERVE") {
         serve_loop(be, &mut st, &dir, tokens);
         ge_builder::fini().expect("fini");
@@ -2406,36 +2301,43 @@ pub fn seg_e2e(be: &AscendBackend, bench: bool, real: Option<&Pi05Weights>) {
 }
 
 // ---------------------------------------------------------------------------
-// GEB_E2E_SERVE 常驻服务循环（闭环 eval 用）
+// GEB_E2E_SERVE resident service loop (closed-loop eval).
 // ---------------------------------------------------------------------------
 
-/// GEB_E2E_SERVE=<dir>：文件轮询常驻服务。单进程单桶（GEB_TOKENS=L、
-/// GEB_OM_DIR=tl{L}），Python 侧按帧挑桶、每桶一个 serve 进程（supervisor
-/// 在 apxinf_rust 容器内 spawn——引擎二进制绑定 9.0.1 GE，eval 的 torch
-/// 侧在 apxinf_npu，跨容器靠 /data 共享目录）。
-/// 协议（spool 目录，tmp+rename 原子交付，单客户端串行）：
-///   ready              —— 三段机械就绪标志（内容 "L=<tokens>"）
-///   req_{seq:06}.bin   —— u32 magic 0x47514531 / u32 L / patches f32
-///                          ×VT*V_PATCH_W / token_ids u32 ×L / noise f32
-///                          ×HOR*ADIM
-///   resp_{seq:06}.bin  —— u32 magic 0x47525331 / u32 status /
-///                          f32 vision_ms/prefix_ms/flow_ms /
-///                          actions f32 ×HOR*7（x_t 终态前 7 列）
-///   shutdown           —— 退出信号
+/// GEB_E2E_SERVE=<dir>: resident file-polling service. One process per
+/// bucket (GEB_TOKENS=L, GEB_OM_DIR=tl{L}); the Python side picks a
+/// bucket per frame with one serve process per bucket (supervisor spawns
+/// inside the apxinf_rust container — the engine binary binds the 9.0.1
+/// GE; the eval's torch side lives in apxinf_npu and they meet over the
+/// /data shared directory).
+/// Protocol (spool dir, tmp+rename atomic delivery, single serial
+/// client):
+///   ready              — three mechs ready marker (content "L=<tokens>")
+///   req_{seq:06}.bin   — u32 magic 0x47514531 / u32 L / patches f32
+///                        x VT*V_PATCH_W / token_ids u32 x L / noise f32
+///                        x HOR*ADIM
+///   resp_{seq:06}.bin  — u32 magic 0x47525331 / u32 status /
+///                        f32 vision_ms/prefix_ms/flow_ms /
+///                        actions f32 x HOR*7 (first 7 cols of the x_t
+///                        terminal state)
+///   shutdown           — exit signal
 pub fn serve_loop(be: &AscendBackend, st: &mut E2eStage, dir: &str, tokens: usize) {
-    // 帧实现与进程内直调（GeServe::infer）同源——spool 只是 IO 壳
+    // Frame implementation is shared with the in-process path
+    // (GeServe::infer) — the spool is just the IO shell.
     let mut pipe = GeServe {
-        vm: st.vmech.take().expect("serve 需要 vision 机械"),
-        pm: st.pmech.take().expect("serve 需要 prefix 机械"),
-        fm: st.fmech.take().expect("serve 需要 flow 机械"),
+        vm: st.vmech.take().expect("serve requires the vision mech"),
+        pm: st.pmech.take().expect("serve requires the prefix mech"),
+        fm: st.fmech.take().expect("serve requires the flow mech"),
         tokens,
         fast: serve_fast(),
     };
     std::fs::create_dir_all(dir).expect("serve spool create");
-    // 清残留（上次运行的 req/resp/ready 会混淆 seq 与就绪判定）。
-    // ⚠ 只删协议文件：pid 是 supervisor 的活体判定依据、stdout.log 是
-    // 本进程重定向目标——全删会让 supervisor 判死重复 spawn（双 engine
-    // 抢同一 spool 目录——实测踩过）
+    // Clear stale files (last run's req/resp/ready would confuse seq and
+    // readiness). Only protocol files are deleted: pid is the
+    // supervisor's liveness marker and stdout.log is this process's
+    // redirect target — deleting those makes the supervisor judge the
+    // process dead and respawn a second engine onto the same spool dir
+    // (this has happened).
     for e in std::fs::read_dir(dir).expect("serve spool read") {
         let p = e.expect("dir entry").path();
         let Some(name) = p.file_name().and_then(|n| n.to_str()) else { continue };
@@ -2450,18 +2352,20 @@ pub fn serve_loop(be: &AscendBackend, st: &mut E2eStage, dir: &str, tokens: usiz
         }
     }
     std::fs::write(format!("{dir}/ready"), format!("L={tokens}\n")).expect("serve ready write");
-    println!("[serve] ready: {dir} L={tokens}（文件轮询中，shutdown 退出）");
+    println!("[serve] ready: {dir} L={tokens} (file polling; shutdown exits)");
     let mut served: u64 = 0;
     let exp_patches = (VT * V_PATCH_W) as usize;
     let exp_noise = (HOR * ADIM) as usize;
     loop {
         if std::path::Path::new(&format!("{dir}/shutdown")).exists() {
-            println!("[serve] shutdown 信号，退出（已服务 {served} 请求）");
+            println!("[serve] shutdown signal, exiting (served {served} requests)");
             return;
         }
-        // 最小现存 seq（不做 last_seq 门限：eval 进程重启后 python 端 seq
-        // 回卷到 1，门限会把新请求当旧丢弃——单客户端串行下按"目录里
-        // 最小现存 req 处理"即正确序；上个进程的死请求至多被白跑一次）
+        // Process the smallest live seq (no last_seq watermark: an eval
+        // restart rewinds the python seq to 1 and a watermark would
+        // discard the new requests as stale; with one serial client,
+        // "smallest req in the dir" is the correct order — a dead
+        // request from the previous process is at worst run for nothing).
         let mut best: Option<(i64, std::path::PathBuf)> = None;
         for e in std::fs::read_dir(dir).expect("serve spool read") {
             let p = e.expect("dir entry").path();
@@ -2479,21 +2383,23 @@ pub fn serve_loop(be: &AscendBackend, st: &mut E2eStage, dir: &str, tokens: usiz
         let t_all = std::time::Instant::now();
         let raw = std::fs::read(&path).expect("serve req read");
         let magic = u32::from_le_bytes([raw[0], raw[1], raw[2], raw[3]]);
-        assert_eq!(magic, 0x4751_4531, "serve 请求 magic 不符");
+        assert_eq!(magic, 0x4751_4531, "serve request magic mismatch");
         let l = u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]) as usize;
-        // 静态模式 = 单 L 桶（L 须钉死）；gear 模式按请求 L 验长 + 选档
-        //（档表外 L 由 gear_idx panic 拒绝——supervisor 档表 = 谱系全集）；
-        // prefix 池模式（GEB_PREFIX_POOL）任意 L 由池换柄承载
+        // Static mode = single-L bucket (L is pinned); gear mode checks
+        // length per request and picks a gear (an off-table L panics in
+        // gear_idx — the supervisor's gear table is the lineage's full
+        // set); prefix pool mode (GEB_PREFIX_POOL) carries any L via a
+        // handle swap.
         if pipe.pm.s.gear_payloads.is_empty() && pipe.pm.pool_root.is_none() {
             assert_eq!(
                 l, tokens,
-                "serve 请求 L={l} ≠ 本进程桶 GEB_TOKENS={tokens}（Python 侧挑桶错）"
+                "serve request L={l} != this process's bucket GEB_TOKENS={tokens} (python picked the wrong bucket)"
             );
         }
         assert_eq!(
             raw.len(),
             8 + exp_patches * 4 + l * 4 + exp_noise * 4,
-            "serve 请求长度不符（seq {seq} L={l}）"
+            "serve request length mismatch (seq {seq} L={l})"
         );
         let mut off = 8usize;
         let f32s = |b: &[u8]| f32::from_le_bytes([b[0], b[1], b[2], b[3]]);
@@ -2516,8 +2422,9 @@ pub fn serve_loop(be: &AscendBackend, st: &mut E2eStage, dir: &str, tokens: usiz
         let tp = out.prefix_ms as f64;
         let tf = out.flow_ms as f64;
         let actions = out.actions;
-        // actions [HOR, ADIM] → 前 7 列（LIBERO deployable 维；
-        // normalized_actions = x_t 终态切片，denorm 在 torch postprocess）
+        // actions [HOR, ADIM] -> first 7 columns (LIBERO deployable dims;
+        // normalized_actions is a slice of the x_t terminal state, denorm
+        // happens in torch postprocess).
         let gd = 7usize;
         let mut a7: Vec<f32> = Vec::with_capacity(HOR as usize * gd);
         for r in 0..HOR as usize {
@@ -2547,8 +2454,8 @@ pub fn serve_loop(be: &AscendBackend, st: &mut E2eStage, dir: &str, tokens: usiz
 }
 
 // ---------------------------------------------------------------------------
-// vision 段：patch embed → depth×SigLIP 层 → post LN → projector
-// 序列与 eager aclnn 组合（ops.rs）同构
+// vision segment: patch embed -> depth x SigLIP layers -> post LN ->
+// projector.
 // ---------------------------------------------------------------------------
 
 pub fn seg_vision(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&mut E2eStage>) {
@@ -2558,23 +2465,26 @@ pub fn seg_vision(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&m
     let t = VT;
     let vqd = V_HEADS * V_HD; // 1152
     let qkvw = vqd * 3;
-    // GEB_ATTN=manual：手工 attention（bmm+softmax+bmm 全静态，ma 验证）。
-    // 默认 pfa（PromptFlashAttention——静态 OM 里走 InnerPFA host 回调，
-    // ~20ms/层停顿，profile 取证）
+    // GEB_ATTN=manual: hand-built attention (bmm+softmax+bmm, all
+    // static). Default is pfa (PromptFlashAttention — in a static OM its
+    // InnerPFA host callback stalls ~20ms/layer).
     let attn_manual = std::env::var("GEB_ATTN").map(|v| v == "manual").unwrap_or(false);
     let vscale = if attn_manual { 1.0f32 / (V_HD as f32).sqrt() } else { 1.0 };
-    // GEB_QKV3：q/k/v 独立投影（3×mm + 独立权重输入），替代融合 qkv mm +
-    // SliceD×3。msprof 取证：切片视图下游（TransposeD/
-    // PFA）每层触发 3 次运行时 MemcopyAsync 物化（~1.77MB/次）+ 每次前
-    // ~4.5-12ms host 停顿 = vision ~450ms 空隙的主源（81 次/执行）
+    // GEB_QKV3: independent q/k/v projections (3 mms + separate weight
+    // inputs) instead of one fused qkv mm + SliceD x3. msprof showed the
+    // slice views' downstream consumers (TransposeD/PFA) trigger 3
+    // runtime MemcopyAsync materializations per layer (~1.77MB each, with
+    // ~4.5-12ms host stalls) — the main source of ~450ms of vision gaps
+    // (81 per execution).
     let qkv3 = std::env::var("GEB_QKV3").is_ok();
     let mut seed = 0xC0DEu32;
     let mut s = Seg::new("ge_vision");
 
-    // ---- 段级输入（注册序 = eager 的 index 约定）----
-    // 0 patches / 1 patch_wt / 2 patch_b / 3 pos_rep / 4 zeros /
-    // 5 shp_qkv3 / 6 shp_flat2 / 每层 12 项（GEB_QKV3: 16 项）/ 尾 4 项(pnw,pnb,projwt,projb)
-    // e2e：真 patches（golden 或合成 bring-up）；缺省随机（对拍两路同值）
+    // ---- Segment inputs (registration order == runtime bind order) ----
+    // 0 patches / 1 patch_wt / 2 patch_b / 3 pos_rep / 4 zeros / 5
+    // shp_qkv3 / 6 shp_flat2 / 12 per layer (16 under GEB_QKV3) / 4 tail
+    // items (pnw,pnb,projwt,projb). e2e supplies real patches; the
+    // default is random (same values on both paths).
     let patches_h = e2e
         .as_ref()
         .map(|st| st.patches.clone())
@@ -2591,7 +2501,8 @@ pub fn seg_vision(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&m
         .unwrap_or_else(|| rand_f16(VW as usize, &mut seed, 12000.0));
     s.data(ctx, "patch_b", &[1, VW], &patch_b_h);
     {
-        // position 表循环重复（cuda kernel 语义：行 r 读 table[r % tpv]）
+        // position table, cyclically repeated (cuda kernel semantics:
+        // row r reads table[r % tpv]).
         let table = real
             .map(|w| t_f16(&w.vision.position_embedding))
             .unwrap_or_else(|| rand_f16((VPV * VW) as usize, &mut seed, 300.0));
@@ -2603,34 +2514,30 @@ pub fn seg_vision(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&m
         s.data(ctx, "pos_rep", &[t, VW], &rep);
     }
     s.data_zeros(ctx, "zeros", t, VW);
-    // shape 类输入一律 Const（Data 会让 desc 变 unknown → host 调度停顿）
+    // Shape inputs are always Consts (as Data they turn descs unknown and
+    // stall host scheduling).
     s.const_i32("shp_v3", &[VIEWS as i32, VPV as i32, vqd as i32]);
     s.const_i32("shp_flat2", &[t as i32, vqd as i32]);
     s.const_i32("nsh", &[VW as i32]); // LayerNormV4 normalized_shape
-    // 手工 attention 的头主序桥 shape（headsplit/headmerge 用）
+    // head-major bridge shapes for manual attention
+    // (headsplit/headmerge).
     s.const_i32("shp_at3", &[(VIEWS * V_HEADS) as i32, VPV as i32, V_HD as i32]);
     s.const_i32("shp_vs4", &[VIEWS as i32, VPV as i32, V_HEADS as i32, V_HD as i32]);
     s.const_i32("shp_vh4", &[VIEWS as i32, V_HEADS as i32, VPV as i32, V_HD as i32]);
 
-    // ---- 图：patch embed ----
+    // ---- Graph: patch embed ----
     let mut cur = s.mm("pemb", "patches", &[t, V_PATCH_W], "patch_wt", &[VW, V_PATCH_W], &[t, VW]);
     cur = s.bias("pemb_b", &cur, &[t, VW], "patch_b");
     cur = s.add2("pemb_p", &cur, "pos_rep", &[t, VW]);
 
-    // ---- 层循环 ----
-    // eager 参考的 qkv 走三个独立 matmul（fused 输出 [m, q|k|v] 列交织，
-    // take_rows 的 flat 切分在交织布局下数学错误——生产 eager 的该切分
-    // 是对拍取证发现的 bug，GE 侧 SliceD 通道切分才是对的；eager 参考以
-    // 独立投影保持数学正确）。独立 buffer 段函数持有，不进图输入。
-    let mut eager_qkv: Vec<(DeviceBuffer, DeviceBuffer, DeviceBuffer, DeviceBuffer, DeviceBuffer, DeviceBuffer)> = Vec::new();
-    // norm gamma/beta 的 host 副本（eager 参考 host LN 用）
-    let mut eager_norms: Vec<(Vec<f16>, Vec<f16>, Vec<f16>, Vec<f16>)> = Vec::new();
+    // ---- Layer loop ----
     let mut layer_bases = Vec::with_capacity(depth);
     for i in 0..depth {
         let base = s.binds.len();
         layer_bases.push(base);
         let p = format!("l{i}_");
-        // 真权重：SigLIP 块按层索引（GEB_DEPTH 冒烟 <= 27）
+        // Real weights: SigLIP blocks are indexed by layer (GEB_DEPTH
+        // smoke runs <= 27).
         let blk = real.and_then(|w| w.vision.blocks.get(i));
         let n1w_h = blk
             .map(|b| t_f16(&b.norm1.weight))
@@ -2641,10 +2548,11 @@ pub fn seg_vision(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&m
         s.data(ctx, &format!("{}n1w", p), &[VW], &n1w_h);
         s.data(ctx, &format!("{}n1b", p), &[VW], &n1b_h);
         {
-            // host 三块 [VW, vqd] → GE 拼接 [VW, qkvw] 转置上传；
-            // eager 三块各自转置上传；bias 整条（GE）/host 切三段（eager）。
-            // manual attention 时 GE 侧 q 块（权重+bias）预乘 1/√hd（图内
-            // 无 scale 算子）；eager 侧保持原值（PFA 的 scale_value attr 承担）
+            // Three host blocks [VW, vqd]; the fused path concatenates to
+            // [VW, qkvw] before the transposed upload. Under manual
+            // attention the q block (weight+bias) is premultiplied by
+            // 1/sqrt(hd) — the graph has no scale operator (PFA carries it
+            // in scale_value instead).
             let wq = blk
                 .map(|b| lw_f16(&b.q))
                 .unwrap_or_else(|| rand_f16((VW * vqd) as usize, &mut seed, 30000.0));
@@ -2659,7 +2567,8 @@ pub fn seg_vision(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&m
             } else {
                 wq.clone()
             };
-            // 真权重 qkv bias = q.bias ‖ k.bias ‖ v.bias（SigLIP 三投影各有 bias）
+            // Real-weight qkv bias = q.bias || k.bias || v.bias (each
+            // SigLIP projection has its own bias).
             let bias = blk
                 .map(|b| {
                     [
@@ -2679,11 +2588,12 @@ pub fn seg_vision(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&m
                 bias.clone()
             };
             if qkv3 {
-                // 独立权重/bias 输入（host 切一次，免运行时物化）；
-                // wq_s/bias_s 已含 manual attention 的 vscale 折叠。
-                // qkv3 下不注册融合 qkvwt/qkvb（图无消费者，GE 可能将其
-                // 从模型输入中消除 → dataset 错位）——层内输入位次
-                // 2..8，eager 闭包按 qkv3 偏移读
+                // Independent weight/bias inputs (one host split, no
+                // runtime materialization); wq_s/bias_s already carry the
+                // manual-attention vscale fold. The fused qkvwt/qkvb is
+                // deliberately not registered in this mode — an input with
+                // no graph consumer may be eliminated from the model's
+                // input list, shifting every later input index.
                 s.wt(ctx, &format!("{}qw", p), &[vqd, VW], &wq_s, VW, vqd);
                 s.wt(ctx, &format!("{}kw", p), &[vqd, VW], &wk, VW, vqd);
                 s.wt(ctx, &format!("{}vw", p), &[vqd, VW], &wv, VW, vqd);
@@ -2701,13 +2611,6 @@ pub fn seg_vision(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&m
                 s.wt(ctx, &format!("{}qkvwt", p), &[qkvw, VW], &fused, VW, qkvw);
                 s.data(ctx, &format!("{}qkvb", p), &[1, qkvw], &bias_s);
             }
-            let bq = upload(ctx, &bias[0..vqd as usize]);
-            let bk = upload(ctx, &bias[vqd as usize..2 * vqd as usize]);
-            let bv = upload(ctx, &bias[2 * vqd as usize..]);
-            let ebq = wbuf_t(ctx, &wq, VW, vqd);
-            let ebk = wbuf_t(ctx, &wk, VW, vqd);
-            let ebv = wbuf_t(ctx, &wv, VW, vqd);
-            eager_qkv.push((ebq, ebk, ebv, bq, bk, bv));
         }
         {
             let host = blk
@@ -2727,7 +2630,6 @@ pub fn seg_vision(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&m
             .unwrap_or_else(|| norm_f16(VW as usize, &mut seed, 0.0));
         s.data(ctx, &format!("{}n2w", p), &[VW], &n2w_h);
         s.data(ctx, &format!("{}n2b", p), &[VW], &n2b_h);
-        eager_norms.push((n1w_h, n1b_h, n2w_h, n2b_h));
         {
             let host = blk
                 .map(|b| lw_f16(&b.fc1))
@@ -2749,8 +2651,8 @@ pub fn seg_vision(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&m
             .unwrap_or_else(|| rand_f16(VW as usize, &mut seed, 12000.0));
         s.data(ctx, &format!("{}fc2b", p), &[1, VW], &fc2b_h);
 
-        // attention（v3 方案：rank-2 列切 → Reshape rank-3 桥）。
-        // manual：[b*h,s,d] 桥 + bmm/softmax/bmm（全静态）；pfa：batch PFA
+        // attention: manual = [b*h,s,d] bridge + bmm/softmax/bmm (all
+        // static); pfa = batch PromptFlashAttention.
         let ln1 = s.addln(&format!("{}ln1", p), &cur, &format!("{}n1w", p), &format!("{}n1b", p), "nsh", &[t, VW]);
         let (q2, k2, v2) = if qkv3 {
             let qm = s.mm(&format!("{}qm", p), &ln1, &[t, VW], &format!("{}qw", p), &[vqd, VW], &[t, vqd]);
@@ -2769,8 +2671,8 @@ pub fn seg_vision(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&m
             (q2, k2, v2)
         };
         let attn = if attn_manual {
-            // 头主序桥（headsplit：Reshape[3,256,16,72]→TransposeD(0,2,1,3)
-            // →Reshape[48,256,72]）——直接 Reshape 是错排
+            // head-major bridge (see headsplit) — a direct Reshape would
+            // mispermute.
             let q3 = s.headsplit(&format!("{}qh", p), &q2, t, VIEWS, VPV, V_HEADS, V_HD, "shp_vs4", "shp_at3");
             let k3 = s.headsplit(&format!("{}kh", p), &k2, t, VIEWS, VPV, V_HEADS, V_HD, "shp_vs4", "shp_at3");
             let v3 = s.headsplit(&format!("{}vh", p), &v2, t, VIEWS, VPV, V_HEADS, V_HD, "shp_vs4", "shp_at3");
@@ -2791,7 +2693,7 @@ pub fn seg_vision(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&m
         let projb = s.bias(&format!("{}projb", p), &proj, &[t, VW], &format!("{}outb", p));
         let res1 = s.add2(&format!("{}res1", p), &projb, &cur, &[t, VW]);
 
-        // mlp（exact gelu）
+        // mlp (exact gelu)
         let ln2 = s.addln(&format!("{}ln2", p), &res1, &format!("{}n2w", p), &format!("{}n2b", p), "nsh", &[t, VW]);
         let fc1 = s.mm(&format!("{}fc1", p), &ln2, &[t, VW], &format!("{}fc1wt", p), &[V_INTER, VW], &[t, V_INTER]);
         let fc1b = s.bias(&format!("{}fc1b", p), &fc1, &[t, V_INTER], &format!("{}fc1b", p));
@@ -2827,16 +2729,18 @@ pub fn seg_vision(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&m
     println!("vision OM built: depth={depth} n_in={} n_out=1", s.ins().len());
 
     if let Some(st) = e2e {
-        // e2e：加载 vision_real.om 跑一次，抓 post-projector 输出 [VT, PW]
+        // e2e: load vision_real.om, run once, capture the post-projector
+        // output [VT, PW].
         let outs = e2e_run(ctx, stream, &mut s, "vision");
-        // vision OM 绑 108 个 LN aux 输出（trap #17：mean/rstd 死端会让 y 爆）
-        // ——主输出（post-projector）在 idx0
+        // The vision OM carries 108 LN aux outputs (dead mean/rstd would
+        // blow up y) — the main output (post-projector) is idx0.
         assert!(outs.len() >= 1);
         st.vision_out = outs[0].clone();
         let m = st.vision_out.iter().fold(0f32, |m, v| m.max(v.to_f32().abs()));
         println!("[e2e] vision_out |max|={m:.4}");
-        // GEB_E2E_SERVE：机械下沉 E2eStage（per-frame 执行由 seg_e2e 的
-        // serve 循环驱动；routs 一次分配跨请求复用）
+        // GEB_E2E_SERVE: sink the mech into E2eStage (per-frame execution
+        // driven by seg_e2e's serve loop; routs allocated once, reused
+        // across requests).
         if std::env::var("GEB_E2E_SERVE").is_ok() {
             let n_out = s.g.num_outputs().unwrap();
             let routs: Vec<DeviceBuffer> = (0..n_out)
@@ -2851,21 +2755,22 @@ pub fn seg_vision(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&m
 }
 
 // ---------------------------------------------------------------------------
-// prefix 段：depth×language 层全序，输出每层 k/v（末层无 tail——eager
-// compute_tail=false 语义）
+// prefix segment: depth x language layers in order, emitting each layer's
+// k/v (the last layer emits no tail).
 // ---------------------------------------------------------------------------
 
-/// int8 权重注册：s_eff 吸收量化 → wq int8 [n,k]（Data 或 Const）+ scale
-/// f32 [n] + smooth/inv f16 行 Data（native 开关二选一）。GEB_INT8_DUMP
-/// 同步落盘（L{nn}_{proj}.wq/.scale，对拍 int8_weights_v1.npz 金标准）。
-/// 返回 (wq, ws, smooth|inv) 三名。
+/// int8 weight registration: s_eff-absorb quantization -> wq int8 [n,k]
+/// (Data or Const) + scale f32 [n] + a smooth/inv f16 row Data (native
+/// switch picks which). GEB_INT8_DUMP also writes L{nn}_{proj}.wq/.scale
+/// for comparison against the int8_weights_v1.npz golden. Returns the
+/// (wq, ws, smooth|inv) names.
 #[allow(clippy::type_complexity)]
 fn reg_i8(
     s: &mut Seg, ctx: &AscendContext, facs: &std::collections::HashMap<String, Int8Smooth>,
     key: &str, dump_tag: &str, w32: &[f32], k: i64, n: i64, native: bool, dump: Option<&str>,
 ) -> (String, String, String) {
-    let f = facs.get(key).unwrap_or_else(|| panic!("int8 smooth 缺 {key}"));
-    assert_eq!(f.s_eff.len(), k as usize, "{key} 因子长度 {} ≠ k={k}", f.s_eff.len());
+    let f = facs.get(key).unwrap_or_else(|| panic!("int8 smooth missing {key}"));
+    assert_eq!(f.s_eff.len(), k as usize, "{key} factor length {} != k={k}", f.s_eff.len());
     let (wq, scale) = quant_w8(w32, k as usize, &f.s_eff);
     if let Some(dir) = dump {
         let _ = std::fs::create_dir_all(dir);
@@ -2874,10 +2779,11 @@ fn reg_i8(
         let sb: Vec<u8> = scale.iter().flat_map(|v| v.to_le_bytes()).collect();
         std::fs::write(format!("{dir}/{dump_tag}.scale"), &sb).expect("dump scale");
     }
-    // GEB_INT8_WCONST=1（默认随 GEB_WCONST）：wq/ws 烤 Const——int8 Data
-    // 权重每执行付 ND→NZ TransData 税（实测 prefix 129.5ms 反比 f16 105 慢
-    // ~25ms ≈ 2GB/63GB/s（serve 实测）；Const 编译期定型免税，
-    // f16 wt() 同理）。smooth 行体量小（[k] f16），保持 Data 无妨
+    // GEB_INT8_WCONST=1 (default follows GEB_WCONST): bake wq/ws as
+    // Consts — int8 Data weights pay a per-execution ND->NZ TransData
+    // tax (prefix measured 129.5ms vs f16's 105 — the ~25ms delta is
+    // 2GB/63GB/s). Consts fold the format at compile time, tax-free
+    // (same as f16 wt()). The tiny [k] f16 smooth row stays Data.
     let wconst8 = envi("GEB_INT8_WCONST", envi("GEB_WCONST", 0)) == 1;
     let (wq_n, ws_n) = if wconst8 {
         let wqb: Vec<u8> = wq.iter().map(|&v| v as u8).collect();
@@ -2895,11 +2801,14 @@ fn reg_i8(
     };
     let sm_n = if native {
         let smf: Vec<f16> = f.smooth.iter().map(|&v| f16::from_f32(v)).collect();
-        // gear 模式两难与解：纯静态 Data 毒化 SetDims 档位匹配（实测定罪）；
-        // 定值动态维又会撑爆 payload 的 ACL_MAX_DIM_CNT=128（全深
-        // 18 层×9 输入 + 基础 24 = 186 维）。缺省（=1）走 Const——此前
-        // 「Const 撞 legacy 墙 rc=-7」实为 dynamicDims 选项串 bug 的误判
-        // （旧版选项被 payload 静态尾维污染，与 Const 无关）
+        // Gear mode dilemma and its resolution: a purely static Data
+        // poisons SetDims gear matching (measured); constant dynamic
+        // dims would overflow the payload's ACL_MAX_DIM_CNT=128 (full
+        // depth: 18 layers x 9 inputs + 24 base = 186). Default (=1) is
+        // Const — the earlier "Const hits the legacy wall rc=-7" was a
+        // misdiagnosis of a dynamicDims option-string bug (the old
+        // option was polluted by payload static trailing dims; nothing
+        // to do with Const).
         if !s.gear_ps.is_empty() {
             s.const_f16(&format!("{dump_tag}sm"), &[k], &smf)
         } else {
@@ -2913,16 +2822,19 @@ fn reg_i8(
             s.data(ctx, &format!("{dump_tag}inv"), &[1, k], &invf)
         }
     };
-    // bias 折入算子实验已毙：int32 Const 输入 aclgrphBuildModel rc=-7
-    // （legacy 算子 bias 分支不可用，实测）。改为调用方直接砍 bias op
-    //（Gemma 投影 bias≡0 + int8 已 assert 真权重——语义零损失）
+    // The bias-fold-into-operator experiment is dead: an int32 Const
+    // input fails aclgrphBuildModel with rc=-7 (the legacy operator's
+    // bias branch is unusable, measured). Callers simply drop the bias
+    // op instead (Gemma bias == 0 and int8 already asserts real weights
+    // — zero semantic loss).
     (wq_n, ws_n, sm_n)
 }
 
-/// 统一 int8/f16 投影：int8 = QuantMatmulDequant（native smooth 直入算子，
-/// GEB_INT8_NATIVE=0 回退 gatew 行预乘）；f16 = MatMulV2（w16 = 原权重段
-/// 名）。两路 w dims 同 [n,k]。bias 均由调用方处理（int8 路径 Gemma
-/// bias≡0 直接砍 op）。
+/// Unified int8/f16 projection: int8 -> QuantMatmulDequant (native
+/// smooth feeds the operator directly; GEB_INT8_NATIVE=0 falls back to a
+/// gatew row premultiply); f16 -> MatMulV2 (w16 = the original weight
+/// segment name). Both paths' w dims are [n,k]. Bias is the caller's
+/// business (the int8 path drops the op outright — Gemma bias == 0).
 #[allow(clippy::type_complexity)]
 fn mm_or_qmd(
     s: &mut Seg, name: &str, a: &str, a_dims: &[i64], i8w: Option<&(String, String, String)>,
@@ -2939,13 +2851,15 @@ fn mm_or_qmd(
     }
 }
 
-/// int8 层内 f16 成员权重 host：组 norm 回 torch 域（g1/g2 = 1+g）后，
-/// 引擎 fold 权重（w·(1+g)）须除回 fold 再进 f16——否则 fold 双计。
-/// unfold=false（组未切 int8）时保持引擎原样（= lw_f16 语义）。
+/// Host f16 member weights inside an int8 layer: once the group norm
+/// returns to the torch domain (g1/g2 = 1+g), the engine's folded
+/// weights (w*(1+g)) must divide the fold back out before f16 — else
+/// the fold double-counts. unfold=false (group not on int8) keeps the
+/// engine values (= lw_f16 semantics).
 fn lin_f16_unfold(l: &LinearWeights, out_dim: usize, unfold: bool, g: &[f32]) -> Vec<f16> {
     let w32 = l.weight.to_f32_vec().unwrap();
     let w = if unfold {
-        assert_eq!(g.len(), w32.len() / out_dim, "unfold 因子长度不符");
+        assert_eq!(g.len(), w32.len() / out_dim, "unfold factor length mismatch");
         w32.into_iter()
             .enumerate()
             .map(|(i, v)| v / g[i / out_dim])
@@ -2961,27 +2875,34 @@ pub fn seg_prefix(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&m
     let stream = be.stream();
     let depth = envi("GEB_DEPTH_PREFIX", envi("GEB_DEPTH", 18)) as usize;
     let tokens = envi("GEB_TOKENS", 64);
-    // GEB_PREFIX_DROP_EMPTY：尾部空视图行数（9/10 语义根因修复）。
-    // golden_gen 按 LIBERO 语义只喂 2 真实视图，empty_camera 走 missing 路径
-    // （-1 pad 图进 SigLIP 但 pad_mask=0）：make_att_2d_masks 的 pad_2d 把该
-    // 256 个 key 对所有人遮蔽，position_ids=cumsum(pad)-1 使文本位置塌缩到
-    // 512..711。pad 列 softmax 贡献恰为 0、可见 token 位置恰为 arange ⇒
-    // 数学上等价于直接剔除该视图行（968→712，全开+arange 语义不变）——
-    // theory_check.py 实证 h1 对应行 0.128%。引擎此前把 pad 视图当一等
-    // 公民（可见 key + 占位 512..767）＝ e2e 314% 漂移的真根因
+    // GEB_PREFIX_DROP_EMPTY: trailing empty-view rows (the 9/10 semantic
+    // root-cause fix). LIBERO feeds only 2 real views; empty_camera takes
+    // the missing path (-1 pad images enter SigLIP but pad_mask=0):
+    // make_att_2d_masks' pad_2d hides those 256 keys from everyone and
+    // position_ids=cumsum(pad)-1 collapses text positions to 512..711.
+    // Pad columns contribute exactly 0 to softmax and visible tokens sit
+    // exactly on arange, so this is mathematically the same as dropping
+    // the view rows outright (968 -> 712; theory_check.py measured 0.128%
+    // on the affected rows). The engine used to treat pad views as
+    // first-class (visible keys squatting on 512..767) — the true root
+    // cause of the 314% e2e drift.
     let drop_v = envi("GEB_PREFIX_DROP_EMPTY", 0);
-    let p = VT + tokens - drop_v; // prefix 长度（16 倍数纪律）
-    // 动态分档（GEB_DYN_LLIST）：desc 维度里的 p 一律 -1（gd()），内容/
-    // buffer 仍按 p 物化（gear 模式下 tokens 必须 = 档表 max L——rope 表/
-    // zeros/swap 逐行 p 无关，p_max 全量即前缀截断语义）。L 相关 Const
-    // （qswap_c/kswap_c）在 gear 模式转 Data[-1]。档表 p 值喂 Seg，finish
-    // 合成 ge.dynamicDims + 每档 S2 payload
-    // GEB_PREFIX_POOL：prefix 段改静态组装 + per-L 静态 OM 池换柄执行——
-    // 判决：动态图结构（-1 维 Reshape / rope·qswap Data 化）
-    // 使 int8 逐层漂移 3×（真帧互差 13.1% actions 级；2 档对照证伪
-    // range-tiling 假设）；llist 仍留给 flow 池与客户端校验
+    let p = VT + tokens - drop_v; // prefix length (multiple-of-16 discipline)
+    // Dynamic gears (GEB_DYN_LLIST): every p in a desc becomes -1 (gd());
+    // content/buffers still materialize at p (in gear mode tokens must
+    // equal the gear table's max L — rope tables/zeros/swaps are
+    // row-wise p-independent, and a full p_max upload is prefix
+    // truncation). L-dependent Consts (qswap_c/kswap_c) become Data[-1]
+    // in gear mode. The gear p values feed Seg; finish() composes
+    // ge.dynamicDims + the per-gear S2 payloads.
+    // GEB_PREFIX_POOL: prefix switches to static assembly + a per-L
+    // static OM pool with handle swaps — the verdict was that dynamic
+    // graph structure (-1-dim Reshape, rope/qswap as Data) drifts int8
+    // layer-by-layer by 3x (13.1% actions-level cross-frame; a 2-gear
+    // control falsified the range-tiling hypothesis). The llist stays
+    // for the flow pool and client-side validation.
     let gear_ll = if std::env::var("GEB_PREFIX_POOL").is_ok() {
-        println!("[prefix-pool] GEB_PREFIX_POOL 生效：prefix 静态组装 + per-L 池");
+        println!("[prefix-pool] GEB_PREFIX_POOL active: static prefix assembly + per-L pool");
         None
     } else {
         dyn_llist()
@@ -2991,45 +2912,49 @@ pub fn seg_prefix(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&m
     if let Some(g) = &gear_ll {
         assert!(
             std::env::var("GEB_WCONST").is_ok(),
-            "GEB_DYN_LLIST 需 GEB_WCONST=1（权重 Const 根图单份——档间零重复的前提）"
+            "GEB_DYN_LLIST requires GEB_WCONST=1 (weights Const in one root graph — the precondition for zero duplication across gears)"
         );
-        assert!(std::env::var("GEB_ROPEFLAT").is_ok(), "GEB_DYN_LLIST 需 GEB_ROPEFLAT=1");
+        assert!(std::env::var("GEB_ROPEFLAT").is_ok(), "GEB_DYN_LLIST requires GEB_ROPEFLAT=1");
         assert!(
             std::env::var("GEB_ATTN").map(|v| v == "manual").unwrap_or(false),
-            "GEB_DYN_LLIST 需 GEB_ATTN=manual"
+            "GEB_DYN_LLIST requires GEB_ATTN=manual"
         );
-        assert!(std::env::var("GEB_QKV3").is_ok(), "GEB_DYN_LLIST 需 GEB_QKV3=1");
+        assert!(std::env::var("GEB_QKV3").is_ok(), "GEB_DYN_LLIST requires GEB_QKV3=1");
         let lmax = *g.iter().max().unwrap();
-        assert_eq!(tokens, lmax, "GEB_DYN_LLIST 模式 GEB_TOKENS 须 = 档表 max L（binds 按 max 物化）");
+        assert_eq!(tokens, lmax, "GEB_DYN_LLIST requires GEB_TOKENS = the gear table's max L (binds materialize at max)");
         let ps = g.iter().map(|&l| VT + l - drop_v).collect::<Vec<i64>>();
-        println!("[gear] prefix 动态分档：L {:?} → p {:?}", g, ps);
+        println!("[gear] prefix dynamic gears: L {:?} -> p {:?}", g, ps);
         gear_ps_hold = Some(ps);
     }
     let mut seed = 0xBEEFu32;
-    // GEB_QKV3：q/k/v 独立投影（同 vision 段——SliceD 列切视图的运行时
-    // MemcopyAsync 物化是 prefix 750ms 的主源，取证见 vision 段注记）
+    // GEB_QKV3: independent q/k/v projections (same rationale as the
+    // vision segment — the SliceD column views' runtime MemcopyAsync
+    // materialization was the main source of prefix's 750ms).
     let qkv3 = std::env::var("GEB_QKV3").is_ok();
-    // GEB_ATTN=manual：手工 GQA attention（bmm+softmax+bmm + k/v TileD 广播）
-    // 替代 PFA——PFA 是 transformer-API 型算子，静态 OM 内走 host launcher
-    // （每次执行 host tiling + staging）。scale 由 pscale 折进 q 权重/bias。
+    // GEB_ATTN=manual: hand-built GQA attention (bmm+softmax+bmm + k/v
+    // TileD broadcast) replacing PFA — PFA is a transformer-API-style
+    // operator that runs a host launcher inside static OMs (host tiling
+    // + staging per execution). pscale folds into the q weight/bias.
     let attn_manual = std::env::var("GEB_ATTN")
         .map(|v| v == "manual").unwrap_or(false);
     let pscale = if attn_manual { 1.0f32 / (HD as f32).sqrt() } else { 1.0 };
-    // GEB_PREFIX_INT8（生产化）：7 投影 → QuantMatmulDequant。因子文件
-    // = GEB_INT8_SMOOTH（默认 pyo3_check/smooth_calib_v1_engine.safetensors，
-    // torch 域 npz 经 Gemma 1+g fold 校正转换）。GEB_INT8_PROJS 子集分阶段
-    // bring-up（默认全 7）；GEB_INT8_NATIVE=0 回退 TileD+Mul 行预乘。
-    // GEB_INT8_DUMP=<dir> 落盘量化产物对拍 int8_weights_v1.npz 金标准。
+    // GEB_PREFIX_INT8 (production): 7 projections -> QuantMatmulDequant.
+    // Factors come from GEB_INT8_SMOOTH (default
+    // ./smooth_calib_v1_engine.safetensors, converted from the torch-domain
+    // npz with the Gemma 1+g fold correction). GEB_INT8_PROJS selects a
+    // subset for staged bring-up (default all 7); GEB_INT8_NATIVE=0 falls
+    // back to a TileD+Mul row premultiply. GEB_INT8_DUMP=<dir> writes the
+    // quantized artifacts for comparison against int8_weights_v1.npz.
     let int8 = prefix_int8();
     let (facs, i8norms): (
         std::collections::HashMap<String, Int8Smooth>,
         std::collections::HashMap<String, [Vec<f32>; 2]>,
     ) = if int8 {
-        assert!(real.is_some(), "GEB_PREFIX_INT8 需要 GEB_CKPT 真权重");
-        assert!(qkv3, "GEB_PREFIX_INT8 需要 GEB_QKV3=1（fused qkv 无法 per-matrix smooth）");
+        assert!(real.is_some(), "GEB_PREFIX_INT8 requires real weights via GEB_CKPT");
+        assert!(qkv3, "GEB_PREFIX_INT8 requires GEB_QKV3=1 (fused qkv cannot take per-matrix smooth)");
         let path = std::env::var("GEB_INT8_SMOOTH")
             .unwrap_or_else(|_| "./smooth_calib_v1_engine.safetensors".into());
-        println!("[int8] prefix int8 开启：smooth={path}");
+        println!("[int8] prefix int8 on: smooth={path}");
         load_int8_smooth(&path)
     } else {
         (std::collections::HashMap::new(), std::collections::HashMap::new())
@@ -3048,46 +2973,50 @@ pub fn seg_prefix(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&m
         s.set_gear_ps(ps);
     }
 
-    // ---- 段级输入 ----
-    // 0 x0 / 1 zeros / 2..7 flat rope 六件（eager flat 版用）/
-    // 8..11 rank-2 rope 表四件（GE rank-2 组合用）/ 层 10 项
-    // e2e x0 = vision_out ‖ token_embedding[token_ids]（embed_prefix 同序：
-    // 视觉前、语言后；state 不进 prefix——π0.5 走离散化进 prompt 文本）
+    // ---- Segment inputs ----
+    // 0 x0 / 1 zeros / 2..7 flat rope sextet / 8..11 rank-2 rope tables
+    // / 10 per layer. e2e x0 = vision_out || token_embedding[token_ids]
+    // (embed_prefix order: vision rows first; state does not enter
+    // prefix — PI-0.5 discretizes state into the prompt text).
     let x0_h = match (&e2e, real) {
         (Some(st), Some(w)) => {
-            assert!(!st.vision_out.is_empty(), "e2e: 须先跑 vision 段");
+            assert!(!st.vision_out.is_empty(), "e2e: run the vision segment first");
             assert_eq!(st.vision_out.len(), (VT * PW) as usize);
-            assert_eq!(st.token_ids.len(), tokens as usize, "token ids 与 GEB_TOKENS 不符");
-            // 一次性 f32 物化 [vocab,PW]（~2.1GB 峰值，查完即弃）
+            assert_eq!(st.token_ids.len(), tokens as usize, "token ids != GEB_TOKENS");
+            // One-shot f32 materialization of [vocab,PW] (~2.1GB peak,
+            // discarded after the lookup).
             let emb = w.vision.token_embedding.to_f32_vec().unwrap();
             let vocab_w = PW as usize;
-            // LeRobot embed_language_tokens 语义：查表行 × √width（gemma
-            // embed scale；vision 段无此缩放）。
-            // 空视图剔除：vision_out 只取前 (VT-drop_v) 行（视图主序，empty 在尾）
+            // LeRobot embed_language_tokens semantics: lookup rows *
+            // sqrt(width) (gemma embed scale; the vision segment has no
+            // such scale). Empty-view drop: only the first (VT-drop_v)
+            // vision_out rows are kept (view-major, empty views trail).
             let lang_scale = (PW as f32).sqrt();
             let vis_rows = ((VT - drop_v) * PW) as usize;
             let mut x0 = st.vision_out[..vis_rows].to_vec();
             x0.reserve(st.token_ids.len() * vocab_w);
             for &id in &st.token_ids {
                 let r = id as usize * vocab_w;
-                assert!(r + vocab_w <= emb.len(), "token id {id} 超 vocab");
+                assert!(r + vocab_w <= emb.len(), "token id {id} beyond vocab");
                 x0.extend(emb[r..r + vocab_w].iter().map(|&v| f16::from_f32(v * lang_scale)));
             }
             x0
         }
-        (None, None) => panic!("e2e 需要 GEB_CKPT（token_embedding 查表）"),
+        (None, None) => panic!("e2e requires GEB_CKPT (token_embedding lookup)"),
         _ => rand_f16((p * PW) as usize, &mut seed, 100.0),
     };
     s.data(ctx, "x0", &[gd(p), PW], &x0_h);
-    // zeros 显式 gear 化（data_zeros 保持纯静态——vision 段共用）：
-    // 内容全零逐行 p 无关，p_max 全量即前缀截断
+    // zeros gets explicit gearing here (data_zeros stays purely static —
+    // shared with the vision segment): all-zero content is row-wise
+    // p-independent, and a full p_max upload is prefix truncation.
     {
         let zh = vec![f16::from_f32(0.0); (p * PW) as usize];
         s.data(ctx, "zeros", &[gd(p), PW], &zh);
     }
-    // GEB_ATTN_MASK（range padding）：softmax 加性 mask 输入
-    // [1,1,p]——bake 内容占位全 0（无 pad），serve/probe 侧按真 L 填充
-    //（行 [vis+L, vis+P) = -30000；f16 域禁 -inf）。全层共用一只 Data
+    // GEB_ATTN_MASK (range padding): additive softmax mask input [1,1,p]
+    // — baked as all-zero placeholder (no pad); serve/probe fills it per
+    // true L (rows [vis+L, vis+P) = -30000; -inf is illegal in f16). One
+    // Data shared by all layers.
     let attn_mask_n: Option<String> = if envi("GEB_ATTN_MASK", 0) == 1 {
         let mh = vec![f16::from_f32(0.0); p as usize];
         Some(s.data(ctx, "padmask", &[1, 1, p], &mh))
@@ -3098,8 +3027,9 @@ pub fn seg_prefix(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&m
     let (kc, ks, ki) = rope_flat_const(p, KV_HEADS, 0);
     let qf = (p * HEADS * 2, HD / 2);
     let kf = (p * KV_HEADS * 2, HD / 2);
-    // gear 模式：dim0 一律 -1 + mul 登记（qf.0 = p×(HEADS*2)）；内容 p_max
-    // 全量（逐行 p 无关——前缀截断语义）
+    // Gear mode: dim0 always -1 with a registered mul (qf.0 =
+    // p*(HEADS*2)); content materializes at p_max (row-wise
+    // p-independent — prefix truncation).
     s.data(ctx, "qcos", &[gd(qf.0), qf.1], &qc);
     s.set_gear_mul("qcos", HEADS * 2);
     s.data(ctx, "qsin", &[gd(qf.0), qf.1], &qs);
@@ -3112,26 +3042,31 @@ pub fn seg_prefix(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&m
     s.set_gear_mul("ksin", KV_HEADS * 2);
     s.data_i32(ctx, "kswap", &[gd(kf.0)], &ki);
     s.set_gear_mul("kswap", KV_HEADS * 2);
-    // rank-2 表（物理 [t*heads, d] 与 [t, heads*d] 同布局；desc 按 rank-2 设）
+    // rank-2 tables (physical layout of [t*heads, d] matches
+    // [t, heads*d]; descs are rank-2).
     let (qc2, qs2) = rope_rank2_const(p, HEADS, 0);
     let (kc2, ks2) = rope_rank2_const(p, KV_HEADS, 0);
     s.data(ctx, "qcos2", &[gd(p), QD], &qc2);
     s.data(ctx, "qsin2", &[gd(p), QD], &qs2);
     s.data(ctx, "kcos2", &[gd(p), KVD], &kc2);
     s.data(ctx, "ksin2", &[gd(p), KVD], &ks2);
-    // Reshape shape 张量（rank-3 桥；Const 内容 gear 不变——p 位写 -1，
-    // 分支推理按档解析，HF 参考链实证）
+    // Reshape shape tensors (rank-3 bridges; Const content is
+    // gear-invariant — the p slot carries -1 and branch inference
+    // resolves it per gear).
     s.const_i32("shp_q3", &[1, gd(p) as i32, QD as i32]);
     s.const_i32("shp_k3", &[1, gd(p) as i32, KVD as i32]);
     s.const_i32("shp_v3", &[1, gd(p) as i32, KVD as i32]);
-    // 手工 GQA attention 的头主序桥 shape（headsplit/headmerge 用，views=1）
+    // head-major bridge shapes for manual GQA attention
+    // (headsplit/headmerge, views=1).
     s.const_i32("shp_mq4", &[1, gd(p) as i32, HEADS as i32, HD as i32]);
     s.const_i32("shp_mq3", &[HEADS as i32, gd(p) as i32, HD as i32]);
     s.const_i32("shp_ma4", &[1, HEADS as i32, gd(p) as i32, HD as i32]);
     s.const_i32("shp_mflat", &[gd(p) as i32, QD as i32]);
-    // GEB_ROPEFLAT：flat 版 rope（换视图行交换，免列切视图物化）。
-    // swap 索引：静态 Const 折叠；gear 模式转 Data[-1]（Const 全档共享而
-    // 长度随档变；Data 逐档特化 desc，内容 r^1 逐行 p 无关——实证）
+    // GEB_ROPEFLAT: flat rope (row swap on a flat view — no column-split
+    // materialization). Swap indices: a static Const when ungearred;
+    // Data[-1] in gear mode (Consts are shared across gears but the
+    // length varies; Data specializes the desc per gear, and the r^1
+    // content is row-wise p-independent).
     let ropeflat = std::env::var("GEB_ROPEFLAT").is_ok();
     if gear_ll.is_some() {
         s.data_i32(ctx, "qswap_c", &[gd(qf.0)], &qi);
@@ -3146,8 +3081,7 @@ pub fn seg_prefix(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&m
     s.const_i32("shp_kflat", &[gd(kf.0) as i32, kf.1 as i32]);
     s.const_i32("shp_kb2", &[gd(p) as i32, KVD as i32]);
 
-    // ---- 层循环（eager qkv 独立投影，同 vision 段注记）----
-    let mut eager_qkv: Vec<(DeviceBuffer, DeviceBuffer, DeviceBuffer, DeviceBuffer, DeviceBuffer, DeviceBuffer)> = Vec::new();
+    // ---- Layer loop ----
     let mut layer_bases = Vec::with_capacity(depth);
     let mut cur = "x0".to_string();
     let mut kv_outs: Vec<String> = Vec::new();
@@ -3156,14 +3090,16 @@ pub fn seg_prefix(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&m
         layer_bases.push(base);
         let tag = format!("l{i}_");
         let last = i + 1 == depth;
-        // 真权重：语言层 host 解析时已把 Gemma 1+w scale 折进 q/k/v/gate/up
-        //（g1/g2 = ones）——probe 图直接消费该约定，无需再乘 norm scale。
+        // Real weights: the host loader already folds the Gemma 1+w scale
+        // into q/k/v/gate/up (g1/g2 = ones), so the graph consumes them
+        // as-is.
         let lay = real.and_then(|w| w.language_layers.get(i));
-        let lay_i = i; // smooth 因子键层号同权重层
-        // int8 q/k/v 注册（f32 直取，不过 f16；manual-attn 的 pscale 折 q——
-        // 行量化对整体常数不变，仅 scale 同比缩小）
+        let lay_i = i; // smooth-factor key layer == weight layer
+        // int8 q/k/v registration (f32 taken directly, no f16 pass; the
+        // manual-attn pscale folds into q — row quantization is invariant
+        // to a global constant, only the scale shrinks).
         let (iq8, ik8, iv8) = if int8 {
-            let l = lay.expect("GEB_PREFIX_INT8 需真权重");
+            let l = lay.expect("GEB_PREFIX_INT8 requires real weights");
             let fk = |proj: &str| format!("prefix/L{:02}/{proj}", lay_i);
             let dt = |proj: &str| format!("L{:02}_{proj}", lay_i);
             let mut q32 = l.attention.q.weight.to_f32_vec().unwrap();
@@ -3196,11 +3132,12 @@ pub fn seg_prefix(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&m
         };
         let qkv_i8 = i8sel("q") || i8sel("k") || i8sel("v");
         let (g1_h, g1_t): (Vec<f16>, &[f32]) = if qkv_i8 {
-            // int8 组：norm 回 torch 域（gamma = (1+g) 真值，loader fold 的
-            // 替代源）——smooth 行 = s_npz 与 npz 权重面同锚（纯引擎域 s_eff
-            // 因 L00 近零 fold 会爆 f16，实测）
+            // int8 group: norm back to the torch domain (gamma = true
+            // (1+g), replacing the loader fold); smooth rows anchor to
+            // s_npz like the npz weight face (a pure engine-domain s_eff
+            // blows up f16 where the L00 fold is near zero — measured).
             let g = &i8norms[&format!("prefix/L{:02}", lay_i)][0];
-            assert_eq!(g.len(), PW as usize, "g1 长度不符");
+            assert_eq!(g.len(), PW as usize, "g1 length mismatch");
             (g.iter().map(|&v| f16::from_f32(v)).collect(), g)
         } else {
             (
@@ -3209,16 +3146,19 @@ pub fn seg_prefix(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&m
                 &[],
             )
         };
-        // gear 模式：Const 化（定值动态维会撑爆 SetDims payload 的 128 维
-        // 上限——同 smooth 注册注记）
+        // Gear mode: bake as Const (constant dynamic dims would overflow
+        // the SetDims payload's 128-dim cap — see the smooth
+        // registration note).
         if !s.gear_ps.is_empty() {
             s.const_f16(&format!("{}g1", tag), &[PW], &g1_h);
         } else {
             s.data(ctx, &format!("{}g1", tag), &[PW], &g1_h);
         }
         {
-            // f16 host 仅在对应投影未转 int8 时构造（int8 段已在上一块注册；
-            // 组切 torch 域后 f16 成员除回 fold——见 lin_f16_unfold）
+            // f16 host blocks are built only when the projection is not
+            // int8 (the int8 path registered above); after the group
+            // switches to the torch domain the f16 members divide the
+            // fold back out — see lin_f16_unfold.
             let wq = if iq8.is_none() {
                 lay.map(|l| lin_f16_unfold(&l.attention.q, QD as usize, qkv_i8, g1_t))
                     .unwrap_or_else(|| rand_f16((PW * QD) as usize, &mut seed, 8000.0))
@@ -3237,12 +3177,13 @@ pub fn seg_prefix(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&m
             } else {
                 Vec::new()
             };
-            // Gemma 投影无 bias（真权重 = zeros）
+            // Gemma projections carry no bias (real weights = zeros).
             let bias = lay
                 .map(|_| vec![f16::from_f32(0.0); QKVW as usize])
                 .unwrap_or_else(|| rand_f16(QKVW as usize, &mut seed, 4000.0));
-            // manual attention：q 块（权重+bias）预乘 1/√hd（图内无 scale
-            // 算子）；eager 侧保持原值（PFA scale_value 承担）
+            // Manual attention: q block (weight+bias) premultiplied by
+            // 1/sqrt(hd) — no scale operator in the graph (PFA carries it
+            // in scale_value).
             let wq_s: Vec<f16> = if attn_manual {
                 wq.iter().map(|v| f16::from_f32(v.to_f32() * pscale)).collect()
             } else {
@@ -3255,7 +3196,7 @@ pub fn seg_prefix(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&m
                 }
             }
             if qkv3 {
-                // qkv3 层内输入位次 1..7（g1 之后）；eager 按 qkv3 偏移读
+                // qkv3 input slots within a layer are 1..7 (after g1).
                 if iq8.is_none() {
                     s.wt(ctx, &format!("{}qw", tag), &[QD, PW], &wq_s, PW, QD);
                 }
@@ -3265,7 +3206,8 @@ pub fn seg_prefix(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&m
                 if iv8.is_none() {
                     s.wt(ctx, &format!("{}vw", tag), &[KVD, PW], &wv, PW, KVD);
                 }
-                // gear 模式行重复注册（row_bcast）；int8 折叠不消费 → 原行省内存
+                // Gear mode: row-repeated registration (row_bcast); the
+                // int8 fold does not consume it -> bare row saves memory.
                 s.row_bcast(ctx, &format!("{}qb", tag), if iq8.is_some() { 1 } else { p }, QD, &bias_s[..QD as usize]);
                 s.row_bcast(ctx, &format!("{}kb", tag), if ik8.is_some() { 1 } else { p }, KVD, &bias_s[QD as usize..(QD + KVD) as usize]);
                 s.row_bcast(ctx, &format!("{}vb", tag), if iv8.is_some() { 1 } else { p }, KVD, &bias_s[(QD + KVD) as usize..]);
@@ -3281,19 +3223,9 @@ pub fn seg_prefix(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&m
                 s.wt(ctx, &format!("{}qkvwt", tag), &[QKVW, PW], &fused, PW, QKVW);
                 s.data(ctx, &format!("{}qkvb", tag), &[1, QKVW], &bias_s);
             }
-            // eager 缓冲（f16 参考镜像）——int8 模式对拍走 e2e golden，跳过
-            if !int8 {
-                let bq = upload(ctx, &bias[0..QD as usize]);
-                let bk = upload(ctx, &bias[QD as usize..(QD + KVD) as usize]);
-                let bv = upload(ctx, &bias[(QD + KVD) as usize..]);
-                let ebq = wbuf_t(ctx, &wq, PW, QD);
-                let ebk = wbuf_t(ctx, &wk, PW, KVD);
-                let ebv = wbuf_t(ctx, &wv, PW, KVD);
-                eager_qkv.push((ebq, ebk, ebv, bq, bk, bv));
-            }
         }
-        // o/gate/up/down：int8 选中者在使用点注册（末层 break 前不触达），
-        // 此处 f16 wt 段按需保留
+        // o/gate/up/down: int8-selected projections register at their use
+        // site; the f16 wt blocks stay here as needed.
         if !i8sel("o") {
             let host = lay
                 .map(|l| lw_f16(&l.attention.output))
@@ -3307,7 +3239,7 @@ pub fn seg_prefix(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&m
         let mlp_i8 = i8sel("gate") || i8sel("up");
         let (g2_h, g2_t): (Vec<f16>, &[f32]) = if mlp_i8 {
             let g = &i8norms[&format!("prefix/L{:02}", lay_i)][1];
-            assert_eq!(g.len(), PW as usize, "g2 长度不符");
+            assert_eq!(g.len(), PW as usize, "g2 length mismatch");
             (g.iter().map(|&v| f16::from_f32(v)).collect(), g)
         } else {
             (
@@ -3345,14 +3277,16 @@ pub fn seg_prefix(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&m
         s.row_bcast(ctx, &format!("{}downb", tag), if i8sel("down") { 1 } else { p }, PW, &downb_h);
 
         let norm1 = s.addrms(&format!("{}n1", tag), &cur, "zeros", &format!("{}g1", tag), &[gd(p), PW]);
-        // rank-2 切分 + rope（rank-2 版）+ Reshape rank-3 桥。
-        // ⚠ 图输出绑 rank-2（rope 的 ad / slice 的 v）——Reshape 输出绑图
-        // 输出时 desc 是动态 [-1,-1,-1]（shape 张量驱动），size 无效
+        // rank-2 split + rope + Reshape rank-3 bridge. Graph outputs bind
+        // the rank-2 nodes (rope's ad / slice's v): binding a Reshape
+        // output as a graph output yields a dynamic [-1,-1,-1] desc
+        // (shape-tensor driven) and the declared size is ignored.
         let (q2, k2, v2) = if qkv3 {
             let qm = mm_or_qmd(&mut s, &format!("{}qm", tag), &norm1, &[gd(p), PW], iq8.as_ref(), &format!("{}qw", tag), QD, &[gd(p), QD], int8_native);
             let km = mm_or_qmd(&mut s, &format!("{}km", tag), &norm1, &[gd(p), PW], ik8.as_ref(), &format!("{}kw", tag), KVD, &[gd(p), KVD], int8_native);
             let vm = mm_or_qmd(&mut s, &format!("{}vm", tag), &norm1, &[gd(p), PW], iv8.as_ref(), &format!("{}vw", tag), KVD, &[gd(p), KVD], int8_native);
-            // int8：bias 已折入算子（int32 零）——跳过 TileD+Add 对
+            // int8: bias is folded into the operator (int32 zero) — the
+            // TileD+Add pair is skipped.
             let qb = if iq8.is_some() {
                 qm
             } else {
@@ -3387,7 +3321,7 @@ pub fn seg_prefix(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&m
         kv_outs.push(kr2.clone());
         kv_outs.push(v2.clone());
         if last {
-            break; // 末层无 PFA/tail（compute_tail=false）
+            break; // last layer: no attention/tail (compute_tail=false)
         }
         let (qr2, qr3) = if ropeflat {
             let qf2 = [gd(qf.0), qf.1];
@@ -3396,7 +3330,8 @@ pub fn seg_prefix(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&m
             s.rope2(&format!("{}qr", tag), &q2, &[gd(p), QD], "qcos2", "qsin2", "shp_q3")
         };
         let sq = if attn_manual {
-            // 头主序桥 + GQA 手工链（k/v 单头 TileD 广播；kr3/v3 rank-3 直用）
+            // head-major bridge + hand-built GQA chain (single-head k/v
+            // TileD broadcast; kr3/v3 used as rank-3 directly).
             let q3 = s.headsplit(&format!("{}qh", tag), &qr2, gd(p), 1, gd(p), HEADS, HD, "shp_mq4", "shp_mq3");
             let attn = s.attn_manual_gqa(&format!("{}attn", tag), &q3, &kr3, &v3, HEADS, gd(p), gd(p), HD, attn_mask_n.as_deref());
             s.headmerge(&format!("{}am", tag), &attn, 1, gd(p), HEADS, HD, "shp_ma4", "shp_mflat")
@@ -3405,7 +3340,7 @@ pub fn seg_prefix(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&m
             s.squeeze(&format!("{}sq", tag), &pfa, &[1, gd(p), QD], &[gd(p), QD])
         };
         let io8 = if i8sel("o") {
-            let l = lay.expect("GEB_PREFIX_INT8 需真权重");
+            let l = lay.expect("GEB_PREFIX_INT8 requires real weights");
             Some(reg_i8(&mut s, ctx, &facs, &format!("prefix/L{:02}/o", lay_i), &format!("L{:02}_o", lay_i),
                 &l.attention.output.weight.to_f32_vec().unwrap(), QD, PW, int8_native, dump_dir))
         } else {
@@ -3413,21 +3348,21 @@ pub fn seg_prefix(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&m
         };
         let proj = mm_or_qmd(&mut s, &format!("{}proj", tag), &sq, &[gd(p), QD], io8.as_ref(), &format!("{}outwt", tag), PW, &[gd(p), PW], int8_native);
         let projb = if io8.is_some() {
-            proj.clone() // int8：bias 已折入算子
+            proj.clone() // int8: bias folded into the operator
         } else {
             s.bias(&format!("{}projb", tag), &proj, &[gd(p), PW], &format!("{}outb", tag))
         };
         let res = s.add2(&format!("{}res", tag), &projb, &cur, &[gd(p), PW]);
         let norm2 = s.addrms(&format!("{}n2", tag), &res, "zeros", &format!("{}g2", tag), &[gd(p), PW]);
         let ig8 = if i8sel("gate") {
-            let l = lay.expect("GEB_PREFIX_INT8 需真权重");
+            let l = lay.expect("GEB_PREFIX_INT8 requires real weights");
             Some(reg_i8(&mut s, ctx, &facs, &format!("prefix/L{:02}/gate", lay_i), &format!("L{:02}_gate", lay_i),
                 &l.mlp.gate.weight.to_f32_vec().unwrap(), PW, INTER, int8_native, dump_dir))
         } else {
             None
         };
         let iu8 = if i8sel("up") {
-            let l = lay.expect("GEB_PREFIX_INT8 需真权重");
+            let l = lay.expect("GEB_PREFIX_INT8 requires real weights");
             Some(reg_i8(&mut s, ctx, &facs, &format!("prefix/L{:02}/up", lay_i), &format!("L{:02}_up", lay_i),
                 &l.mlp.up.weight.to_f32_vec().unwrap(), PW, INTER, int8_native, dump_dir))
         } else {
@@ -3438,7 +3373,7 @@ pub fn seg_prefix(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&m
         let gact = s.gelu(&format!("{}gact", tag), &gate, &[gd(p), INTER], true);
         let act = s.mul2(&format!("{}act", tag), &gact, &up, &[gd(p), INTER]);
         let id8 = if i8sel("down") {
-            let l = lay.expect("GEB_PREFIX_INT8 需真权重");
+            let l = lay.expect("GEB_PREFIX_INT8 requires real weights");
             Some(reg_i8(&mut s, ctx, &facs, &format!("prefix/L{:02}/down", lay_i), &format!("L{:02}_down", lay_i),
                 &l.mlp.down.weight.to_f32_vec().unwrap(), INTER, PW, int8_native, dump_dir))
         } else {
@@ -3446,7 +3381,7 @@ pub fn seg_prefix(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&m
         };
         let down = mm_or_qmd(&mut s, &format!("{}down", tag), &act, &[gd(p), INTER], id8.as_ref(), &format!("{}downwt", tag), PW, &[gd(p), PW], int8_native);
         let downb = if id8.is_some() {
-            down.clone() // int8：bias 已折入算子
+            down.clone() // int8: bias folded into the operator
         } else {
             s.bias(&format!("{}downb", tag), &down, &[gd(p), PW], &format!("{}downb", tag))
         };
@@ -3457,16 +3392,18 @@ pub fn seg_prefix(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&m
     println!("prefix OM built: depth={depth} P={p} n_in={} n_out={}", s.ins().len(), kv_outs.len());
 
     if let Some(st) = e2e {
-        // e2e：加载 prefix_real.om 跑一次，抓 36×k/v（k0,v0,k1,v1,...）
+        // e2e: load prefix_real.om, run once, capture the 36 k/v outputs
+        // (k0,v0,k1,v1,...).
         let outs = e2e_run(ctx, stream, &mut s, "prefix");
         let nkv = depth * 2;
-        assert!(outs.len() >= nkv, "prefix OM 输出 {} < kv {}", outs.len(), nkv);
+        assert!(outs.len() >= nkv, "prefix OM outputs {} < kv {}", outs.len(), nkv);
         st.kv = outs[..nkv].to_vec();
         let m = st.kv.iter().flat_map(|v| v.iter()).fold(0f32, |m, v| m.max(v.to_f32().abs()));
-        println!("[e2e] prefix kv ×{} |max|={m:.4}", st.kv.len());
-        // GEB_E2E_SERVE：机械下沉（嵌入表 ~2.1GB 常驻机械内，跨请求查表复用）
+        println!("[e2e] prefix kv x{} |max|={m:.4}", st.kv.len());
+        // GEB_E2E_SERVE: sink the mech (embedding table ~2.1GB resident
+        // in the mech, reused across requests).
         if std::env::var("GEB_E2E_SERVE").is_ok() {
-            let w = real.expect("serve prefix 需要 GEB_CKPT（token 嵌入查表）");
+            let w = real.expect("serve prefix requires GEB_CKPT (token embedding lookup)");
             let n_out = s.g.num_outputs().unwrap();
             let routs: Vec<DeviceBuffer> = (0..n_out)
                 .map(|i| ctx.malloc(s.g.output_size(i).unwrap().max(16)).expect("serve out malloc"))
@@ -3480,7 +3417,7 @@ pub fn seg_prefix(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&m
                 (0..n_out).map(|i| s.g.output_size(i).unwrap()).collect();
             let pool_root = std::env::var("GEB_PREFIX_POOL").ok();
             if pool_root.is_some() {
-                println!("[prefix-pool] serve 池模式：per-L 静态 OM 换柄（lazy，cap {}）", envi("GEB_POOL_CAP", 8));
+                println!("[prefix-pool] serve pool mode: per-L static OM handle swap (lazy, cap {})", envi("GEB_POOL_CAP", 8));
             }
             let mask_bind = s.try_bind_of("padmask");
             st.pmech = Some(PrefixMech {
@@ -3497,8 +3434,10 @@ pub fn seg_prefix(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&m
                 pool_root,
                 pool_graphs: std::collections::HashMap::new(),
                 pool_lru: Vec::new(),
-                // 池容量上限（LRU 驱逐）：桶数超过 cap 时最久未用桶被卸载、
-                // 再命中需重装（秒级）——满谱系连跑时应设为桶数
+                // Pool capacity cap (LRU eviction): past the cap the least
+                // recently used bucket unloads and a re-hit reloads
+                // (seconds). Set to the bucket count for full-lineage
+                // runs.
                 pool_cap: envi("GEB_POOL_CAP", 8) as usize,
                 rout_bytes,
                 mask_bind,
@@ -3507,19 +3446,20 @@ pub fn seg_prefix(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&m
         return;
     }
     if int8 {
-        // eager/parity 跳过：f16 eager 参考对 int8 图无裁判意义（量化执行差
-        // 的裁判 = e2e golden 对拍 + task0 行为）。烤桶 OM 落盘照常（save
-        // 只需 build 产物，同 GEB_NORM32 先例）。
+        // int8 tail: save the built OM (GEB_SAVE needs only the build
+        // artifact) and optionally run it (GEB_INT8_RUN).
         let mut save_path = None;
         if let Ok(p) = std::env::var("GEB_SAVE") {
             s.g.save(&p).expect("save om (int8)");
             println!("OM saved: {p}");
             save_path = Some(p);
         }
-        // GEB_INT8_RUN=1：活图直跑 vs 存后重载跑（同 binds）——OM 序列化
-        // desc（int8/f32 Data 输入）疑点隔离：probe 活图干净而 e2e 重载
-        // 后全炸（ladder 定位：gate/down 单投影同炸、布局桥
-        // N2/N3 干净 ⇒ 嫌疑集中 save/load 往返）
+        // GEB_INT8_RUN=1: run the live graph, then the saved-and-reloaded
+        // OM on the same binds — isolates OM serialization desc (int8/f32
+        // Data input) suspicions: the probe's live graph was clean while
+        // e2e blew up after reload (a ladder pinned gate/down single
+        // projections blowing up with layout bridges N2/N3 clean ->
+        // suspicion on the save/load roundtrip).
         if std::env::var("GEB_INT8_RUN").is_ok() {
             let run_once = |s: &mut Seg, tag: &str| {
                 let ins: Vec<&DeviceBuffer> = s.ins();
@@ -3529,13 +3469,13 @@ pub fn seg_prefix(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&m
                     .collect();
                 let refs: Vec<&DeviceBuffer> = outs.iter().collect();
                 s.g.run(&ins, &refs, stream).expect("ge run");
-                drop(stream.synchronize());
+                let _ = stream.synchronize();
                 let full = download_f16(ctx, &outs[0], s.g.output_size(0).unwrap() / 2);
                 let m = full.iter().fold(0f32, |a, v| a.max(v.to_f32().abs()));
                 let head: Vec<f32> = full[..8.min(full.len())].iter().map(|v| v.to_f32()).collect();
                 println!("[int8] {tag} out0 head={head:?} |max|={m:.2}");
             };
-            run_once(&mut s, "活图");
+            run_once(&mut s, "live");
             let live_sizes: Vec<(usize, usize)> = (0..s.g.num_inputs().unwrap())
                 .map(|i| (s.g.input_size(i).unwrap_or(0), s.binds[i].len()))
                 .collect();
@@ -3545,7 +3485,7 @@ pub fn seg_prefix(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&m
                 .filter(|(_, (sz, bl))| sz != bl)
                 .map(|(i, _)| i)
                 .collect();
-            println!("[int8] 活图输入 {} 个，binds 长度不符的 idx：{:?}", live_sizes.len(), bad_live);
+            println!("[int8] live graph: {} inputs; binds length mismatches at {:?}", live_sizes.len(), bad_live);
             if let Some(p) = save_path {
                 s.g = ge_builder::load(&p).expect("reload om");
                 let n2 = s.g.num_inputs().unwrap();
@@ -3556,8 +3496,8 @@ pub fn seg_prefix(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&m
                         mism.push((i, live_sizes[i].0, sz, s.g.input_dims(i).unwrap_or_default()));
                     }
                 }
-                println!("[int8] 重载输入 {n2} 个（活图 {}）；size 不符：{:?}（前 8 项）", live_sizes.len(), mism.iter().take(8).collect::<Vec<_>>());
-                run_once(&mut s, "重载");
+                println!("[int8] reloaded: {n2} inputs (live {}); size mismatches (first 8): {:?}", live_sizes.len(), mism.iter().take(8).collect::<Vec<_>>());
+                run_once(&mut s, "reloaded");
             }
         }
         ge_builder::fini().expect("fini");
@@ -3566,7 +3506,7 @@ pub fn seg_prefix(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&m
             .filter(|p| int8_projs.contains(*p))
             .collect();
         println!(
-            "GE_PREFIX_PROBE_OK (int8: 投影 {} ×{} 层, native_smooth={int8_native})",
+            "GE_PREFIX_PROBE_OK (int8: projections {} x{} layers, native_smooth={int8_native})",
             projs.join(","),
             depth
         );
@@ -3577,8 +3517,9 @@ pub fn seg_prefix(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&m
 }
 
 // ---------------------------------------------------------------------------
-// flow 段：单步 OM（action_in → depth×action 层(ada-norm + cross PFA +
-// geglu) → action_out → euler）。styles/prefix-kv/euler 常数全为外部输入。
+// flow segment: single-step OM (action_in -> depth x action layers
+// (ada-norm + cross attention + geglu) -> action_out -> euler). Styles,
+// prefix kv and euler constants are all external inputs.
 // ---------------------------------------------------------------------------
 
 pub fn seg_flow(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&mut E2eStage>) {
@@ -3586,61 +3527,66 @@ pub fn seg_flow(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&mut
     let stream = be.stream();
     let depth = envi("GEB_DEPTH", 18) as usize;
     let tokens = envi("GEB_TOKENS", 64);
-    // prefix 可见长度（空视图剔除须与 prefix 段一致——suffix rope 偏移与
-    // pk/pv 形状都取此值；infer 侧 pos_s = sum(prefix_pad)+cumsum-1 = 712 起）
+    // prefix visible length (the empty-view drop must match the prefix
+    // segment — suffix rope offsets and pk/pv shapes all take this value;
+    // the infer side starts pos_s = sum(prefix_pad)+cumsum-1 = 712).
     let p = VT + tokens - envi("GEB_PREFIX_DROP_EMPTY", 0);
     let mut seed = 0xF00Du32;
-    // 同 vision/prefix 段三件套（取证见各段注记）：q/k/v 独立投影 /
-    // flat rope（免列切物化）/ 手工 cross-GQA attention（免 PFA host
-    // launcher）。scale 折进 q 权重/bias
+    // Same trio as vision/prefix (rationale in those segments):
+    // independent q/k/v projections, flat rope (no column-split
+    // materialization), hand-built cross-GQA attention (no PFA host
+    // launcher). Scale folds into the q weight/bias.
     let qkv3 = std::env::var("GEB_QKV3").is_ok();
     let ropeflat = std::env::var("GEB_ROPEFLAT").is_ok();
     let attn_manual = std::env::var("GEB_ATTN").map(|v| v == "manual").unwrap_or(false);
     let fscale = if attn_manual { 1.0f32 / (HD as f32).sqrt() } else { 1.0 };
     let mut s = Seg::new("ge_flow");
-    // 动态分档：与 prefix 段同源（pk/pv 36 路 [-1,KVD]）——但生产 HYBRID
-    // 拓扑下 flow 不走 gear（styles 是运行期内容的静态 Data 输入，无法
-    // Const 化，而静态 Data 混入动态集会让 SetInputDynamicDims 档位匹配
-    // 失败——实测定罪）：flow 用 per-L 静态 OM 池（GEB_FLOW_POOL，
-    // 现存 tl{L}_i8 资产），图按 p_max 构造 binds。GEB_DYN_LLIST_FLOW 仅供
-    // gear 化 flow 的隔离实验
+    // Dynamic gears: same mechanism as prefix (36 pk/pv lanes as
+    // [-1,KVD]) — but in the production HYBRID topology flow does NOT
+    // gear (styles are static Data inputs with runtime content; they
+    // cannot be Consts, and static Data mixed into the dynamic set breaks
+    // SetInputDynamicDims gear matching — measured). Flow instead uses a
+    // per-L static OM pool (GEB_FLOW_POOL over the tl{L}_i8 assets), with
+    // binds built at p_max. GEB_DYN_LLIST_FLOW exists only for isolated
+    // gear-mode flow experiments.
     let gear_ll = std::env::var("GEB_DYN_LLIST_FLOW").ok().and_then(|_| dyn_llist());
     let mut gear_ps_hold: Option<Vec<i64>> = None;
     let gd = |v: i64| if gear_ll.is_some() { -1 } else { v };
     if let Some(g) = &gear_ll {
         assert!(
             std::env::var("GEB_WCONST").is_ok(),
-            "GEB_DYN_LLIST 需 GEB_WCONST=1"
+            "GEB_DYN_LLIST requires GEB_WCONST=1"
         );
-        assert!(ropeflat && attn_manual && qkv3, "GEB_DYN_LLIST 需三件套（ROPEFLAT/ATTN=manual/QKV3）");
+        assert!(ropeflat && attn_manual && qkv3, "GEB_DYN_LLIST requires the trio (ROPEFLAT/ATTN=manual/QKV3)");
         let lmax = *g.iter().max().unwrap();
-        assert_eq!(tokens, lmax, "GEB_DYN_LLIST 模式 GEB_TOKENS 须 = 档表 max L");
+        assert_eq!(tokens, lmax, "GEB_DYN_LLIST requires GEB_TOKENS = the gear table's max L");
         let drop_v2 = envi("GEB_PREFIX_DROP_EMPTY", 0);
         let ps = g.iter().map(|&l| VT + l - drop_v2).collect::<Vec<i64>>();
-        println!("[gear] flow 动态分档：L {:?} → p {:?}", g, ps);
+        println!("[gear] flow dynamic gears: L {:?} -> p {:?}", g, ps);
         gear_ps_hold = Some(ps);
     }
     if let Some(ps) = gear_ps_hold.take() {
         s.set_gear_ps(ps);
     }
 
-    // ---- 段级输入（注册序，两遍式：先全部注册再建图——层 i 的 next
-    // ada-norm 引用层 i+1 的 style 输入，必须先注册后链接）----
-    // 0 state / 1 zeros / 2..7 flat rope（eager）/ 8..11 rank-2 表（GE）/
-    // 12 ainwt / 13 ainb / 14.. 每层 (pk_i, pv_i)（rank-2）/
-    // 每层 12 项 / 尾 fsc,fsh,aoutwt,aoutb,c1,c2
-    // e2e：state 起步 = noise（golden 或合成）；缺省随机（对拍两路同值）
+    // ---- Segment inputs (two-pass: register everything, then build —
+    // layer i's next ada-norm references layer i+1's style input, so
+    // registration must precede wiring) ----
+    // 0 state / 1 zeros / 2..7 flat rope / 8..11 rank-2 tables /
+    // 12 ainwt / 13 ainb / 14.. (pk_i, pv_i) per layer (rank-2) /
+    // 12 per layer / tail fsc,fsh,aoutwt,aoutb,c1,c2.
+    // e2e: state starts from noise; the default is random.
     let state_h = e2e
         .as_ref()
         .map(|st| st.noise.clone())
         .unwrap_or_else(|| rand_f16((HOR * ADIM) as usize, &mut seed, 100.0));
     s.data(ctx, "state", &[HOR, ADIM], &state_h);
-    // GEB_NORM32 v2：常量 Const 折叠，无 Data 注册（binds[0] 约束解除）
     if let Some(st) = e2e.as_ref() {
-        assert_eq!(st.kv.len(), depth * 2, "e2e: prefix 段 k/v 数与 flow 深度不符（GEB_DEPTH 须全 18）");
+        assert_eq!(st.kv.len(), depth * 2, "e2e: prefix kv count != flow depth (GEB_DEPTH must be 18)");
     }
     s.data_zeros(ctx, "zeros", HOR, AW);
-    // 桶界 P 只定 cache 消费维度；serve 侧 set_rope_for(真L) 按真长定相位
+    // The bucket boundary P fixes only the cache-consumed dim; serve's
+    // set_rope_for(true L) fixes the phase by the true length.
     let rope_p = p;
     let (qc, qs, qi) = rope_flat_const(HOR, HEADS, rope_p);
     let (kc, ks, ki) = rope_flat_const(HOR, KV_HEADS, rope_p);
@@ -3658,12 +3604,14 @@ pub fn seg_flow(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&mut
     s.data(ctx, "qsin2", &[HOR, QD], &qs2);
     s.data(ctx, "kcos2", &[HOR, KVD], &kc2);
     s.data(ctx, "ksin2", &[HOR, KVD], &ks2);
-    // Reshape shape 张量（q/k/v/kall rank-3 桥；kall/vall 共用；Const）
+    // Reshape shape tensors (q/k/v/kall rank-3 bridges; kall/vall share;
+    // Consts).
     s.const_i32("shp_q3", &[1, HOR as i32, QD as i32]);
     s.const_i32("shp_k3", &[1, HOR as i32, KVD as i32]);
     s.const_i32("shp_v3", &[1, HOR as i32, KVD as i32]);
     s.const_i32("shp_kall", &[1, gd(p + HOR) as i32, KVD as i32]);
-    // ropeflat / manual cross-attention 常量（swap 索引 Const 折叠）
+    // ropeflat / manual cross-attention constants (swap indices as
+    // Consts).
     s.const_i32("qswap_c", &qi);
     s.const_i32("kswap_c", &ki);
     s.const_i32("shp_qflat", &[qf.0 as i32, qf.1 as i32]);
@@ -3683,9 +3631,10 @@ pub fn seg_flow(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&mut
         .map(|w| lb_f16(&w.action_in, AW as usize))
         .unwrap_or_else(|| rand_f16(AW as usize, &mut seed, 4000.0));
     s.data(ctx, "ainb", &[1, AW], &ainb_h);
-    // prefix k/v（rank-2——ConcatD axis=0 拼接后统一 Unsqueeze）；
-    // e2e：prefix OM 36 输出直连（k0,v0,k1,v1,... → pk{i}=kv[2i]/pv{i}=kv[2i+1]）
-    // pk/pv 注册基址（replay 逐帧换绑用——循环体恰好两次 s.data）
+    // prefix k/v (rank-2 — concatenated along axis=0 then Unsqueezed
+    // together); e2e wires the prefix OM's 36 outputs straight in
+    // (pk{i}=kv[2i], pv{i}=kv[2i+1]). pk/pv registration base (for
+    // per-frame rebinding; the loop body does exactly two s.data).
     let pk_base = s.binds.len();
     for i in 0..depth {
         let pk_h = e2e
@@ -3699,26 +3648,30 @@ pub fn seg_flow(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&mut
         s.data(ctx, &format!("pk{i}"), &[gd(p), KVD], &pk_h);
         s.data(ctx, &format!("pv{i}"), &[gd(p), KVD], &pv_h);
     }
-    // ---- flow int8（GEB_FLOW_INT8）：7 投影/层 → QuantMatmulDequant ----
-    // 注册区在层区之前（sm Data 落此，pk_base 不动）；层内 int8 权重槽以
-    // 16B dummy bind 占位——18 槽布局与 f16 恒同（serve/e2e 的 style 硬编码
-    // 偏移 b+0/+1/+10/+11/+16/+17 依赖布局，FlowMech/style_residency 免改）
+    // ---- flow int8 (GEB_FLOW_INT8): 7 projections/layer ->
+    // QuantMatmulDequant ----
+    // The registration zone precedes the layer zone (sm Data lands here,
+    // pk_base stays put); in-layer int8 weight slots take 16B dummy
+    // binds — the 18-slot layout always matches f16 (serve/e2e's
+    // hard-coded style offsets b+0/+1/+10/+11/+16/+17 depend on it, so
+    // FlowMech/style_residency need no changes).
     let int8 = flow_int8();
     if int8 {
-        assert!(qkv3, "GEB_FLOW_INT8 需要 GEB_QKV3=1（fused qkv 无法 per-matrix smooth）");
+        assert!(qkv3, "GEB_FLOW_INT8 requires GEB_QKV3=1 (fused qkv cannot take per-matrix smooth)");
     }
     let facs: std::collections::HashMap<String, Int8Smooth> = if int8 {
-        assert!(real.is_some(), "GEB_FLOW_INT8 需要 GEB_CKPT 真权重");
+        assert!(real.is_some(), "GEB_FLOW_INT8 requires real weights via GEB_CKPT");
         let path = std::env::var("GEB_FLOW_SMOOTH")
             .unwrap_or_else(|_| "./smooth_calib_v2_flow_engine.safetensors".into());
-        println!("[int8] flow int8 开启：smooth={path}");
+        println!("[int8] flow int8 on: smooth={path}");
         load_int8_smooth(&path).0
     } else {
         std::collections::HashMap::new()
     };
-    // GEB_FLOW_PROJS：flow 段独立子集（缺省回落 GEB_INT8_PROJS——两段共享
-    // 同名 env 会在子集实验时把 prefix 段一起切掉，OM 输入数不匹配 rc=-2
-    // 实测）
+    // GEB_FLOW_PROJS: the flow segment's own subset (falling back to
+    // GEB_INT8_PROJS; sharing one env between segments would switch
+    // prefix off too during subset experiments — OM input-count
+    // mismatch, rc=-2 measured).
     let int8_projs: std::collections::HashSet<String> = std::env::var("GEB_FLOW_PROJS")
         .or_else(|_| std::env::var("GEB_INT8_PROJS"))
         .unwrap_or_else(|_| "q,k,v,o,gate,up,down".into())
@@ -3728,8 +3681,9 @@ pub fn seg_flow(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&mut
     let int8_native = envi("GEB_INT8_NATIVE", 1) == 1;
     let dump_dir = std::env::var("GEB_INT8_DUMP").ok();
     let fi8sel = |pr: &str| int8 && int8_projs.contains(pr);
-    // (名, k, n)：k/v 的 n=256 与 down 的 k=4096 是小/宽 shape——qmd 在
-    // M=50 的编译/性能未验，GEB_INT8_PROJS 子集可退
+    // (name, k, n): k/v's n=256 and down's k=4096 are small/wide shapes —
+    // qmd compile/perf at M=50 was not pre-validated, so the
+    // GEB_INT8_PROJS subset can bail on them.
     const FPROJS: [(&str, i64, i64); 7] = [
         ("q", AW, QD),
         ("k", AW, KVD),
@@ -3744,7 +3698,7 @@ pub fn seg_flow(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&mut
         for i in 0..depth {
             let lay = real
                 .and_then(|w| w.action_layers.get(i))
-                .unwrap_or_else(|| panic!("GEB_FLOW_INT8 需真权重（层 {i} 缺）"));
+                .unwrap_or_else(|| panic!("GEB_FLOW_INT8 requires real weights (layer {i} missing)"));
             for (slot, &(pn, kk, nn)) in FPROJS.iter().enumerate() {
                 if !fi8sel(pn) {
                     continue;
@@ -3773,25 +3727,26 @@ pub fn seg_flow(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&mut
                 ));
             }
         }
-        println!("[int8] flow int8 预注册完成：{} 层 × {} 投影（native={}）", depth, fi8[0].iter().filter(|x| x.is_some()).count(), int8_native);
+        println!("[int8] flow int8 preregistered: {} layers x {} projections (native={})", depth, fi8[0].iter().filter(|x| x.is_some()).count(), int8_native);
     }
-    // 层权重 12 项（GEB_QKV3: 16 项）+ 尾部 agate/mgate 两项（gate 通路
-    // 补全）：ascl ash [qkvwt qkvb | qw kw vw qb kb vb] outwt outb
-    // mscl msh gatewt upwt downwt downb agate mgate（eager qkv 独立投影）
-    let mut eager_qkv: Vec<(DeviceBuffer, DeviceBuffer, DeviceBuffer, DeviceBuffer, DeviceBuffer, DeviceBuffer)> = Vec::new();
+    // Per-layer weight layout (GEB_QKV3 changes the bracketed part):
+    // ascl ash [qkvwt qkvb | qw kw vw qb kb vb] outwt outb
+    // mscl msh gatewt upwt downwt downb agate mgate
     let mut layer_bases = Vec::with_capacity(depth);
     for i in 0..depth {
         layer_bases.push(s.binds.len());
         let tag = format!("l{i}_");
-        // 真权重：ascl/ash/mscl/msh 是 ada-norm 条件向量（style 投影 ×
-        // conditioning 的运行时产物，随 time step 变化）——保持合成输入，
-        // 真权重接入只换投影/LN 类权重
+        // Real weights: ascl/ash/mscl/msh are ada-norm conditioning
+        // vectors (runtime products of the style projection and
+        // conditioning, varying per time step) — they stay synthetic;
+        // real-weight integration only swaps projection/LN-style weights.
         let lay = real.and_then(|w| w.action_layers.get(i));
         s.data(ctx, &format!("{}ascl", tag), &[AW], &norm_f16(AW as usize, &mut seed, 1.0));
         s.data(ctx, &format!("{}ash", tag), &[AW], &norm_f16(AW as usize, &mut seed, 0.0));
         {
-            // int8 槽：f16 host 不构造、wt 槽 16B dummy 占位（布局纪律见
-            // 预注册注记）；eager 缓冲整块免建（int8 模式 eager 跳过）
+            // int8 slots: no f16 host block is built and the wt slot gets
+            // a 16B dummy placeholder (layout discipline — see the
+            // preregistration note).
             let wq = if fi8[i][0].is_none() {
                 lay
                     .map(|l| lw_f16(&l.attention.q))
@@ -3813,11 +3768,12 @@ pub fn seg_flow(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&mut
             } else {
                 Vec::new()
             };
-            // Gemma 投影无 bias（真权重 = zeros）
+            // Gemma projections carry no bias (real weights = zeros).
             let bias = lay
                 .map(|_| vec![f16::from_f32(0.0); QKVW as usize])
                 .unwrap_or_else(|| rand_f16(QKVW as usize, &mut seed, 4000.0));
-            // manual attention：q 块（权重+bias）预乘 1/√hd；eager 保持原值
+            // Manual attention: q block (weight+bias) premultiplied by
+            // 1/sqrt(hd).
             let wq_s: Vec<f16> = if attn_manual {
                 wq.iter().map(|v| f16::from_f32(v.to_f32() * fscale)).collect()
             } else {
@@ -3830,9 +3786,10 @@ pub fn seg_flow(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&mut
                 }
             }
             if qkv3 {
-                // qkv3 层内输入位次 2..8（ascl/ash 之后）；eager 按 qkv3 偏移读
+                // qkv3 input slots within a layer are 2..8 (after
+                // ascl/ash).
                 let i8_slot = |s: &mut Seg| {
-                    s.binds.push(ctx.malloc(16).expect("i8 wt 槽占位"));
+                    s.binds.push(ctx.malloc(16).expect("i8 wt slot placeholder"));
                     s.bind_names.push(String::new());
                 };
                 if fi8[i][0].is_some() {
@@ -3865,18 +3822,9 @@ pub fn seg_flow(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&mut
                 s.wt(ctx, &format!("{}qkvwt", tag), &[QKVW, AW], &fused, AW, QKVW);
                 s.data(ctx, &format!("{}qkvb", tag), &[1, QKVW], &bias_s);
             }
-            if !int8 {
-                let bq = upload(ctx, &bias[0..QD as usize]);
-                let bk = upload(ctx, &bias[QD as usize..(QD + KVD) as usize]);
-                let bv = upload(ctx, &bias[(QD + KVD) as usize..]);
-                let ebq = wbuf_t(ctx, &wq, AW, QD);
-                let ebk = wbuf_t(ctx, &wk, AW, KVD);
-                let ebv = wbuf_t(ctx, &wv, AW, KVD);
-                eager_qkv.push((ebq, ebk, ebv, bq, bk, bv));
-            }
         }
         if fi8[i][3].is_some() {
-            s.binds.push(ctx.malloc(16).expect("i8 wt 槽占位"));
+            s.binds.push(ctx.malloc(16).expect("i8 wt slot placeholder"));
             s.bind_names.push(String::new());
         } else {
             let host = lay
@@ -3891,7 +3839,7 @@ pub fn seg_flow(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&mut
         s.data(ctx, &format!("{}mscl", tag), &[AW], &norm_f16(AW as usize, &mut seed, 1.0));
         s.data(ctx, &format!("{}msh", tag), &[AW], &norm_f16(AW as usize, &mut seed, 0.0));
         if fi8[i][4].is_some() {
-            s.binds.push(ctx.malloc(16).expect("i8 wt 槽占位"));
+            s.binds.push(ctx.malloc(16).expect("i8 wt slot placeholder"));
             s.bind_names.push(String::new());
         } else {
             let host = lay
@@ -3900,7 +3848,7 @@ pub fn seg_flow(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&mut
             s.wt(ctx, &format!("{}gatewt", tag), &[AINTER, AW], &host, AW, AINTER);
         }
         if fi8[i][5].is_some() {
-            s.binds.push(ctx.malloc(16).expect("i8 wt 槽占位"));
+            s.binds.push(ctx.malloc(16).expect("i8 wt slot placeholder"));
             s.bind_names.push(String::new());
         } else {
             let host = lay
@@ -3909,7 +3857,7 @@ pub fn seg_flow(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&mut
             s.wt(ctx, &format!("{}upwt", tag), &[AINTER, AW], &host, AW, AINTER);
         }
         if fi8[i][6].is_some() {
-            s.binds.push(ctx.malloc(16).expect("i8 wt 槽占位"));
+            s.binds.push(ctx.malloc(16).expect("i8 wt slot placeholder"));
             s.bind_names.push(String::new());
         } else {
             let host = lay
@@ -3921,13 +3869,16 @@ pub fn seg_flow(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&mut
             .map(|_| vec![f16::from_f32(0.0); AW as usize])
             .unwrap_or_else(|| norm_f16(AW as usize, &mut seed, 0.0));
         s.data(ctx, &format!("{}downb", tag), &[1, AW], &downb_h);
-        // ada-norm 门控第三段（chunk 3 of dense(cond)）：attention/MLP 分支
-        // 输出 ×gate 后进残差（torch _gated_residual）。块尾追加——qkv3
-        // eager 偏移 8..15 不动，gate 固定位 16/17（默认布局 12/13）
+        // ada-norm gated third segment (chunk 3 of dense(cond)): the
+        // attention/MLP branch output scales by gate before the residual
+        // (torch _gated_residual). Appended at the block tail — the qkv3
+        // offsets 8..15 stay put and gate fixes at 16/17 (default layout
+        // 12/13).
         s.data(ctx, &format!("{}agate", tag), &[1, AW], &norm_f16(AW as usize, &mut seed, 1.0));
         s.data(ctx, &format!("{}mgate", tag), &[1, AW], &norm_f16(AW as usize, &mut seed, 1.0));
     }
-    // e2e 每步覆写 final norm 条件用（fsc/fsh 的 bind 位）
+    // Bind slots of fsc/fsh — e2e overwrites them per step (final norm
+    // conditions).
     let fs_idx = s.binds.len();
     s.data(ctx, "fsc", &[AW], &norm_f16(AW as usize, &mut seed, 1.0));
     s.data(ctx, "fsh", &[AW], &norm_f16(AW as usize, &mut seed, 0.0));
@@ -3941,30 +3892,35 @@ pub fn seg_flow(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&mut
         .map(|w| lb_f16(&w.action_out, ADIM as usize))
         .unwrap_or_else(|| rand_f16(ADIM as usize, &mut seed, 4000.0));
     s.data(ctx, "aoutb", &[1, ADIM], &aoutb_h);
-    // euler 常数（σ = dt = -0.1：x' = (1+σ)x + σ·v）
+    // euler constants (sigma = dt = -0.1: x' = (1+sigma)x + sigma*v).
     let eul_c1 = vec![f16::from_f32(0.9); (HOR * ADIM) as usize];
     let eul_c2 = vec![f16::from_f32(-0.1); (HOR * ADIM) as usize];
     s.data(ctx, "c1", &[HOR, ADIM], &eul_c1);
     s.data(ctx, "c2", &[HOR, ADIM], &eul_c2);
 
-    // ---- 图构造 ----
-    // action_in + 第一层 attention ada-norm（eager：第一层无预解析
-    // normalized，用 adaptive_rms(action_in_out, attention_style[0])）
+    // ---- Graph build ----
+    // action_in + the first layer's attention ada-norm (layer 0 has no
+    // precomputed normalized input — adaptive_rms(action_in_out,
+    // attention_style[0])).
     let ain = s.mm("ain", "state", &[HOR, ADIM], "ainwt", &[AW, ADIM], &[HOR, AW]);
     let ain = s.bias("ainb2", &ain, &[HOR, AW], "ainb");
     let mut normed = s.ada("l0ada", &ain, "zeros", "l0_ascl", "l0_ash", &[HOR, AW]);
-    // ⚠ 残差流（未归一化 x）双轨携带——cuda bf16_executor 语义：attention
-    // 残差基是 input 本体（fused::adaptive_gate_residual_rms_bf16(
-    // projection, input)），normed 只喂 qkv。定罪：本段曾以
-    // normed 作残差基（两处镜像同 bug，组件 parity 全绿因为参考 eager 同
-    // 错）——18 层累积 → v 输出近随机、闭环 0/10；step0_x1 仅 11.5% 是
-    // dt=0.1 对 v 误差的掩盖（Δx1=0.1·Δv ⇒ v 已 ~100% 错）
+    // The unnormalized residual stream is carried as a second track —
+    // cuda bf16_executor semantics: the attention residual base is the
+    // input itself (fused::adaptive_gate_residual_rms_bf16(projection,
+    // input)); normed only feeds qkv. This segment once used normed as
+    // the residual base (both mirrors shared the bug, and component
+    // parity stayed green because the reference was equally wrong): 18
+    // layers of accumulation left v near-random and the closed loop at
+    // 0/10 — step0_x1's 11.5% was merely dt=0.1 masking the v error
+    // (dx1 = 0.1*dv, so v was ~100% wrong).
     let mut xstream = ain;
 
     let total = p + HOR;
-    // GEB_ATTN_MASK（range padding）：flow 侧 mask [1,1,total]——键布局 =
-    // cache 行在前（真 [0,vis+L) / pad [vis+L, vis+P)）+ flow HOR 行恒真。
-    // bake 占位全 0，serve 侧按真 L 填充
+    // GEB_ATTN_MASK (range padding): the flow-side mask [1,1,total] —
+    // key layout = cache rows first (real [0,vis+L), pad [vis+L, vis+P))
+    // plus this bucket's HOR flow rows always real. Baked as all-zero
+    // placeholder; serve fills it per true L.
     let fmask_n: Option<String> = if envi("GEB_ATTN_MASK", 0) == 1 {
         let mh = vec![f16::from_f32(0.0); total as usize];
         Some(s.data(ctx, "padmask", &[1, 1, total], &mh))
@@ -3973,13 +3929,14 @@ pub fn seg_flow(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&mut
     };
     for i in 0..depth {
         let tag = format!("l{i}_");
-        // attention（normed 已是本层 ada-norm 输出；q1/r1 验证链）
+        // attention (normed is this layer's ada-norm output).
         let (q2, k2, v2) = if qkv3 {
             let qm = mm_or_qmd(&mut s, &format!("{}qm", tag), &normed, &[HOR, AW], fi8[i][0].as_ref(), &format!("{}qw", tag), QD, &[HOR, QD], int8_native);
             let km = mm_or_qmd(&mut s, &format!("{}km", tag), &normed, &[HOR, AW], fi8[i][1].as_ref(), &format!("{}kw", tag), KVD, &[HOR, KVD], int8_native);
             let vm = mm_or_qmd(&mut s, &format!("{}vm", tag), &normed, &[HOR, AW], fi8[i][2].as_ref(), &format!("{}vw", tag), KVD, &[HOR, KVD], int8_native);
-            // int8：Gemma bias≡0 砍 TileD+Add 对（同 prefix 先例；bias Data
-            // 保留注册占图输入槽——布局稳定）
+            // int8: Gemma bias == 0 drops the TileD+Add pair (prefix
+            // precedent; the bias Data stays registered to hold the input
+            // slot — layout stability).
             let qb = if fi8[i][0].is_some() {
                 qm
             } else {
@@ -4016,7 +3973,7 @@ pub fn seg_flow(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&mut
         } else {
             s.rope2(&format!("{}qr", tag), &q2, &[HOR, QD], "qcos2", "qsin2", "shp_q3")
         };
-        // prefix cat（rank-2 ConcatD axis=0）+ Reshape rank-3 桥
+        // prefix cat (rank-2 ConcatD axis=0) + Reshape rank-3 bridge
         let kcat = format!("{}kcat", tag);
         s.g.add_op(&kcat, "ConcatD").unwrap();
         s.g.dyn_inputs(&kcat, "x", 2).unwrap();
@@ -4042,7 +3999,8 @@ pub fn seg_flow(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&mut
         let vall = s.reg_out(&vcat, "y");
         let vall3 = s.reshape(&format!("{}vall3", tag), &vall, &[gd(total), KVD], "shp_kall", &[1, gd(total), KVD]);
         let sq = if attn_manual {
-            // 手工 cross-GQA：q 头主序化（headsplit），k/v 已是 rank-3 单头
+            // manual cross-GQA: q goes head-major (headsplit); k/v are
+            // already single-head rank-3.
             let q3 = s.headsplit(&format!("{}qh", tag), &qr2, HOR, 1, HOR, HEADS, HD, "shp_fq4", "shp_fq3");
             let attn = s.attn_manual_gqa(&format!("{}attn", tag), &q3, &kall3, &vall3, HEADS, HOR, gd(total), HD, fmask_n.as_deref());
             s.headmerge(&format!("{}am", tag), &attn, 1, HOR, HEADS, HD, "shp_fa4", "shp_fbq")
@@ -4056,7 +4014,8 @@ pub fn seg_flow(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&mut
         } else {
             s.bias(&format!("{}projb", tag), &proj, &[HOR, AW], &format!("{}outb", tag))
         };
-        // 分支 ×gate 进残差（torch _gated_residual：residual + branch·gate）
+        // branch x gate into the residual (torch _gated_residual:
+        // residual + branch*gate).
         let gated = s.gatew(&format!("{}ag", tag), &projb, &[HOR, AW], &format!("{}agate", tag));
         let res = s.add2(&format!("{}res", tag), &gated, &xstream, &[HOR, AW]);
 
@@ -4075,7 +4034,8 @@ pub fn seg_flow(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&mut
         let gated2 = s.gatew(&format!("{}mg", tag), &downb, &[HOR, AW], &format!("{}mgate", tag));
         let hidden = s.add2(&format!("{}h", tag), &gated2, &res, &[HOR, AW]);
 
-        // 下一层 attention 的 ada-norm（eager attention_normalized 同构）
+        // next layer's attention ada-norm (attention_normalized
+        // isomorph).
         let (nscl, nsh) = if i + 1 < depth {
             (format!("l{}_ascl", i + 1), format!("l{}_ash", i + 1))
         } else {
@@ -4095,28 +4055,31 @@ pub fn seg_flow(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&mut
     println!("flow OM built: depth={depth} P={p} n_in={} n_out=1", s.ins().len());
 
     if let Some(st) = e2e {
-        // e2e 10 步：每步覆写 styles（qkv3 布局：ascl/ash=base+0/+1，
-        // mscl/msh=base+10/+11）+ state（x），pk/pv 不变；euler 已在图内
-        let rw = real.expect("e2e 需要 GEB_CKPT（time_mlp/style 投影）");
+        // e2e 10 steps: overwrite styles (qkv3 layout: ascl/ash =
+        // base+0/+1, mscl/msh = base+10/+11) and state (x) per step;
+        // pk/pv unchanged; euler is in-graph.
+        let rw = real.expect("e2e requires GEB_CKPT (time_mlp/style projections)");
         let cfg = Pi05Config::default();
         let dir = std::env::var("GEB_OM_DIR").unwrap_or_else(|_| "./om_cache".into());
-        // HYBRID：GEB_FLOW_POOL=<om 根>（配 GEB_DYN_LLIST 的 L 表）——
-        // 装载 per-L 静态 flow OM 池（binds 一次 max 物化，图句柄按请求换）。
-        // bring-up 用首档句柄跑（内容 warmup 无所谓）
+        // HYBRID: GEB_FLOW_POOL=<om root> (with GEB_DYN_LLIST's L table)
+        // — loads the per-L static flow OM pool (binds materialize once
+        // at max; graph handles swap per request). Bring-up runs the
+        // first handle (warmup content doesn't matter).
         let mut flow_pool: std::collections::HashMap<i64, GeGraph> = std::collections::HashMap::new();
         if let Ok(pool_root) = std::env::var("GEB_FLOW_POOL") {
-            let ls = dyn_llist().unwrap_or_else(|| panic!("GEB_FLOW_POOL 需 GEB_DYN_LLIST 档表"));
-            // 串行装载（22 只 × ~500MB ≈ 1-2min）。22 线程并行实测崩进程
-            //（aclmdlLoadFromMem 并发上限 <22——3 线程的 OM 预载活；
-            // crash-loop 实测）。有界并行留待验证
+            let ls = dyn_llist().unwrap_or_else(|| panic!("GEB_FLOW_POOL requires a GEB_DYN_LLIST gear table"));
+            // Serial loading (22 OMs x ~500MB = 1-2min). 22 parallel
+            // threads crashed the process in testing (aclmdlLoadFromMem
+            // concurrency cap < 22 — the 3-thread OM preload survives;
+            // crash-loop measured). Bounded parallelism unverified.
             let t0p = std::time::Instant::now();
             for &l in &ls {
                 let p = format!("{pool_root}/tl{l}_i8/flow_real.om");
                 let g = ge_builder::load(&p).unwrap_or_else(|e| panic!("flow pool {p}: {e:?}"));
                 flow_pool.insert(l, g);
             }
-            println!("[flow-pool] {} 只装载完成 {:?}", flow_pool.len(), t0p.elapsed());
-            let first = *ls.first().expect("档表非空");
+            println!("[flow-pool] {} OMs loaded {:?}", flow_pool.len(), t0p.elapsed());
+            let first = *ls.first().expect("gear table non-empty");
             s.g = flow_pool[&first];
         } else {
             println!("[e2e] loading {dir}/flow_real.om");
@@ -4129,17 +4092,20 @@ pub fn seg_flow(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&mut
             ctx.copy_h2d(buf, &bytes).expect("h2d style/state");
         };
         let mut x = st.noise.clone();
-        // euler 常数换绑为 LeRobot 语义 x' = x + dt·v（c1=1.0，sample_actions
-        // L894；OM 缺省 0.9/-0.1 = openpi x1-预测式）。c1/c2 是 Data 输入，
-        // 按名定位——原「binds 尾两位」假设被 GEB_ATTN_MASK 的 padmask
-        // 追加注册打破（padmask 落尾，c2 灌进 1444B mask bind 即崩）
+        // Rebind the euler constants to LeRobot semantics x' = x + dt*v
+        // (c1=1.0, sample_actions L894; the OM default 0.9/-0.1 is
+        // openpi's x1-prediction form). c1/c2 are Data inputs located by
+        // name — the old "last two binds" assumption broke when
+        // GEB_ATTN_MASK's padmask got appended (it lands at the tail, and
+        // pouring c2 into the 1444B mask bind crashes instantly).
         let c1_h = vec![f16::from_f32(1.0); (HOR * ADIM) as usize];
         let c2_h = vec![f16::from_f32(-0.1); (HOR * ADIM) as usize];
         h2d_f16(&s.binds[s.bind_of("c1")], &c1_h);
         h2d_f16(&s.binds[s.bind_of("c2")], &c2_h);
-        // styles 预计算缓存：10 步 time 调度固定（1+step·dt）⇒ styles 跨调用
-        // 不变，生产口径一次性算 + 常驻（每步 host 现算 ≈173ms/步 是 glue 大头，
-        // bring-up 计时定罪）。cond 对拍/替入诊断（bisect）保留在此
+        // styles precompute cache: the 10-step time schedule is fixed
+        // (1+step*dt), so styles never change across calls — computed
+        // once and resident in production (per-step host computation at
+        // ~173ms/step dominated the glue, per bring-up timing).
         let tpre = std::time::Instant::now();
         let style_cache: Vec<Vec<Vec<f16>>> = (0..cfg.num_flow_steps)
             .map(|step| {
@@ -4170,7 +4136,7 @@ pub fn seg_flow(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&mut
             })
             .collect();
         println!(
-            "[e2e] styles 预计算 ×{} 步 {:?}（一次性，跨调用缓存）",
+            "[e2e] styles precomputed x{} steps {:?} (once, cached across calls)",
             cfg.num_flow_steps,
             tpre.elapsed()
         );
@@ -4188,18 +4154,19 @@ pub fn seg_flow(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&mut
             }
             h2d_f16(&s.binds[fs_idx], &sc[6 * depth]);
             h2d_f16(&s.binds[fs_idx + 1], &sc[6 * depth + 1]);
-            h2d_f16(&s.binds[0], &x); // state = 当前 x
+            h2d_f16(&s.binds[0], &x); // state = current x
             let oref: Vec<&DeviceBuffer> = vec![&ob];
             s.run_seg(s.gear_payloads.len().saturating_sub(1), &oref, stream)
                 .expect("ge run");
-            drop(stream.synchronize());
+            let _ = stream.synchronize();
             x = download_f16(ctx, &ob, (HOR * ADIM) as usize);
             let m = x.iter().fold(0f32, |m, v| m.max(v.to_f32().abs()));
             println!("[e2e] step {step} |x|max={m:.4}");
         }
-        println!("[e2e] flow 10 步 {:?}（styles 已缓存——纯 h2d 换绑 + run + d2h）", t0.elapsed());
-        // GEB_E2E_BENCH=N：稳态 per-call bench——每迭代 = 完整 10 步 flow
-        // （styles 缓存直取 + h2d + run + sync + d2h），x 每迭代从 noise 重启
+        println!("[e2e] flow 10 steps {:?} (styles cached — pure h2d rebind + run + d2h)", t0.elapsed());
+        // GEB_E2E_BENCH=N: steady per-call bench — each iteration is a
+        // full 10-step flow (cached styles + h2d + run + sync + d2h); x
+        // restarts from noise every iteration.
         let nb = envi("GEB_E2E_BENCH", 0) as usize;
         if nb > 0 {
             let mut ts = Vec::with_capacity(nb);
@@ -4222,28 +4189,29 @@ pub fn seg_flow(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&mut
                     let oref: Vec<&DeviceBuffer> = vec![&ob];
                     s.run_seg(s.gear_payloads.len().saturating_sub(1), &oref, stream)
                         .expect("ge run");
-                    drop(stream.synchronize());
+                    let _ = stream.synchronize();
                     xx = download_f16(ctx, &ob, (HOR * ADIM) as usize);
                 }
                 ts.push(t.elapsed().as_secs_f64() * 1e3);
             }
             ts.sort_by(|a, b| a.partial_cmp(b).unwrap());
             println!(
-                "[e2e] flow 稳态 bench ×{nb} 调用（10 步/调用，styles 缓存 + h2d + run + sync + d2h）: P50={:.2}ms min={:.2} max={:.2}",
+                "[e2e] flow steady bench x{nb} calls (10 steps/call, cached styles + h2d + run + sync + d2h): P50={:.2}ms min={:.2} max={:.2}",
                 ts[nb / 2],
                 ts[0],
                 ts[nb - 1]
             );
         }
         st.actions = x;
-        // GEB_E2E_SERVE：机械下沉（styles 缓存跨请求不变——10 步调度固定；
-        // euler c1/c2 已换绑 LeRobot 语义，buffer 内容恒持）
+        // GEB_E2E_SERVE: sink the mech (styles cache is request-invariant
+        // — the 10-step schedule is fixed; euler c1/c2 already rebound to
+        // LeRobot semantics and the buffer contents persist).
         if std::env::var("GEB_E2E_SERVE").is_ok() {
             let (style_master, style_views, style_map) = if serve_fast() {
                 let (m, v, mp) =
                     style_residency(ctx, &style_cache, &layer_bases, fs_idx, depth);
                 println!(
-                    "[serve] GEB_SERVE_FAST：styles 设备驻留 {} 步 × {} 槽（master {} 字节，一次上传）",
+                    "[serve] GEB_SERVE_FAST: styles device-resident, {} steps x {} slots (master {} bytes, one upload)",
                     v.len(),
                     mp.len(),
                     m.len()
@@ -4289,8 +4257,8 @@ pub fn seg_flow(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&mut
         return;
     }
     if int8 {
-        // eager/parity 跳过（同 prefix int8 先例）：f16 eager 参考对 int8 图
-        // 无裁判意义——法官 = e2e golden 对拍 + task0 行为。烤桶 OM 落盘照常
+        // int8 tail: save the built OM (GEB_SAVE needs only the build
+        // artifact).
         if let Ok(p) = std::env::var("GEB_SAVE") {
             s.g.save(&p).expect("save om (flow int8)");
             println!("OM saved: {p}");
@@ -4300,16 +4268,16 @@ pub fn seg_flow(be: &AscendBackend, real: Option<&Pi05Weights>, e2e: Option<&mut
     println!("GE_FLOW_PROBE_OK");
 }
 
-/// 单算子最小图编译冒烟（GEB_OPTEST=btd|rsh|sld|gat|cat|aln|gln|asc）——
-
 // ---------------------------------------------------------------------------
-// GeServe 门面（④C in-process 直调面）：三段 OM per-frame 推理。
-// spool serve_loop 与 PyO3（apxinf-py --features ascend）共用同一帧实现。
-// 驱动入口（env 分发 / GEB_CKPT 加载）见 examples/ge_model_probe.rs。
+// GeServe facade (in-process direct call): per-frame inference over the
+// three segment OMs. The spool serve_loop and PyO3 (apxinf-py --features
+// ascend) share the same frame implementation. Driver entry points (env
+// dispatch / GEB_CKPT loading) live in examples/ge_model_probe.rs.
 // ---------------------------------------------------------------------------
 
-/// 一帧推理结果：actions [HOR, ADIM] flow 终态 + 段计时（ms）+
-/// vision_out [VT, PW]（对拍/调试用，生产可忽略）
+/// One frame's inference result: actions [HOR, ADIM] (flow terminal
+/// state), per-segment timings (ms), and vision_out [VT, PW] (debug;
+/// production can ignore).
 pub struct GeServeOut {
     pub actions: Vec<f16>,
     pub vision_out: Vec<f16>,
@@ -4318,9 +4286,10 @@ pub struct GeServeOut {
     pub flow_ms: f32,
 }
 
-/// 进程内三段管线（= serve 桶的机械组）。open 走与探针 bring-up 完全
-/// 相同的构装路径（含首帧 warmup 与 styles 预计算）；infer 与 serve_loop
-/// 逐帧同源。
+/// In-process three-segment pipeline (= a serve bucket's mech group).
+/// open() walks the exact probe bring-up assembly path (including the
+/// first-frame warmup and styles precompute); infer() is frame-for-frame
+/// identical to serve_loop.
 pub struct GeServe {
     vm: VisionMech,
     pm: PrefixMech,
@@ -4330,15 +4299,19 @@ pub struct GeServe {
 }
 
 impl GeServe {
-    /// 从预置桶目录开一条管线。前置：ge_builder::init + AscendBackend::new
-    /// 已由调用方完成（GE 全局初始化须先于 acl runtime）；real = 真权重
-    /// （token 嵌入/styles 条件 host 消费面）。
-    /// env 契约：om_dir 内 {vision,prefix,flow}_real.om 须与四件套
-    /// （GEB_ATTN=manual GEB_QKV3=1 GEB_ROPEFLAT=1 GEB_WCONST=1）同配置
-    /// 构建；本函数自行补设缺省 env（GEB_SEG=e2e / GEB_TOKENS /
-    /// GEB_OM_DIR / GEB_E2E_SERVE——后者是三段机械下沉的既定闸门），
-    /// GEB_NORM32 桶拓扑不同不支持。
-    /// ⚠ 进程级单管线：配置走进程全局 env，多桶（多 L）须多进程或先扩展
+    /// Opens a pipeline from a prepared bucket directory. Prerequisites:
+    /// the caller has done ge_builder::init + AscendBackend::new (GE
+    /// global init must precede acl runtime); real = real weights (the
+    /// token embedding / styles conditions are consumed on the host).
+    /// Env contract: om_dir's {vision,prefix,flow}_real.om must have been
+    /// built with the quartet (GEB_ATTN=manual GEB_QKV3=1 GEB_ROPEFLAT=1
+    /// GEB_WCONST=1); this function fills missing default envs itself
+    /// (GEB_SEG=e2e / GEB_TOKENS / GEB_OM_DIR / GEB_E2E_SERVE — the
+    /// latter being the gate that sinks the three mechs). GEB_NORM32
+    /// buckets are a different topology and unsupported.
+    /// One pipeline per process: configuration is process-global env;
+    /// multiple buckets (multiple L) need multiple processes or an
+    /// extension first.
     pub fn open(
         be: &AscendBackend,
         real: &Pi05Weights,
@@ -4346,17 +4319,20 @@ impl GeServe {
         tokens: usize,
         fast: bool,
     ) -> GeServe {
-        assert!(!norm32_enabled(), "GeServe 不支持 GEB_NORM32 桶（拓扑不同）");
+        assert!(!norm32_enabled(), "GeServe does not support GEB_NORM32 buckets (different topology)");
         for (k, v) in [
             ("GEB_SEG", "e2e"),
             ("GEB_ATTN", "manual"),
             ("GEB_QKV3", "1"),
             ("GEB_ROPEFLAT", "1"),
             ("GEB_WCONST", "1"),
-            // 拓扑一致性（Seg 构造读，须与 OM 构建同值；进程内场景 env
-            // 不受控，钉死生产值）。⚠ 不钉 GEB_DEPTH——分段默认
-            // vision=27 / prefix=18 / flow=18 与 OM 一致，钉 18 会把
-            // vision 砍成 18 层（n_in 187≠277 首跑教训）
+            // Topology consistency (Seg construction reads these; they
+            // must match the OM build; the in-process scenario cannot
+            // control env, so pin production values). GEB_DEPTH is
+            // deliberately NOT pinned — the per-segment defaults
+            // vision=27 / prefix=18 / flow=18 match the OMs, and pinning
+            // 18 would cut vision to 18 layers (n_in 187 != 277, learned
+            // the hard way).
             ("GEB_PREFIX_DROP_EMPTY", "256"),
             ("GEB_LAYER_OFFSET", "0"),
         ] {
@@ -4372,9 +4348,11 @@ impl GeServe {
         if fast {
             std::env::set_var("GEB_SERVE_FAST", "1");
         }
-        // 冷启动 lazy：三段 OM 并行预载（构造段序内 e2e_run 命中即取）
+        // Cold-start lazy: preload the three OMs in parallel (e2e_run
+        // inside the segment constructors picks them up).
         preload_e2e_oms(be.ctx());
-        // 合成 bring-up 输入（首帧 warmup 消费；真实帧走 infer）
+        // Synthetic bring-up inputs (consumed by the first-frame warmup;
+        // real frames arrive via infer).
         let mut seed = 0xE2E2u32;
         let mut st = E2eStage {
             patches: rand_f16((VT * V_PATCH_W) as usize, &mut seed, 300.0),
@@ -4392,17 +4370,17 @@ impl GeServe {
         seg_flow(be, Some(real), Some(&mut st));
         let fast = serve_fast();
         GeServe {
-            vm: st.vmech.take().expect("GeServe vision 机械缺失"),
-            pm: st.pmech.take().expect("GeServe prefix 机械缺失"),
-            fm: st.fmech.take().expect("GeServe flow 机械缺失"),
+            vm: st.vmech.take().expect("GeServe vision mech missing"),
+            pm: st.pmech.take().expect("GeServe prefix mech missing"),
+            fm: st.fmech.take().expect("GeServe flow mech missing"),
             tokens,
             fast,
         }
     }
 
-    /// 一帧推理：patches [VT*V_PATCH_W] / token_ids [tokens] / noise
-    /// [HOR*ADIM] → actions [HOR, ADIM]（normalized_actions，denorm 在
-    /// torch 后处理）
+    /// One frame: patches [VT*V_PATCH_W] / token_ids [tokens] / noise
+    /// [HOR*ADIM] -> actions [HOR, ADIM] (normalized_actions; denorm is
+    /// torch postprocess).
     pub fn infer(
         &mut self,
         be: &AscendBackend,
@@ -4416,9 +4394,11 @@ impl GeServe {
         let vision_out = self.vm.one_frame(ctx, stream, patches);
         let vision_ms = t0.elapsed().as_secs_f64() * 1e3;
         let (actions, prefix_ms, flow_ms) = if self.fast {
-            // GEB_SERVE_FAST：kv 设备直连 + styles 驻留 + x 驻留（tp 仍含
-            // prefix run 的 sync 等待——段计时与 legacy 可比）。gear 模式
-            // 下 L = token_ids.len()，逐请求选档（prefix/flow 同档）
+            // GEB_SERVE_FAST: kv device-direct + styles resident + x
+            // resident (tp still includes prefix run's sync wait — the
+            // segment timings stay comparable with legacy). In gear mode
+            // L = token_ids.len() picks the gear per request (prefix and
+            // flow share it).
             let t1 = std::time::Instant::now();
             self.pm.one_frame_dev(ctx, stream, &vision_out, token_ids);
             let prefix_ms = t1.elapsed().as_secs_f64() * 1e3;

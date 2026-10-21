@@ -868,16 +868,19 @@ impl Model {
     }
 }
 
-/// GE 三段 OM in-process 引擎（昇腾 route C 直调面，feature `ascend`）。
+/// GE three-segment OM in-process engine (Ascend route C, feature
+/// `ascend`).
 ///
-/// 与 serve 桶进程（`ge_model_probe GEB_E2E_SERVE`）同一实现（crate 库面
-/// `GeServe`），无 spool 轮询。接口与 `npu_ge._BucketClient.request` 逐位
-/// 对齐：patches [768,588] f32 / ids [L] u32 / noise [50,32] f32 →
-/// actions 前 7 列 [50,7] f32 + 段计时。
+/// Same implementation as the serve bucket processes
+/// (`ge_model_probe GEB_E2E_SERVE` — the crate-level `GeServe`), minus
+/// the spool polling. The interface matches `npu_ge._BucketClient.request`
+/// bit-for-bit: patches [768,588] f32 / ids [L] u32 / noise [50,32] f32
+/// -> actions first 7 columns [50,7] f32 + per-segment timings.
 ///
-/// ⚠ 进程级单管线（配置走全局 env）；设备选择由
-/// `ASCEND_RT_VISIBLE_DEVICES` 决定（与 spool 桶一致）。本扩展链接 9.0.1
-/// CANN——不能与 torch_npu（8.5.1）同进程加载。
+/// One pipeline per process (configuration is process-global env);
+/// device selection follows `ASCEND_RT_VISIBLE_DEVICES` (same as spool
+/// buckets). This extension links CANN 9.0.1 — it cannot load in the
+/// same process as torch_npu (8.5.1).
 #[cfg(feature = "ascend")]
 mod ge_serve_py {
     use super::runtime_err;
@@ -895,12 +898,13 @@ mod ge_serve_py {
     static GE_INIT: OnceLock<Result<(), String>> = OnceLock::new();
 
     fn ge_init_once() -> PyResult<()> {
-        // ⚠ 只能在 allow_threads（无 GIL）区内调用：te 的 py_decouple
-        // static path 在 PyGILState_Check()!=0 时 TE_PyEval_SaveThread()
-        // 会偷走调用者的 GIL（GIL 劫持 = open 尾 SEGV 真凶，gdb 定罪）。
-        // 并行编译 forkserver 默认关闭：python 宿主内它与
-        // multiprocessing 相克，是 open 中途静默死亡的必要条件（判决实验
-        // 归档在本地工作日志）。
+        // MUST run inside allow_threads (no GIL): te's py_decouple static
+        // path calls TE_PyEval_SaveThread() when PyGILState_Check()!=0,
+        // stealing the caller's GIL (the GIL hijack was the true cause
+        // of the open-tail SEGV, pinned by gdb). The parallel-compile
+        // forkserver stays off by default: inside a python host it
+        // conflicts with multiprocessing and was a necessary condition
+        // for open dying silently midway.
         if std::env::var("MIN_COMPILE_RESOURCE_USAGE_CTRL")
             .unwrap_or_default()
             .is_empty()
@@ -910,8 +914,9 @@ mod ge_serve_py {
                 "ub_fusion,op_compile",
             );
         }
-        // 排障逃生门：APXINF_GE_NO_BUILD_INIT=1 跳过编译会话（构图随后
-        // panic——OperatorFactory 依赖 FE init，仅用于隔离实验）
+        // Debug escape hatch: APXINF_GE_NO_BUILD_INIT=1 skips the compile
+        // session (graph building then panics — OperatorFactory needs FE
+        // init; isolation experiments only).
         if std::env::var("APXINF_GE_NO_BUILD_INIT").unwrap_or_default() == "1" {
             return Ok(());
         }
@@ -922,7 +927,7 @@ mod ge_serve_py {
         match res {
             Ok(()) => Ok(()),
             Err(msg) => Err(pyo3::exceptions::PyRuntimeError::new_err(format!(
-                "apxinf_py.GeServeModel: ge_builder init 失败（须先于 acl runtime）: {msg}"
+                "apxinf_py.GeServeModel: ge_builder init failed (must precede acl runtime): {msg}"
             ))),
         }
     }
@@ -959,20 +964,25 @@ mod ge_serve_py {
                 .to_str()
                 .ok_or_else(|| PyValueError::new_err("om_dir must be a utf-8 path"))?
                 .to_owned();
-            // ⚠ init+构图+open 主体必须跑在无 GIL 区（allow_threads）：
-            // GE te fusion 的 python 适配层（py_decouple static path——python
-            // 宿主内 dlsym 命中宿主符号）在 PyGILState_Check()!=0 时
-            // TE_PyEval_SaveThread() 会偷走 PyO3 持有的 GIL 并存走 thread
-            // state；open 完成后 into_py 分配 python 对象时 pymalloc
-            // get_state() 读烂状态直接 SEGV（gdb 栈定罪）。无 GIL 进入 ⇒
-            // te 不触发 SaveThread，其内部 python 调用自走
-            // PyGILState_Ensure/Release，宿主线程状态全程完好。
+            // init + graph build + open must run GIL-free
+            // (allow_threads): GE te fusion's python shim (the py_decouple
+            // static path — inside a python host, dlsym resolves to host
+            // symbols) calls TE_PyEval_SaveThread() when
+            // PyGILState_Check()!=0, stealing the GIL PyO3 holds and
+            // saving the thread state; after open, into_py's pymalloc
+            // get_state() reads the corrupted state and SEGVs (gdb stack
+            // pinned). Entering GIL-free means te never triggers
+            // SaveThread, its internal python calls go through
+            // PyGILState_Ensure/Release, and the host thread state stays
+            // intact.
             let (backend, serve) = py.allow_threads(|| -> PyResult<(AscendBackend, GeServe)> {
                 ge_init_once()?;
-                // serve-min（GEB_CKPT_SERVE_MIN=1）：零物化骨架 + Data 源真值
-                // 的选择性加载（与 probe 驱动同 env 约定）。PyO3 open 只有
-                // GEB_LOAD 面（不 bake），无 GEB_SAVE 护栏需求；inproc 全链
-                // 冷启动由此砍掉 ckpt 数学段的大头。
+                // serve-min (GEB_CKPT_SERVE_MIN=1): zero-materialization
+                // skeleton + selective loading of true Data sources (same
+                // env contract as the probe driver). PyO3 open only has
+                // the GEB_LOAD face (no baking), so no GEB_SAVE guard is
+                // needed; this cuts most of the ckpt math phase from the
+                // inproc cold start.
                 let real = if std::env::var("GEB_CKPT_SERVE_MIN").is_ok() {
                     Pi05Weights::from_safetensors_serve(&Pi05Config::default(), &ckpt)
                 } else {
@@ -1024,9 +1034,10 @@ mod ge_serve_py {
                 .as_slice()
                 .map_err(|_| PyValueError::new_err("ids must be C-contiguous uint32"))?
                 .to_vec();
-            // gear 模式（GEB_DYN_LLIST 档表）L 由 payload 驱动选档——只查
-            // L ≤ open 时的 max tokens（binds 按 max 物化）；静态桶模式仍
-            // 要求逐字节等于（挑桶语义）
+            // Gear mode (GEB_DYN_LLIST table): the payload picks the gear
+            // — only check L <= open-time max tokens (binds materialize
+            // at max). Static-bucket mode still requires an exact match
+            // (bucket-picking semantics).
             let gear_mode = std::env::var("GEB_DYN_LLIST").is_ok();
             let ids_ok = if gear_mode {
                 ids.len() <= self.serve.tokens
@@ -1035,7 +1046,7 @@ mod ge_serve_py {
             };
             if !ids_ok {
                 return Err(PyValueError::new_err(format!(
-                    "GeServeModel.infer: ids length {} != bucket tokens {}（挑桶错；gear 模式 L 须 ≤ max）",
+                    "GeServeModel.infer: ids length {} != bucket tokens {} (wrong bucket; gear mode requires L <= max)",
                     ids.len(),
                     self.serve.tokens
                 )));

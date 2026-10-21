@@ -13,9 +13,10 @@ static ACL_INIT: OnceLock<i32> = OnceLock::new();
 
 fn ensure_init() -> Result<()> {
     let &code = ACL_INIT.get_or_init(|| unsafe { ffi::aclInit(std::ptr::null()) });
-    // 100002 = ACL_ERROR_REPEAT_INITIALIZE：进程里已有先行初始化者（GE 的
-    // aclgrphBuildInitialize 隐式 aclInit——inproc 宿主里 open 先于 backend）。
-    // 运行时已就绪，视为成功。
+    // 100002 = ACL_ERROR_REPEAT_INITIALIZE: someone initialized first
+    // (GE's aclgrphBuildInitialize implicitly aclInits — in an inproc
+    // host, open precedes the backend). The runtime is ready; treat as
+    // success.
     if code == 0 || code == 100002 {
         Ok(())
     } else {
@@ -273,8 +274,10 @@ impl AscendContext {
         )
     }
 
-    /// Sized stream-ordered H2D（动态分档：实际内容行数 ≤ max 物化 buffer
-    /// ——只写前 host.len() 字节，尾部保留旧值；分支 desc 只读本档行）
+    /// Sized stream-ordered H2D (gears: real content rows <= the
+    /// max-sized buffer — writes only the first host.len() bytes, the
+    /// tail keeps old values; the branch desc reads only this gear's
+    /// rows).
     pub fn copy_h2d_async_sized(
         &self,
         dst: &DeviceBuffer,
@@ -382,7 +385,7 @@ impl DeviceBuffer {
     /// drop — the backing buffer owns the allocation and must outlive the
     /// view). For device-resident constant tables shared across runs.
     pub fn view_of(backing: &DeviceBuffer, offset_bytes: usize, len_bytes: usize) -> DeviceBuffer {
-        assert!(offset_bytes + len_bytes <= backing.len, "view_of 越界");
+        assert!(offset_bytes + len_bytes <= backing.len, "view_of out of bounds");
         DeviceBuffer {
             ptr: unsafe { backing.ptr.add(offset_bytes) },
             len: len_bytes,
@@ -396,11 +399,11 @@ impl DeviceBuffer {
 /// malloc reuse the address while a kernel/memcpy still touches it
 /// (sdma copy error 0x217 under deep queues, bench). Drops
 /// park here; the next successful stream synchronize flushes for real.
-/// Raw device pointer + length, parked until the stream drains. The
+/// Raw device pointer, parked until the stream drains. The
 /// wrapper makes the static's Send requirement honest (ACL device
 /// pointers are plain addresses; freeing on any thread after the
 /// stream drained is safe).
-struct PendingPtr(*mut std::ffi::c_void, usize);
+struct PendingPtr(*mut std::ffi::c_void);
 unsafe impl Send for PendingPtr {}
 
 static PENDING_FREES: std::sync::Mutex<Vec<PendingPtr>> = std::sync::Mutex::new(Vec::new());
@@ -417,7 +420,7 @@ pub fn flush_pending_frees() {
 impl Drop for DeviceBuffer {
     fn drop(&mut self) {
         if self.owned && !self.ptr.is_null() {
-            PENDING_FREES.lock().unwrap().push(PendingPtr(self.ptr, self.len));
+            PENDING_FREES.lock().unwrap().push(PendingPtr(self.ptr));
         }
     }
 }

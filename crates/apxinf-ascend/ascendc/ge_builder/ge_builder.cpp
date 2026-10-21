@@ -1,4 +1,4 @@
-// ge_builder -- generic GE graph-building FFI (thin C ABI, C-route stage C1).
+// ge_builder -- generic GE graph-building FFI (thin C ABI).
 //
 // The model DEFINITION lives in Rust (which ops, which descs/attrs, how they
 // wire); this layer only manipulates GE C++ objects on demand. Unlike the
@@ -122,7 +122,7 @@ bool ParseDtype(const char *s, ge::DataType &dt) {
     } else if (v == "bool") {
         dt = ge::DT_BOOL;
     } else if (v == "uint64") {
-        // QuantBatchMatmulV3 的 packed scale 输入（TransQuantParamV2 产物）
+        // QuantBatchMatmulV3 packed scale input (TransQuantParamV2 output)
         dt = ge::DT_UINT64;
     } else {
         std::cerr << "[geb] unknown dtype '" << v << "' (fp16/fp32/int32/int64/int8/bool/uint64)" << std::endl;
@@ -236,8 +236,8 @@ int CacheIo(GebModel &m) {
         std::cerr << "[geb] gear census: GetInputDynamicGearCount err=" << static_cast<int>(gc_rc)
                   << std::endl;
     } else if ((gears > 0) && (gears <= 128)) {
-        // aclmdlGetInputDynamicDims returns 500001 on full-scale OMs (works
-        // on small spikes -- CANN-side limitation, root cause not traced).
+        // aclmdlGetInputDynamicDims returns 500001 on full-scale OMs (it only
+        // works on small gear tables -- CANN-side limitation, cause unknown).
         // The gear table is computed Rust-side at graph-build time instead;
         // the census only trusts GearCount and does not degrade to static
         // when the dims query fails.
@@ -265,9 +265,10 @@ int CacheIo(GebModel &m) {
 extern "C" int geb_init(const char *soc_version) {
     std::map<ge::AscendString, ge::AscendString> opts;
     opts.emplace(ge::AscendString("ge.socVersion"), ge::AscendString(soc_version));
-    // GEB_INIT_OPT_<key>=<value>: init 级选项直通（aclgrphBuildInitialize
-    // 白名单，如 ge.enableSingleStream / ge.streamMaxParallelNum——都是
-    // init scope，不在 graph build options 里）
+    // GEB_INIT_OPT_<key>=<value>: init-scope option passthrough
+    // (aclgrphBuildInitialize whitelist, e.g. ge.enableSingleStream /
+    // ge.streamMaxParallelNum — these are init scope, not graph build
+    // options).
     for (int i = 0; environ[i] != nullptr; ++i) {
         const std::string entry(environ[i]);
         const std::string prefix = "GEB_INIT_OPT_";
@@ -338,7 +339,7 @@ extern "C" int geb_model_build(int64_t h) {
         DumpGraph(m->graph);
     }
     // input_shape is mandatory: without it aclgrphBuildModel reports SUCCESS
-    // but emits a kernel-less ~10KB empty model with empty IO dims (trap #3)
+    // but emits a kernel-less ~10KB empty model with empty IO dims
     if (m->options.find(ge::AscendString("input_shape")) == m->options.end()) {
         std::cerr << "[geb] build: option 'input_shape' missing" << std::endl;
         return -6;
@@ -386,8 +387,10 @@ extern "C" int geb_model_save(int64_t h, const char *path) {
 
 // load a persisted OM (no GE compile session needed -- pure ACL runtime)
 extern "C" int64_t geb_model_load(const char *path) {
-    // 供三段并行装载（冷启动 lazy）：g_models 增删非线程安全——装载全程
-    // 持锁（IO/aclmdlLoadFromMem 在锁内，ACL runtime 自身线程安全）
+    // For parallel three-segment loading (cold-start lazy): g_models
+    // insert/erase is not thread-safe — loading holds the lock
+    // throughout (IO/aclmdlLoadFromMem inside; the ACL runtime itself is
+    // thread-safe).
     static std::mutex load_mu;
     const std::lock_guard<std::mutex> lk(load_mu);
     FILE *f = fopen(path, "rb");
@@ -448,7 +451,7 @@ extern "C" int geb_add_data(const char *name, int64_t index, const int64_t *dims
     ge::Operator op = ge::OperatorFactory::CreateOperator(name, "Data");
     // phantom INPUT desc 0: GE reads the model IO dtype/shape from
     // GetInputDescPtr(0); leaving it unset once produced an fp32-typed model
-    // with an inserted Cast and all-zero output (trap #4)
+    // with an inserted Cast and all-zero output
     if (op.UpdateInputDesc(0U, td) != ge::GRAPH_SUCCESS) {
         std::cerr << "[geb] add_data '" << name << "': phantom input desc 0 rejected" << std::endl;
         return -3;
@@ -472,9 +475,10 @@ static bool ParseFormat(const char *s, ge::Format &fmt) {
     return true;
 }
 
-// Data 输入（desc format 可指定）。FRACTAL_NZ 权重直入实验：MatMulV2 的
-// b 算子在 310P 走 NZ，Data ND 权重会被 GE 插每执行一次的设备侧
-// TransData（ND→NZ，~63GB/s 实测）——desc 直接声明 NZ 则可能免插。
+// Data input (desc format selectable). FRACTAL_NZ weight passthrough
+// experiment: MatMulV2's b operator runs NZ on 310P, and ND Data weights
+// make GE insert a device-side TransData (ND->NZ, ~63GB/s measured)
+// every execution — declaring the desc NZ directly may avoid it.
 extern "C" int geb_add_data_fmt(const char *name, int64_t index, const int64_t *dims, int32_t n_dims,
                                 const char *dtype, const char *fmt) {
     GebModel *m = Cur();
@@ -514,11 +518,12 @@ extern "C" int geb_add_op(const char *name, const char *type) {
     return 0;
 }
 
-// Const 节点（int32 一维张量 attr）——给 Reshape/LayerNormV4 的 shape 类
-// 输入用。Data 输入的 shape 张量会让消费算子输出 desc 变 unknown →
-// DynamicShapePartitioner 把图按未知 shape 拆子图、unknown 部分走 host
-// 调度（每边界 ~20ms 停顿，vision_ma profile 取证 3220 个 unknown 标记）。
-// Const 在编译期被常量折叠 → 消费算子静态 infershape。
+// Const node (1-D int32 tensor attr) — for shape-class inputs of
+// Reshape/LayerNormV4. A shape tensor as a Data input turns the
+// consumer's output desc unknown, and the DynamicShapePartitioner
+// splits the graph along unknown shapes with host-scheduled unknown
+// parts (~20ms stall per boundary; a vision_ma profile counted 3220
+// unknown marks). Consts fold at compile time -> static infershape.
 extern "C" int geb_add_const_i32(const char *name, const int32_t *vals, int32_t n) {
     GebModel *m = Cur();
     if (m == nullptr) {
@@ -533,9 +538,11 @@ extern "C" int geb_add_const_i32(const char *name, const int32_t *vals, int32_t 
     return 0;
 }
 
-// Const 节点（任意 dtype/shape 的原始字节）——权重入图实验：ND Data 权重
-// 每执行触发设备侧 ND→NZ TransData；Const 权重若被编译期折叠转换，则
-// OM 自带 NZ 权重、零运行时税（TorchAir 378ms 的逃税路径同款假设）。
+// Const node (arbitrary dtype/shape, raw bytes) — weights baked into
+// the graph: ND Data weights trigger a device-side ND->NZ TransData
+// every execution; if the compile folds the conversion into a Const,
+// the OM carries NZ weights with zero runtime tax (the same assumption
+// behind TorchAir's 378ms tax escape).
 extern "C" int geb_add_const_raw(const char *name, const int64_t *dims, int32_t n_dims,
                                  const char *dtype, const uint8_t *data, int64_t len) {
     GebModel *m = Cur();
@@ -709,8 +716,9 @@ extern "C" int geb_set_input_desc_idx(const char *op_name, int32_t port, const i
     return 0;
 }
 
-// 消费算子输入 desc（format 可指定）——NZ 直入实验的 MatMulV2 x2 用：
-// dims 传 NZ 4-D [k/16, n/16, 16, 16] + FRACTAL_NZ，与上游 NZ Data 一致。
+// Consumer input desc (format selectable) — for MatMulV2's x2 in the
+// NZ passthrough experiment: dims are NZ 4-D [k/16, n/16, 16, 16] +
+// FRACTAL_NZ, matching the upstream NZ Data.
 extern "C" int geb_set_input_desc_fmt(const char *op_name, const char *port, const int64_t *dims,
                                       int32_t n_dims, const char *dtype, const char *fmt) {
     GebModel *m = Cur();
@@ -1107,7 +1115,7 @@ extern "C" int geb_gear_dims(int64_t h, int32_t gear, int64_t *out_dims, int32_t
 }
 
 // Gear-aware run. dyn_dims/n_dyn = full dims of all dynamic inputs in input
-// order (spike S2 recipe: ONE SetInputDynamicDims call on input 0 carrying
+// order (empirical contract: ONE SetInputDynamicDims call on input 0 carrying
 // every dynamic input's dims). For dynamic OMs n_in counts the REAL inputs
 // only -- the trailing shape-data input is buffered and filled here. Static
 // OMs (gear_count==0): dyn_dims ignored, behaves exactly like geb_run.
@@ -1193,7 +1201,7 @@ extern "C" int geb_run_gear(int64_t h, void *const *inputs, int32_t n_in, void *
 
 // Output dims of the LAST executed gear (aclmdlGetCurOutputDims). Rank>=3
 // outputs with a dynamic non-last dim are laid out at MAX-gear stride --
-// consumers must honour that (spike v2 empirical).
+// consumers must honour that (empirical).
 extern "C" int geb_cur_output_dims(int64_t h, int32_t idx, int64_t *out_dims, int32_t cap) {
     GebModel *m = ByHandle(h);
     if ((m == nullptr) || !m->loaded) {

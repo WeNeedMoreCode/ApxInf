@@ -267,9 +267,12 @@ impl Pi05Weights {
         config.validate()?;
         normalize_lerobot_prefix(&mut tensors);
         let mut weights = Self::synthetic_skeleton(config)?;
-        // styles 链（18 层 ×2 + final + time_mlp ×2 = 39 件 [3w,w]/[w,w] 转置）
-        // 是零物化骨架后数学段的大头：先顺序 take（纯 move），再按线程分块
-        // 并行转置——chunk 独占所有权无锁；不引 rayon（引擎 crate 零新依赖）。
+        // The styles chain (18 layers x 2 + final + time_mlp x 2 = 39
+        // [3w,w]/[w,w] transposes) dominates the math phase after the
+        // zero-materialization skeleton: take sequentially (pure moves)
+        // first, then parallelize the transposes across threads by chunk
+        // — each chunk owns its data, no locks; no rayon (zero new
+        // dependencies for the engine crate).
         let action_prefix = format!("{ROOT}.gemma_expert.model");
         let mut srcs: Vec<(Tensor, Option<Tensor>)> = Vec::with_capacity(39);
         for layer in 0..config.action_expert.depth {
@@ -303,13 +306,16 @@ impl Pi05Weights {
             AdaRmsNormWeights { style: lin.next().expect("style slots") };
         weights.time_mlp_in = lin.next().expect("style slots");
         weights.time_mlp_out = lin.next().expect("style slots");
-        // flow 段 Data bias 槽（ainb/aoutb 图输入——binds 物化消费；mm
-        // 权重 wt() 在 WCONST 下 Const 烤入 OM 不占输入，占位无害）
+        // flow-segment Data bias slots (ainb/aoutb graph inputs —
+        // consumed via binds materialization; mm weights baked as Consts
+        // under WCONST take no input slot, so the placeholders are
+        // harmless).
         weights.action_in.bias = take_opt(&mut tensors, "action_in_proj.bias");
         weights.action_out.bias = take_opt(&mut tensors, "action_out_proj.bias");
-        // vision 段 Data 输入源（binds 物化消费——mm 权重仍占位：WCONST
-        // 烤入 OM 不走 binds；tmp 桶 vis_head 分岔定位的补遗：
-        // patch/pos/LN/qkv/fc bias 全部经 s.data() 进 binds）
+        // vision-segment Data input sources (consumed via binds
+        // materialization — mm weights still take placeholder slots:
+        // WCONST bakes them into the OM and bypasses binds; patch/pos/
+        // LN/qkv/fc biases all enter binds through s.data()).
         let vp = format!("{ROOT}.paligemma.model.vision_tower.vision_model");
         weights.vision.patch_embedding.bias =
             Some(take(&mut tensors, &format!("{vp}.embeddings.patch_embedding.bias"))?);
@@ -364,8 +370,10 @@ impl Pi05Weights {
     /// zero pages that are never touched cost neither time nor RSS. Benchmarks
     /// and bakes must keep `synthetic`: they compute with the values.
     pub fn synthetic_skeleton(config: &Pi05Config) -> Result<Self> {
-        // GEB_SM_ZSCOPE：bisect/debug 旋钮。默认空 = 全零（生产）；rand =
-        // 全随机占位（旧行为单变量对照——隔离「零填充」与「重构本身」）
+        // GEB_SM_ZSCOPE: bisect/debug knob. Default (empty) = all zeros
+        // (production); rand = fully random placeholders (the old
+        // behavior, for single-variable controls separating
+        // zero-filling from the refactor itself).
         if std::env::var("GEB_SM_ZSCOPE").as_deref() == Ok("rand") {
             let mut rng = SyntheticRng::new(0);
             return Self::build_skeleton(config, &mut SkeletonFill::Random(&mut rng));
@@ -486,7 +494,8 @@ impl SkeletonFill<'_> {
     fn tensor(&mut self, shape: Vec<usize>) -> Result<Tensor> {
         match self {
             Self::Random(rng) => synthetic_tensor(rng, shape),
-            // 大块 `vec![0u8]` 走 calloc → 懒 commit 零页：不 touch 不计费
+            // Large `vec![0u8]` goes through calloc -> lazily committed
+            // zero pages: untouched pages cost nothing.
             Self::Zero => Ok(Tensor::zeros(shape, DType::BF16)),
         }
     }
